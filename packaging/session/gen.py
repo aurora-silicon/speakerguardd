@@ -128,6 +128,25 @@ def voicing_bound(board, gate=None):
     return [float(x) for x in b]
 
 
+def operating_volume_db(board, gate=None):
+    """The amp volume a grant holds `board`'s speaker at, in dB on the volume
+    control's own TLV, from gate.json operating_volume_db: 0 dB unless the
+    board's kernel lifts its speaker only to a fixed ceiling under the lease
+    (the J873g's -16 dB). The self-check records it and the supervisor
+    grants only at exactly that volume: speakerguardd's hard cap for the
+    board. Anything malformed, above 0 dB or below -40 dB refuses the board.
+    """
+    if gate is None:
+        gate = load_gate()
+    table = gate.get("operating_volume_db", {})
+    if not isinstance(table, dict):
+        raise wiring.Refused("malformed operating_volume_db")
+    v = table.get(board, 0.0)
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not -40.0 <= v <= 0.0:
+        raise wiring.Refused(f"operating_volume_db for {board}: want a volume in dB from -40 to 0")
+    return float(v)
+
+
 LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
 
 

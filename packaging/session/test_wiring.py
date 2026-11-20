@@ -1346,6 +1346,38 @@ class Record(unittest.TestCase):
         self.assertTrue(all("=" in l for l in lines))
 
 
+    def test_a_fixed_ceiling_board_records_its_volume(self):
+        # 0 dB is no line (the supervisor reads its absence as 0); the
+        # J873g's -16 dB ceiling is volume_cdb=-1600
+        rec = {"schema": 1, "version": 3, "result": "pass", "board": "j873g", "kernel": "k", "params_sha256": "ab",
+               "wiring": "d1d62e8a0aaaef3d", "card": "AppleJ873", "amps": 1, "sense": 0, "family": "sn012776",
+               "key": "j873", "method": "derived-nosense", "reasons": []}
+        self.assertFalse(any(l.startswith("volume_cdb=") for l in sgsc.bind_lines(rec).splitlines()))
+        self.assertFalse(any(l.startswith("volume_cdb=") for l in sgsc.bind_lines(dict(rec, volume_cdb=0)).splitlines()))
+        lines = sgsc.bind_lines(dict(rec, volume_cdb=-1600)).splitlines()
+        self.assertEqual([l for l in lines if l.startswith("volume_cdb=")], ["volume_cdb=-1600"])
+
+
+class OperatingVolume(unittest.TestCase):
+    """gate.json operating_volume_db: the volume a grant holds a board's
+    amps at, below 0 dB only where the kernel lifts the speaker to a fixed
+    ceiling (the J873g), and the supervisor's hard cap for that board."""
+
+    def test_shipped_gate(self):
+        self.assertEqual(gen.operating_volume_db("j873g"), -16.0)
+        for board in ("j316s", "j413", "j616s", "j700", "j773g", "j813", "j815"):
+            self.assertEqual(gen.operating_volume_db(board), 0.0, board)
+        self.assertEqual(round(100 * gen.operating_volume_db("j873g")), -1600)
+
+    def test_malformed_values_refuse_the_board(self):
+        for v in (1.0, 0.5, -40.5, True, "-16", None, [-16]):
+            with self.assertRaises(wiring.Refused, msg=repr(v)):
+                gen.operating_volume_db("j873g", {"operating_volume_db": {"j873g": v}})
+        with self.assertRaises(wiring.Refused):
+            gen.operating_volume_db("j873g", {"operating_volume_db": [-16]})
+        self.assertEqual(gen.operating_volume_db("j873g", {}), 0.0)
+        self.assertEqual(gen.operating_volume_db("j873g", {"operating_volume_db": {"j873g": -40}}), -40.0)
+
 class BoundRecord(unittest.TestCase):
     """A bound pass is reused only with its record (the graph is generated
     from it): a bind without one is checked again (11-07: a removed

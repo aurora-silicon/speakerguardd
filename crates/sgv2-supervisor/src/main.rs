@@ -1117,7 +1117,7 @@ mod linux {
         let mut session = Session(session_path, live);
         let mut observer = Observer::new(engine_crc, header.sample_rate, TICK_NS);
         observer.expect_wiring(bind.wiring);
-        let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
+        let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id).with_volume_cdb(bind.volume_cdb));
         let mut deadline = now_ns();
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;

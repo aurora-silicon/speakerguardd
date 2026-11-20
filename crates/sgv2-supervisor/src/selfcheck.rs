@@ -20,6 +20,11 @@
 //! method=derived
 //! ```
 //!
+//! A board whose kernel lifts its speaker only to a fixed ceiling under the
+//! lease (gate.json `operating_volume_db`: the J873g) adds the volume a
+//! grant must show, in hundredths of a dB on the volume control's own TLV:
+//! `volume_cdb=-1600`. Without the line it is 0 dB.
+//!
 //! The supervisor grants only with a passing record for exactly this board,
 //! this kernel release and this parameter blob, and then only while the
 //! session helper reports that the protect stage was built with the same
@@ -43,6 +48,9 @@ pub struct Bind {
     pub family: String,
     pub key: String,
     pub method: String,
+    /// The amp volume a grant must show, cdB on the control's own TLV: 0
+    /// unless the record names the board's fixed ceiling (`volume_cdb`).
+    pub volume_cdb: i32,
     /// The first failure, for a failing record.
     pub reason: Option<String>,
 }
@@ -67,6 +75,15 @@ pub fn parse(text: &str) -> Result<Bind, String> {
         return Err(format!("schema {}", field("schema")?));
     }
     let num = |k: &str| field(k)?.parse::<usize>().map_err(|_| format!("{k} is not a number"));
+    // A ceiling only ever lowers the volume: at most 0 dB, and no lower than
+    // the -40 dB a speaker would still be worth granting at.
+    let volume_cdb = match get.get("volume_cdb") {
+        None => 0,
+        Some(v) => match v.parse::<i32>() {
+            Ok(c) if (-4000..=0).contains(&c) => c,
+            _ => return Err(format!("volume_cdb {v:?} is not a volume from -4000 to 0 cdB")),
+        },
+    };
     Ok(Bind {
         result: field("result")?,
         board: field("board")?,
@@ -79,6 +96,7 @@ pub fn parse(text: &str) -> Result<Bind, String> {
         family: field("family")?,
         key: field("key")?,
         method: field("method")?,
+        volume_cdb,
         reason: get.get("reason").map(|s| s.to_string()),
     })
 }
@@ -176,6 +194,18 @@ mod tests {
         let b = parse(&t).unwrap();
         let e = covers(&b, "j316s", "7.3.0-aurora-sgv2k5", "aa11").unwrap_err();
         assert!(e.contains("failed") && e.contains("VSENSE"), "{e}");
+    }
+
+    #[test]
+    fn a_record_may_name_a_fixed_ceiling_below_0_db() {
+        assert_eq!(parse(GOOD).unwrap().volume_cdb, 0);
+        assert_eq!(parse(&format!("{GOOD}volume_cdb=-1600\n")).unwrap().volume_cdb, -1600);
+        assert_eq!(parse(&format!("{GOOD}volume_cdb=0\n")).unwrap().volume_cdb, 0);
+        // a ceiling only lowers the volume, within -40 dB, and is a number
+        for v in ["100", "1", "-4001", "-16.0", "", "x"] {
+            assert!(parse(&format!("{GOOD}volume_cdb={v}\n")).is_err(), "{v:?}");
+        }
+        assert!(parse(&format!("{GOOD}volume_cdb=-1600\nvolume_cdb=-1600\n")).is_err());
     }
 
     #[test]
