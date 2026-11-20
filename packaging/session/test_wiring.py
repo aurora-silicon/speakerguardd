@@ -930,6 +930,40 @@ class NoSensePath(unittest.TestCase):
             wiring.derive(f["hw"], f["tuning"])
         self.assertIn("one amp only", str(cm.exception))
 
+    def test_aop_dma_sense_follows_the_named_channel(self):
+        # t8152_aop_audio (T8142, T6050): the J815 names "sense" and keeps
+        # its sense and its hash; without it, it is refused (its spp3 unit
+        # reads sense, and six amps could not run without it anyway).
+        f = fx("j815")
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr", "sense", "hpai"]]
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertEqual(wiring.derive(f["hw"], f["tuning"])["hash"], "725f518662e42388")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr"]]
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f["tuning"]["tuning"]["protection"]["kind"] = "lsm2"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_t6050_one_amp_without_sense(self):
+        # The M5 Mac Studio's shape: one SN012776 on the T6050 AOP whose
+        # audio node names no "sense" (its ADT audio-speaker is TX only).
+        f = j773g(("cout", "cin", "spkr"))
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["cpu_compatible"] = [["apple,t6050-aop-audio"]]
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertTrue(w["no_sense_path"])
+        self.assertEqual((w["unit_channels"], w["sense"]), ([0], []))
+        self.assertEqual(sgsc.method_of(w), "derived-nosense")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr", "sense"]]
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertFalse(wiring.derive(f["hw"], f["tuning"])["no_sense_path"])
+
     def test_static_report_names_the_no_sense_case(self):
         f = j773g()
         w = wiring.derive(f["hw"], f["tuning"])
