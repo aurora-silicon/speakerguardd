@@ -1290,6 +1290,84 @@ class PcmWidths(unittest.TestCase):
         self.assertEqual(sgsc.amp_lanes(sgsc.stats(raw[: 16 * frames], 8), 4)["ch"], sgsc.stats(raw[: 16 * frames], 8)["ch"])
 
 
+class AudioStack(unittest.TestCase):
+    """wiring.audio_stack: the speaker card, the nodes its links point at and
+    the loaded sound modules, nothing else."""
+
+    @staticmethod
+    def be(*w):
+        import struct
+        return struct.pack(">%dI" % len(w), *w)
+
+    def tree(self, d):
+        import struct
+        root, mods = os.path.join(d, "dt"), os.path.join(d, "module")
+
+        def node(path, props):
+            p = os.path.join(root, path)
+            os.makedirs(p, exist_ok=True)
+            for k, v in props.items():
+                with open(os.path.join(p, k), "wb") as f:
+                    f.write(v)
+
+        be = self.be
+        node("", {"compatible": b"apple,j615\0"})
+        node("soc/i2s@2a3400000", {"compatible": b"apple,t8122-mca\0apple,mca\0", "phandle": be(1),
+                                   "#sound-dai-cells": be(1)})
+        node("soc/i2c@0/codec@38", {"compatible": b"ti,sn012776\0", "phandle": be(2)})
+        node("soc/gpu@0", {"compatible": b"apple,agx\0", "phandle": be(3)})
+        node("sound", {"compatible": b"apple,macaudio\0"})
+        node("sound/dai-link@0", {"link-name": b"Speakers\0"})
+        node("sound/dai-link@0/cpu", {"sound-dai": be(1, 0)})
+        node("sound/dai-link@0/codec", {"sound-dai": be(2)})
+        for m, v in (("snd_soc_apple_mca", "AAAA"), ("snd_soc_macaudio", "BBBB"), ("nvme", "CCCC")):
+            os.makedirs(os.path.join(mods, m))
+            with open(os.path.join(mods, m, "srcversion"), "w") as f:
+                f.write(v + "\n")
+        return root, mods
+
+    def test_what_changes_the_fingerprint(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root, mods = self.tree(d)
+            be = self.be
+
+            def fp():
+                return wiring.audio_stack("sound", root, mods)
+            base = fp()
+            self.assertRegex(base, r"^[0-9a-f]{16}$")
+            self.assertEqual(fp(), base)
+            # unrelated: another node, another module
+            with open(os.path.join(root, "soc/gpu@0/status"), "wb") as f:
+                f.write(b"okay\0")
+            with open(os.path.join(mods, "nvme", "srcversion"), "w") as f:
+                f.write("DDDD\n")
+            self.assertEqual(fp(), base)
+            # the serializer node a link points at (the J615's receiver delay)
+            with open(os.path.join(root, "soc/i2s@2a3400000/apple,rx-delay-bclks"), "wb") as f:
+                f.write(bytes.fromhex("00000001000000010000000000000000"))
+            with_prop = fp()
+            self.assertNotEqual(with_prop, base)
+            # a rebuilt sound module under the same kernel release
+            with open(os.path.join(mods, "snd_soc_apple_mca", "srcversion"), "w") as f:
+                f.write("EEEE\n")
+            rebuilt = fp()
+            self.assertNotEqual(rebuilt, with_prop)
+            # an amp node a link points at
+            with open(os.path.join(root, "soc/i2c@0/codec@38/ti,imon-slot-no"), "wb") as f:
+                f.write(be(4))
+            self.assertNotEqual(fp(), rebuilt)
+            self.assertEqual(wiring.audio_stack("nowhere", root, mods), "-")
+
+    def test_the_bind_carries_it(self):
+        rec = {"schema": 1, "version": 1, "result": "pass", "board": "j615", "kernel": "k", "params_sha256": "ab",
+               "wiring": "a46e56034fa096f0", "audio": "0123456789abcdef", "card": "AppleJ615", "amps": 6, "sense": 12,
+               "family": "sn012776", "key": "j615", "method": "derived", "reasons": []}
+        self.assertIn("audio=0123456789abcdef", sgsc.bind_lines(rec).splitlines())
+        del rec["audio"]
+        self.assertIn("audio=-", sgsc.bind_lines(rec).splitlines())
+
+
 class Record(unittest.TestCase):
     def test_bind_lines_are_what_the_supervisor_parses(self):
         rec = {"schema": 1, "version": 1, "result": "fail", "board": "j316s", "kernel": "k", "params_sha256": "ab",
@@ -1414,7 +1492,7 @@ class Deferral(unittest.TestCase):
         self.w["method"] = "derived-static" if static else "derived"
         self.desc = wiring.describe(self.hw, self.w)
 
-    def run_sc(self, *argv, kernel="7.3.0-test"):
+    def run_sc(self, *argv, kernel="7.3.0-test", audio="a1a1a1a1a1a1a1a1"):
         def active(idx, card, w, report, args=None):
             self.calls.append("active")
             return list(self.hw_errs)
@@ -1427,6 +1505,7 @@ class Deferral(unittest.TestCase):
         with mock.patch.object(sgsc, "lv2_shadows", return_value=self.shadows), \
                 mock.patch.object(sgsc, "derive_live", return_value=(self.hw, self.w, self.desc, [])), \
                 mock.patch.object(sgsc, "blob_rate", return_value=self.w["rate"]), \
+                mock.patch.object(sgsc, "audio_of", return_value=audio), \
                 mock.patch.object(sgsc, "find_card", return_value=(0, self.desc["card"])), \
                 mock.patch.object(sgsc, "active", side_effect=active), \
                 mock.patch.object(sgsc, "static", side_effect=static), \
@@ -1462,6 +1541,34 @@ class Deferral(unittest.TestCase):
         self.assertEqual(self.calls, ["active"])
         self.assertEqual(self.run_sc("pending"), 0)
         self.assertEqual(self.bind()["kernel"], "7.3.0-test")
+
+    def test_a_changed_audio_stack_is_checked_again(self):
+        # J615: the same kernel release with the stock MCA module (sense one
+        # bit clock late) and with the fixed one. A pass bound to one never
+        # covers the other.
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
+        self.assertEqual(self.bind()["audio"], "a1a1a1a1a1a1a1a1")
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("pending"), 1)
+        self.assertEqual(self.run_sc("run", "--defer", audio="b2b2b2b2b2b2b2b2"), 0)
+        self.assertEqual(self.run_sc("pending"), 0, "the switch test is due again")
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("run", audio="b2b2b2b2b2b2b2b2"), 0)
+        self.assertEqual(self.calls, ["active", "active"])
+        self.assertEqual(self.bind()["audio"], "b2b2b2b2b2b2b2b2")
+
+    def test_a_pass_without_an_audio_stack_is_not_reused(self):
+        # a record from before the audio stack was bound
+        self.assertEqual(self.run_sc("run"), 0)
+        path = os.path.join(self.state, "selfcheck.bind")
+        with open(path) as f:
+            old = "".join(l for l in f if not l.startswith("audio="))
+        with open(path, "w") as f:
+            f.write(old)
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.calls, ["active", "active"])
 
     def test_a_failed_switch_test_after_login_fails_closed(self):
         self.assertEqual(self.run_sc("run", "--defer"), 0)
