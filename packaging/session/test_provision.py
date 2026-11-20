@@ -171,10 +171,12 @@ class Provision(Base):
         self.patch(gen, "voicing_enabled", lambda board: False)
         self.assertEqual(self.run_(), 0)
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
+        self.assertNotIn("--voicing-pre", prov.read_kv(self.p.conf)["SGV2_ARGS"])
         self.patch(gen, "voicing_enabled", lambda board: board == "j316s")
         self.assertEqual(self.run_(), 0)
         self.assertTrue(self.record()["compiled"])
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "true")
+        self.assertIn("--voicing-pre", prov.read_kv(self.p.conf)["SGV2_ARGS"])
         with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
             self.assertIn("--voicing-pre", f.read())
         self.assertEqual(self.run_(), 0)
@@ -183,6 +185,7 @@ class Provision(Base):
         self.assertEqual(self.run_(), 0)
         self.assertTrue(self.record()["compiled"])
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
+        self.assertNotIn("--voicing-pre", prov.read_kv(self.p.conf)["SGV2_ARGS"])
 
 
     def test_compiles_binds_and_configures(self):
@@ -192,7 +195,7 @@ class Provision(Base):
         self.assertEqual(conf["SGV2_MACHINE"], "j316")
         self.assertEqual(conf["SGV2_USER"], ME.pw_name)
         self.assertEqual(conf["SGV2_UID"], str(ME.pw_uid))
-        self.assertEqual(conf["SGV2_ARGS"], f"--card AppleJ316 --pcm 1 --uid {ME.pw_uid} --params {self.p.params}")
+        self.assertEqual(conf["SGV2_ARGS"], f"--card AppleJ316 --pcm 1 --uid {ME.pw_uid} --voicing-pre")
         self.assertEqual(conf["SGV2_PARAMS"], self.p.params)
         self.assertEqual(conf["SGV2_TUNING"], "")
         bind = prov.read_kv(self.p.bind)
@@ -321,6 +324,8 @@ class Provision(Base):
         os.makedirs(b)
         self.assertEqual(self.run_(bundle=b), 0)
         self.assertEqual(prov.read_kv(self.p.conf)["SGV2_TUNING"], b)
+        self.assertIn(f"--bundle {b}", prov.read_kv(self.p.conf)["SGV2_ARGS"])
+        self.assertNotIn("--params", prov.read_kv(self.p.conf)["SGV2_ARGS"])
         self.assertEqual(self.run_(bundle=os.path.join(self.t, "absent")), 1)
         self.assertEqual(self.run_(bundle=os.path.join(self.t, "a b")), 1)
 

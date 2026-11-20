@@ -7,13 +7,13 @@
 # (the J316s and J316c are both j316), for the session helper.
 SGV2_MACHINE=j316
 # The seat user, by name, and its uid from the user database.
-SGV2_USER=ryan
+SGV2_USER=alice
 SGV2_UID=1000
-# The supervisor: the speaker card, its speaker PCM (the front-end
-# "Secondary"), the seat user's uid and the parameter blob, compiled for this
-# board from this Mac's own tuning (the supervisor refuses a blob for another
-# Mac).
-SGV2_ARGS="--card AppleJ316 --pcm 1 --uid 1000 --params /var/lib/speakerguardd/params.bin"
+# The supervisor compiles this Mac's verified bundle at every start. The
+# deployment policy selected full voicing here, as for provisioning's compile.
+# An explicit source adds --bundle <path>; otherwise discovery uses the
+# vendor firmware tree, then the ESP archive. No precompiled input is accepted.
+SGV2_ARGS="--card AppleJ316 --pcm 1 --uid 1000 --voicing-pre"
 # The self-check: the same blob, and the tuning source it was compiled from
 # (empty: the installer's bundle).
 SGV2_PARAMS=/var/lib/speakerguardd/params.bin

@@ -12,7 +12,7 @@ hand-written template and with nobody at the machine.
 | Protection unit | per type | spp3, atsp and lsm2 are at parity in the shipped policy; LSID is pending. |
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
-| Parameter blob | yes | Compiled and bound at boot by `speakerguardd-provision`. The compiler has no table of boards. |
+| Parameter blob | yes | Provisioning compiles it for the self-check; the supervisor recompiles the verified bundle at every start and requires the same checked hash. The compiler has no table of boards. |
 | Configuration and seat user | yes | Written at boot by `speakerguardd-provision`; the seat user is resolved by name. |
 | Fleet gate | derived | `gate.json` supplies build-wide `units_at_parity` and deny/override policy; current compilation, own-Mac provenance and silent self-check records qualify the board automatically. |
 | Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check (MCA and AOP paths; the J700 is derived but cannot be proven silently). |
@@ -152,6 +152,41 @@ removed, the self-check and the supervisor do not start, the kernel holds
 the speakers at its floor, and the journal lists every reason. For tests,
 `--root DIR` (or `SGV2_PROVISION_ROOT`) moves every file it writes under a
 test root, and `--bundle` names another tuning source.
+
+### Supervisor startup
+
+The supervisor takes `--pcm` and `--uid`, with optional `--card`, `--bundle`,
+`--voicing-pre` and `--selfcheck`. It accepts no `--params` input or development
+bypass. With no `--bundle`, the tuning library discovers the vendor firmware
+bundle, then the ESP archive; an explicit directory or archive is used as-is,
+without falling back to another source on failure.
+
+At every start it reads the actual board, unit identity and speaker ID through
+the tuning library's device-tree APIs, loads and verifies the bundle, and
+compiles in-process with verified provenance. Board/unit binding and speaker-ID
+selection use the existing compiler rules, including open-loop calibration
+handling when unit identity cannot be verified. There is no separate set of
+supervisor DSP parameters or compiler defaults.
+
+Provisioning carries its selected `--voicing-pre` mode and optional bundle path
+in `SGV2_ARGS`. Full voicing uses the existing voicing compiler with identity
+protection pre-stage; otherwise the existing protection compiler uses identity
+pre-stage, just as provisioning's compile does. The supervisor validates the
+compiled board, geometry, operating point, CRC, sample rate, voicing and
+pre-stage, then requires the self-check to cover the exact compiled SHA-256
+and running kernel. Only after all checks pass does it atomically publish the
+complete blob; engine pages and speaker devices are opened later. A missing,
+corrupt or refused bundle, a changed compile mode, or a stale self-check leaves
+startup refused, with no stale-blob fallback and the kernel floor holding.
+
+`SGV2_PARAMS` remains the provisioning artifact used by independent self-check
+and graph-activation workflows; `SGV2_TUNING` remains their source. Removing
+the supervisor's precompiled input does not remove these artifacts.
+
+Offline startup tests inject synthetic identity, bundle discovery, self-check,
+kernel and publication dependencies into the same startup function the binary
+calls. They do not run the daemon or prove physical speaker behaviour, live
+service deployment, or qualification on every v2 board.
 
 ## 5. The fleet gate (`speakerguardd-gate`)
 
