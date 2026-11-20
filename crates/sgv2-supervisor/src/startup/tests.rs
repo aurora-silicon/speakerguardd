@@ -1,14 +1,14 @@
 // Copyright (c) 2026 The Aurora Silicon Contributors
 // SPDX-License-Identifier: MIT
 
-//! Offline only: include the production startup module, inject all host
+//! Offline only: exercise the production startup module, inject all host
 //! dependencies, and open only generated synthetic files. Never invoke the
 //! daemon or use the live device tree, kernel controls, engine pages or ALSA.
-#[path = "../../aurora-speaker-tuning/tests/common/mod.rs"]
+#[path = "../../../aurora-speaker-tuning/tests/common/mod.rs"]
 mod common;
-#[path = "../src/startup.rs"]
-mod startup;
+use crate::startup;
 
+use super::Environment;
 use aurora_speaker_tuning::{
     aupreset::{ParamSection, ParamState},
     bundle::Bundle,
@@ -21,7 +21,6 @@ use aurora_speaker_tuning::{
 };
 use common::*;
 use sgv2_supervisor::selfcheck::{self, Bind};
-use startup::Environment;
 use std::path::{Path, PathBuf};
 
 struct Host {
@@ -430,10 +429,16 @@ fn unknown_unit_preserves_compiler_open_loop_and_exact_hash_binding() {
 
 #[test]
 fn speaker_vendor_selection_requires_a_known_supported_id_when_no_neutral_exists() {
-    for (name, spid, succeeds) in
-        [("manifest", Some(2), true), ("unknown", None, false), ("unsupported", Some(9), false)]
-    {
+    for (name, spid, succeeds) in [
+        ("manifest", Some(2), true),
+        ("device-tree", None, true),
+        ("unknown", None, false),
+        ("unsupported", Some(9), false),
+    ] {
         let mut host = Host::new(&format!("vendor-{name}"), "spp3", false);
+        if name == "device-tree" {
+            std::fs::write(host.root.join("dt/chosen/asahi,speaker-id"), 3u32.to_be_bytes()).unwrap();
+        }
         let mut files = files("spp3");
         files.insert(
             "DeviceDSPDatabase.plist".into(),

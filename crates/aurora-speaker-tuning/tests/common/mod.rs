@@ -451,7 +451,12 @@ pub fn collector_json(files: &BTreeMap<String, Vec<u8>>) -> String {
 
 /// A fresh empty directory under the target dir.
 pub fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    // Integration tests get Cargo's scratch directory at compile time;
+    // binary unit tests reuse their own target directory at run time.
+    let root = option_env!("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("CARGO_TARGET_DIR").map(|p| PathBuf::from(p).join("tmp")).unwrap_or_else(std::env::temp_dir)
+    });
+    let d = root.join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d

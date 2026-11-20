@@ -166,3 +166,6 @@ pub fn publish_atomic(run_dir: &Path, user_dir: &Path, blob: &[u8]) -> std::io::
     std::fs::write(&tmp, blob)?;
     std::fs::rename(&tmp, run_dir.join("params.bin"))
 }
+
+#[cfg(test)]
+mod tests;
