@@ -136,6 +136,16 @@ TRANSPORTS = {
 # The T6050 (J714s) is the same driver's T6050 configuration: six amps on the
 # T8142 transport.
 TRANSPORTS["apple,t6050-aop-audio"] = TRANSPORTS["apple,t8142-aop-audio"]
+# t8152_aop_audio.rs, T8152 configuration (HW_CFG_T8152, the Mac mini M6,
+# J873g): one amp in one 32-bit slot, S24_LE, the same ADMAC DMA as the T8142
+# configuration, and nothing sent back. The stream's RX carries no V/I sense,
+# and the J873's card has no sense PCM, whatever the node's dma-names list
+# (its node names "sense", the shared driver's channel). "senses": False says
+# so for the transport: its amps are wired without sense (transport_senses).
+# The J813's node lists this compatible after "apple,t8142-aop-audio", which
+# matches first (transport()), so it keeps the T8142 transport.
+TRANSPORTS["apple,t8152-aop-audio"] = {"transport": "aop-t8152", "formats": ["S24_LE"], "sense_batch": False,
+                                       "speaker_headroom": 0, "speaker_irq": False, "senses": False}
 # Newer device trees omit the generic MCA fallback. Both compatibles bind
 # mca.c; share the entry so back-ends using either name are the same driver.
 TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
@@ -518,14 +528,20 @@ def tdm_slots(n_codecs, n_bes):
 
 def transport_senses(hw):
     """Whether the speaker link's transport carries the amps' V/I sense on
-    this Mac. A transport whose sense is a named DMA channel ("sense_dma")
-    carries none when its back-end nodes name their speaker channel
-    ("speaker_dma") and not that one. A back-end with no dma-names, one
-    that does not name its speaker channel either (a node not yet
-    described for this Mac), or a device-tree read from before they were
-    recorded, keeps the sense the amps' family offers. (transport() refuses
-    unknown or mixed back-ends; this only reads the ones it knows.)"""
+    this Mac. A transport that never does ("senses": False, the T8152
+    configuration) carries none on any Mac. A transport whose sense is a
+    named DMA channel ("sense_dma") carries none when its back-end nodes
+    name their speaker channel ("speaker_dma") and not that one. A back-end
+    with no dma-names, one that does not name its speaker channel either (a
+    node not yet described for this Mac), or a device-tree read from before
+    they were recorded, keeps the sense the amps' family offers.
+    (transport() refuses unknown or mixed back-ends; this only reads the
+    ones it knows.)"""
     link = _speaker_link(hw)
+    for compat in link.get("cpu_compatible") or []:
+        t = next((TRANSPORTS[c] for c in compat if c in TRANSPORTS), None)
+        if t and t.get("senses") is False:
+            return False
     dmas = link.get("cpu_dma_names")
     if not dmas or any(d is None for d in dmas):
         return True

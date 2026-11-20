@@ -934,6 +934,69 @@ class NoSensePath(unittest.TestCase):
         self.assertEqual(wiring.derive(got, j773g()["tuning"])["hash"], "d1d62e8a0aaaef3d")
 
 
+
+def j873g(names=("cout", "cin", "spkr", "sense")):
+    """The M6 Mac mini (J873g) as its device tree describes it: one SN012776
+    (ti,vmon-slot-no 0, ti,imon-slot-no 2, no sound-name-prefix) behind the
+    T8152 AOP, whose node names the shared driver's four channels, sense
+    included, and the J473's atsp mono tuning (the J873's AID48 is atsp
+    too)."""
+    f = fx("j473")
+    h = f["hw"]
+    h.update(board="j873g", compatible=["apple,j873g", "apple,t8152", "apple,arm-platform"],
+             sound_compatible=["apple,j873-macaudio", "apple,macaudio"], model="Mac mini J873")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["cpu_compatible"] = [["apple,t8152-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    link["codecs"] = [{"node": "soc/i2c@33101c000/codec@38", "compatible": ["ti,sn012776", "ti,tas2764"],
+                       "vmon": 0, "imon": 2, "i2c": "1-0038"}]
+    return f
+
+
+class T8152NoSense(unittest.TestCase):
+    """The T8152 AOP's speaker stream sends nothing back (HW_CFG_T8152): the
+    J873g's one SN012776 is wired without sense whatever its node's
+    dma-names say, and proven like the J773g's."""
+
+    def test_j873g_derives_without_sense(self):
+        for names in (("cout", "cin", "spkr", "sense"), ("cout", "cin", "spkr"), None):
+            f = j873g(names)
+            self.assertFalse(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertTrue(w["no_sense_path"], names)
+            self.assertEqual((w["family"], w["unit_kind"], w["unit_channels"], w["sense"]),
+                             ("sn012776", "atsp", [0], []), names)
+            self.assertEqual((c["transport"], c["plugin"], c["sense"], c["alsa_format"], c["speaker_pcm"]),
+                             ("aop-t8152", "1ch", 0, "S24_LE", 1), names)
+            self.assertFalse(c["speaker_irq"], names)
+            self.assertEqual(sgsc.method_of(w), "derived-nosense", names)
+            # one full-range amp on slot 0 without sense: the J773g's map
+            self.assertEqual(w["hash"], "d1d62e8a0aaaef3d", names)
+
+    def test_sense_units_and_several_amps_are_refused(self):
+        f = j873g()
+        f["tuning"]["tuning"]["protection"]["kind"] = "spp3"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f = j873g()
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["codecs"] = [dict(link["codecs"][0], prefix=p) for p in ("Left Speaker", "Right Speaker")]
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_t8142_keeps_its_sense_before_the_t8152_fallback(self):
+        # The J815's node lists "apple,t8142-aop-audio" first and the T8152
+        # compatible as its fallback: the T8142 transport, with its sense.
+        f = fx("j815")
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual((w["no_sense_path"], len(w["sense"]), w["hash"]), (False, 12, "725f518662e42388"))
+        self.assertEqual(wiring.describe(f["hw"], w)["transport"], "aop-dma")
+
+
 class NoHandMap(unittest.TestCase):
     """There is no hand map to fall back on: a Mac whose wiring the
     derivation cannot read fails the self-check."""
