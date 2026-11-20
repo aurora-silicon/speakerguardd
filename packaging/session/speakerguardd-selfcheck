@@ -1011,6 +1011,9 @@ def run_locked(args):
                     os.unlink(MARKER)
                 except OSError:
                     pass
+        else:
+            # Fail closed: a method no branch proves is never a pass.
+            errs.append(f"no check proves a {w['method']!r} wiring")
     except wiring.Refused as e:
         errs.append(str(e))
     except Exception as e:  # noqa: BLE001 - every failure is a failing record
