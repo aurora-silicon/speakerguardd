@@ -1475,16 +1475,6 @@ impl HardOracle {
                 Some(false) => keep_or_disarm(prev),
                 None => (keep_or_disarm(prev) == Some(true)).then_some(true),
             };
-            // rig law 6a by policy: the feed-forward node above 1000 K holds
-            // the hard path (the unit flags MODEL_RANGE), undecided within
-            // rounding of the threshold
-            if c.ff_on {
-                c.armed = match cmp(c.theta_ff as f64, 1000.0) {
-                    Some(true) => Some(true),
-                    Some(false) => c.armed,
-                    None => (c.armed == Some(true)).then_some(true),
-                };
-            }
             // the virtual coil, independently: the unit's must agree
             let cs = &unit_cs[ci];
             if c.ff_on {
@@ -1495,6 +1485,15 @@ impl HardOracle {
                     c.src,
                     self.updates
                 );
+                // Rig law 6a by policy: the feed-forward node strictly above
+                // 1000 K forces the hard path. Use the published node for this
+                // controller decision, as for the candidates below: the
+                // independently checked recurrence can straddle 1000 K within
+                // its rounding error (issue #217). Unlike T_OL telemetry, this
+                // exposes the node exactly, so no comparison tolerance is needed.
+                if unit > 1000.0 {
+                    c.armed = Some(true);
+                }
             }
             let theta_mg = if cs[5].is_finite() { cs[5] } else { mag - self.amb };
             let num = limit - self.amb - theta_mg;
@@ -1689,7 +1688,7 @@ fn sine_drive(n: usize, secs: f64, rate: u32, amp: f32, f: f64) -> Vec<Vec<f32>>
 }
 
 /// Exercise the same synthetic setup for randomized and pinned hard-path cases.
-fn spp3_hard_case(seed: u64, n: usize, rate: u32, ff: Ff, secs: f64, amp: f32, h: Hostility) {
+fn spp3_hard_case(seed: u64, n: usize, rate: u32, ff: Ff, secs: f64, amp: f32, h: Hostility) -> (usize, usize) {
     let mut p = spp3_params(seed, n, 512, rate, ff, true);
     // short coil constants and low limits so the coil reaches the hard
     // limit within the run; closed loop off (the corrected limit is
@@ -1709,13 +1708,17 @@ fn spp3_hard_case(seed: u64, n: usize, rate: u32, ff: Ff, secs: f64, amp: f32, h
     p.thermal_safe_tlim_time_min = [10.0, 5.0, 0.01, 0.02, 0.05, 0.002][(seed >> 8) as usize % 6];
     let len = (secs * rate as f64) as usize;
     let x = signal(seed ^ 1, n, len, amp, h);
-    let _ = spp3_hard_render(&p, &x);
+    let (armed, exact, _, _) = spp3_hard_render(&p, &x);
+    (armed, exact)
 }
 
 /// Issue #217: the property input seed, not proptest's runner seed.
 #[test]
 fn spp3_hard_path_issue_217() {
-    spp3_hard_case(10_374_819_889_551_966_816, 8, 48_000, Ff::On, 7.952000980109578, 1.9866279, Hostility::Large);
+    let (armed, exact) =
+        spp3_hard_case(10_374_819_889_551_966_816, 8, 48_000, Ff::On, 7.952000980109578, 1.9866279, Hostility::Large);
+    assert!(armed > 0 && exact > 0, "the regression must exercise armed and exact controller checks");
+    eprintln!("issue #217: {armed} armed updates, {exact} exact controller checks");
 }
 
 proptest! {
@@ -1729,7 +1732,7 @@ proptest! {
         seed in any::<u64>(), n in 1usize..=8, rate in prop_oneof![Just(48_000u32), 8_000u32..=192_000],
         ff in ff(), secs in 1.0f64..8.0, amp in 0.5f32..4.0, h in hostility(),
     ) {
-        spp3_hard_case(seed, n, rate, ff, secs, amp, h);
+        let _ = spp3_hard_case(seed, n, rate, ff, secs, amp, h);
     }
 
     #[test]
