@@ -278,6 +278,14 @@ def acquire(identity, a):
             except Exception as e:
                 reasons.append(f"route {r}: {e}")
                 continue
+            try:
+                b, dropped = collect.for_this_reader(b)
+            except collect.CollectError as e:
+                reasons.append(f"route {r}: {e}")
+                continue
+            if dropped:
+                say(f"route {r}: the bundle carries {', '.join(dropped)}, which this speakerguardd "
+                    "does not read yet; it is stored without it")
             m = json.loads(b[audio_tuning.MANIFEST])
             if collect.lsm2_fill.needs_fill(b) and m.get("lsm2_param_fill") is None:
                 reasons.append(f"route {r}: collected before the installer read the lsm2 fill; "

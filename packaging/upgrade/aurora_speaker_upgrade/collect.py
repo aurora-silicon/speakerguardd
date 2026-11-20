@@ -346,6 +346,39 @@ def collect(staged, identity, speaker_id, speaker_id_known):
     return c.bundle, build
 
 
+# Manifest records a newer installer writes that this speakerguardd does
+# not read yet, and the file each one names. Its tuning reader parses a
+# schema-2 manifest strictly: one key it does not know refuses the whole
+# bundle ("unknown field"), and the speakers stay at the kernel's floor.
+# The installer's collector on main wrote `buzzkill_quadrature` by default
+# from 2026-11-13 (aurora-installer#119) while no release read it
+# (speakerguardd#138 adds the reader); the vendored collector does not know
+# it either, so it keeps the record in the manifest but drops its file.
+# Remove an entry here once the tuning reader reads that record.
+UNREAD_RECORDS = {"buzzkill_quadrature": "buzzkill-quadrature.bin"}
+
+
+def for_this_reader(bundle):
+    """(bundle, [record names dropped]): the bundle without the records this
+    speakerguardd does not read (UNREAD_RECORDS) and their files, every
+    other file and manifest entry unchanged. The manifest is written again
+    the way the installer's collector writes it (sorted keys, two-space
+    indent), so the result is the bundle the collector writes without
+    those records. A bundle without any is returned as is."""
+    m = json.loads(bundle[audio_tuning.MANIFEST])
+    dropped = [k for k in UNREAD_RECORDS if k in m]
+    if not dropped:
+        return bundle, []
+    out = dict(bundle)
+    for k in dropped:
+        rec = m.pop(k)
+        if not isinstance(rec, dict) or rec.get("path") != UNREAD_RECORDS[k]:
+            raise CollectError(f"malformed {k} record in the bundle's manifest")
+        out.pop(UNREAD_RECORDS[k], None)
+    out[audio_tuning.MANIFEST] = json.dumps(m, indent=2, sort_keys=True).encode("utf-8")
+    return out, dropped
+
+
 def write_bundle(bundle, dest):
     """Writes a bundle tree (0700 directories, 0600 files) at dest, which
     must not exist."""
