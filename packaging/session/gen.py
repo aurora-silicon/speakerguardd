@@ -24,7 +24,9 @@ The graph, per machine:
   node named alsa_output.platform-sound.RawSpeakers, which on v2 is the
   protect stage's input.
 - The protect stage is a filter-chain around one sgv2 LV2 instance: the
-  program on AUX0.. and the amps' V/I sense after it.
+  program on AUX0.. and the amps' V/I sense after it. A board with a
+  gate.json protect_highpass (the J873g) has that high-pass on every amp's
+  lane in front of the instance.
 - The speaker amps and the sense are ALSA nodes of their own on the speaker
   card's PCMs 1 and 2 (hw:CARD=<card>,DEV=<n>, a name no aurora-audio rule
   matches), in one node.group, so the amps' sink drives the sense at the
@@ -262,6 +264,43 @@ def voicing_lowpass(aid, gate=None):
     return float(hz), order
 
 
+HIGHPASS_ORDERS = (2, 4, 6, 8)
+
+
+def protect_highpass(board, gate=None):
+    """A board's high-pass ahead of its protection unit, from gate.json
+    protect_highpass: {"hz": corner, "order": even Butterworth order}. It is
+    for a speaker with no measurement behind its low end: the J873g's 4th
+    order at 100 Hz is aurora-silicon/asahi-audio#28's, which keeps its drive
+    below 100 Hz under the J274 graph's at every frequency. Each section is
+    PipeWire's builtin bq_highpass (RBJ) at the corner with the Butterworth Q
+    of its pole pair: the cascade is the bilinear Butterworth response,
+    monotonic and never above 0 dB. It sits in the protect stage, in front
+    of the unit on every amp's lane, so the unit models the program the amp
+    gets, and no voicing setting can drop it. Anything malformed refuses the
+    board's graph.
+    """
+    if gate is None:
+        gate = load_gate()
+    hp = gate.get("protect_highpass", {}).get(board)
+    if hp is None:
+        return None
+    hz = hp.get("hz") if isinstance(hp, dict) else None
+    order = hp.get("order") if isinstance(hp, dict) else None
+    if (
+        not isinstance(hp, dict)
+        or set(hp) != {"hz", "order"}
+        or not isinstance(hz, (int, float))
+        or isinstance(hz, bool)
+        or not 20.0 <= hz <= 1000.0
+        or not isinstance(order, int)
+        or isinstance(order, bool)
+        or order not in HIGHPASS_ORDERS
+    ):
+        raise ValueError(f"protect_highpass for {board}: want {{\"hz\": 20..1000, \"order\": one of {HIGHPASS_ORDERS}}}")
+    return float(hz), order
+
+
 def butterworth_q(order):
     """Q of each pole pair of an even-order Butterworth low-pass."""
     return [1.0 / (2.0 * math.sin((2 * k - 1) * math.pi / (2 * order))) for k in range(1, order // 2 + 1)]
@@ -413,6 +452,24 @@ def pipewire_conf(m, c, w, source=None, voicing_pre=None):
     sense_ports = sense_ports if sense else []
     inputs = [f'"sgv2:in_{unit[p]}"' for p in range(amps)] + [f'"sgv2:sense_{s}"' for s in sense_ports]
     outputs = [f'"sgv2:out_{unit[p]}"' for p in range(amps)]
+    # The board's high-pass (protect_highpass): on every amp's lane, in front
+    # of its unit port; the sense ports are untouched.
+    hp_nodes, hp_links = "", ""
+    hp = protect_highpass(c.get("board", m))
+    if hp is not None:
+        hz, order = hp
+        qs = butterworth_q(order)
+        for p in range(amps):
+            u = unit[p]
+            chain = [f"hp{u}s{k}" for k in range(len(qs))]
+            hp_nodes += "".join(
+                f'\n                    {{ type = builtin name = {n} label = bq_highpass control = {{ "Freq" = {hz:.1f} "Q" = {q:.9f} }} }}'
+                for n, q in zip(chain, qs)
+            )
+            hp_links += "".join(f'\n                    {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in zip(chain, chain[1:]))
+            hp_links += f'\n                    {{ output = "{chain[-1]}:Out" input = "sgv2:in_{u}" }}'
+            inputs[p] = f'"{chain[0]}:In"'
+    hp_links = f"\n                links = [{hp_links}\n                ]" if hp_links else ""
     sense_obj = ""
     # A sense PCM whose pointer advances in small chunks (the AOP sense ring:
     # 120 frames) is not period-batched: PipeWire's batch handling would
@@ -531,8 +588,8 @@ context.modules = [
             media.name       = "{c['name']} speaker protection"
             filter.graph = {{
                 nodes = [
-                    {{ type = lv2 name = sgv2 plugin = "{uri}" }}
-                ]
+                    {{ type = lv2 name = sgv2 plugin = "{uri}" }}{hp_nodes}
+                ]{hp_links}
                 inputs  = [ {" ".join(inputs)} ]
                 outputs = [ {" ".join(outputs)} ]
             }}
