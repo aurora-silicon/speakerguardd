@@ -234,11 +234,9 @@ def pcm_ids(idx):
     return out
 
 
-def pcm_status(idx, dev, d):
-    """The substream's /proc status as a dict ({"state": "closed"} when
-    closed, {} when unreadable)."""
+def pcm_info(idx, dev, d, name):
     try:
-        with open(f"/proc/asound/card{idx}/pcm{dev}{d}/sub0/status") as f:
+        with open(f"/proc/asound/card{idx}/pcm{dev}{d}/sub0/{name}") as f:
             t = f.read()
     except OSError:
         return {}
@@ -250,6 +248,11 @@ def pcm_status(idx, dev, d):
         if sep:
             out.setdefault(k.strip(), v.strip())
     return out
+
+
+def pcm_status(idx, dev, d):
+    """The substream's status (state=closed on close, {} if unreadable)."""
+    return pcm_info(idx, dev, d, "status")
 
 
 def pcm_state(idx, dev, d):
@@ -575,6 +578,19 @@ class Streams:
                 proc.kill()
                 proc.wait(2)
 
+    def _check_sense_params(self):
+        params = pcm_info(self.idx, self.sense, "c", "hw_params")
+        period = params.get("period_size", "")
+        if (params.get("format") != "S16_LE"
+                or params.get("channels") != str(self.sense_ch)
+                or params.get("rate", "").partition(" ")[0] != str(self.rate)
+                or not period.isdecimal() or int(period) == 0):
+            raise wiring.Refused(f"sense PCM hw_params do not match S16_LE, "
+                                 f"{self.sense_ch} channels at {self.rate} Hz and "
+                                 f"a positive period: {params}")
+        log(f"sense capture accepted S16_LE, {self.sense_ch} channels at "
+            f"{self.rate} Hz, period {period} frames")
+
     def start(self, idx):
         self.idx = idx
         self.capture_deadline = time.monotonic() + 30
@@ -594,6 +610,7 @@ class Streams:
             if time.monotonic() >= deadline:
                 raise wiring.Refused("sense capture did not become owned/RUNNING before playback")
             time.sleep(0.01)
+        self._check_sense_params()
         self.lease = Lease(self.ctl)
         self.lease.start()
         log("holding \"Speaker Protection\" for the silent switch test (zero samples only)")

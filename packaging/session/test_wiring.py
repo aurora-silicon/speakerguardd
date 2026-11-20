@@ -1355,6 +1355,39 @@ class RegmapRead(unittest.TestCase):
                 sgsc.regmap_values("3-0038", {0x0C})
 
 
+class SenseOpen(unittest.TestCase):
+    def test_checks_applied_pcm_geometry_before_taking_the_grant(self):
+        st = sgsc.Streams(None, "AppleK114c", 1, 2, 6, 48000)
+        good = "format: S16_LE\nchannels: 12\nrate: 48000 (48000/1)\nperiod_size: 2730\n"
+        for line, replacement in (
+            ("S16_LE", "S32_LE"),
+            ("channels: 12", "channels: 10"),
+            ("48000 (48000/1)", "44100 (44100/1)"),
+            ("period_size: 2730", "period_size: 0"),
+            (good, "closed\n"),
+        ):
+            with self.subTest(replacement=replacement), \
+                    mock.patch("builtins.open", mock.mock_open(read_data=good.replace(line, replacement))), \
+                    mock.patch.object(sgsc.subprocess, "Popen"), \
+                    mock.patch.object(sgsc.threading, "Thread"), \
+                    mock.patch.object(st, "_owned", return_value=True), \
+                    mock.patch.object(sgsc, "Lease") as lease:
+                with self.assertRaisesRegex(wiring.Refused, "sense PCM hw_params"):
+                    st.start(3)
+                lease.assert_not_called()
+
+        # The applied size need not equal the requested period or the graph
+        # quantum: a valid 2730-frame capture can proceed to the silent grant.
+        with mock.patch("builtins.open", mock.mock_open(read_data=good)) as proc, \
+                mock.patch.object(sgsc.subprocess, "Popen"), \
+                mock.patch.object(sgsc.threading, "Thread"), \
+                mock.patch.object(st, "_owned", return_value=True), \
+                mock.patch.object(sgsc, "Lease", side_effect=RuntimeError("ready for grant")):
+            with self.assertRaisesRegex(RuntimeError, "ready for grant"):
+                st.start(3)
+            proc.assert_called_once_with("/proc/asound/card3/pcm2c/sub0/hw_params")
+
+
 class StreamStop(unittest.TestCase):
     """The zero-sample playback ends on SIGTERM; the sense capture, whose
     data is no longer needed and which can stall once the playback stopped,

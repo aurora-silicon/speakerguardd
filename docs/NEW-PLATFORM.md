@@ -176,6 +176,16 @@ policy data; deny wins, and an explicit allow cannot bypass any proof.
 The former `qualified`, `require_qualified_board` and `allow-unqualified`
 mechanisms cannot admit a board.
 
+**K114c qualification is pending the owner's machine window.** Use the
+Mac's own installer extraction (AID49 and its unit calibration), not the
+legacy thermal constants or a profile copied from another model. Record the
+provenance and the compiler's primary and companion results. Keep the
+speakers muted while LSID parity or any other gate requirement is missing.
+Once the gate permits the silent self-check, record the applied PCM format,
+rate, period and V/I wiring. The ALSA period is not the PipeWire callback
+size: the LV2 unit processes only the frames in each callback, including
+the first after a new open. The hardware speaker row remains owed.
+
 The provisioning and self-check services use the gate's `prepare` mode,
 which checks graph types, refusals, parity and deny policy without requiring
 records that they have yet to produce. The supervisor's `v2` condition
