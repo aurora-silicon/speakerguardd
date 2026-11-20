@@ -254,17 +254,22 @@ class Derivation(unittest.TestCase):
         self.assertEqual(stale, [])
 
 
-def capture(n, quiet=(), pattern=()):
+def capture(n, quiet=(), pattern=(), late=False):
     """Synthetic sense statistics: every channel live except `quiet` (zeros)
-    and `pattern` (a fixed two-value idle square)."""
+    and `pattern` (a fixed two-value idle square). `late`: the words were
+    sampled one bit clock late (J615 before its receiver delay): live idle
+    noise then reads near full scale and a quiet channel takes the previous
+    word's last bit as its sign bit."""
     ch = []
     for k in range(n):
         if k in quiet:
-            ch.append({"distinct": 1, "rms": 0.0, "mean": 0.0})
+            ch.append({"distinct": 2, "rms": 16383.5, "mean": -16384.0} if late and k else
+                      {"distinct": 1, "rms": 0.0, "mean": 0.0})
         elif k in pattern:
             ch.append({"distinct": 2, "rms": 2.0, "mean": -2.0})
         else:
-            ch.append({"distinct": 60, "rms": 8.0, "mean": -0.4})
+            ch.append({"distinct": 9000, "rms": 23170.0, "mean": 1100.0} if late else
+                      {"distinct": 60, "rms": 8.0, "mean": -0.4})
     return {"frames": 19200, "ch": ch}
 
 
@@ -273,7 +278,7 @@ class SenseCheck(unittest.TestCase):
     do: [I, V] per amp, V switched off gives an idle pattern, I gives
     zeros."""
 
-    def run_check(self, w, truth, also=None):
+    def run_check(self, w, truth, also=None, late=False):
         switches = {}
         also = also or {}
         n = len(w["amps"])
@@ -295,7 +300,7 @@ class SenseCheck(unittest.TestCase):
                         for ch in (truth[(prefix, kind)], also.get((prefix, kind))):
                             if ch is not None:
                                 (pattern if kind == "V" else quiet).append(ch)
-                return capture(2 * n, quiet, pattern)
+                return capture(2 * n, quiet, pattern, late)
 
             def stop(self):
                 calls.append("stop")
@@ -404,6 +409,20 @@ class SenseCheck(unittest.TestCase):
         errs = self.run_check(self.w, self.truth, also={("Left Tweeter", "I"): self.truth[("Left Woofer", "I")]})
         self.assertTrue(any("Left Woofer ISENSE" in e and "no single switch" in e for e in errs), errs)
         self.assertEqual(len(errs), 1, errs)
+
+    def test_sense_sampled_a_bit_clock_late_fails(self):
+        # J615 before its receiver delay: the switches still map one to one
+        # (a switched-off word reads 0 or -32768), but idle noise is near
+        # full scale, so the power the protection computes is meaningless.
+        errs = self.run_check(self.w, self.truth, late=True)
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("misframed", errs[0])
+        self.assertIn("23170 counts RMS", errs[0])
+
+    def test_idle_ceiling(self):
+        self.assertEqual(sgsc.idle_too_loud(capture(4)), [])
+        self.assertEqual(sgsc.idle_too_loud(capture(4, late=True)), [0, 1, 2, 3])
+        self.assertEqual(sgsc.idle_too_loud({"ch": [{"rms": 2048.0}, {"rms": 2048.5}]}), [1])
 
     def test_a_switch_that_quiets_nothing_fails(self):
         truth = dict(self.truth)
