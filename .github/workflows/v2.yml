@@ -33,6 +33,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo test --workspace --release
+      # Thermal latch at the shipped SafeTlim TimeMin values (5 and 10 min of
+      # audio, about 10 s in release). Ignored in the default run for length.
+      - run: cargo test --release -p sgv2-core --test adversarial -- --ignored shipped
       - run: cargo build --workspace --release
 
   diffrig:

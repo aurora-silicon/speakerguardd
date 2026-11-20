@@ -44,7 +44,7 @@
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
-//! TODO(lane A): compile the blob from the bundle instead of `--params`.
+//! TODO(lane A, #209): compile the blob from the bundle instead of `--params`.
 
 #[cfg(target_os = "linux")]
 fn main() {
