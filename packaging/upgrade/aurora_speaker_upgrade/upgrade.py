@@ -10,7 +10,7 @@ this Mac's own tuning, and back.
     aurora-speaker-upgrade --check [--json FILE]                (dry run: /run only, nothing stored or switched)
     aurora-speaker-upgrade status
     aurora-speaker-upgrade collect --out DIR [--route ...]     (no switch; for checks)
-    aurora-speaker-upgrade interface-apply                     (speakerguardd.service ExecStartPre)
+    aurora-speaker-upgrade interface-apply                     (what speakerguardd-gate interface does; kept for scripts)
 
 1. The tuning bundle, the installer's own, first found of:
    0. an installer bundle already on this Mac, bound to this unit;
@@ -1027,9 +1027,10 @@ def cmd_status(a):
 
 
 def cmd_interface_apply(a):
-    """speakerguardd.service ExecStartPre: puts the kernel on the v2
-    interface when this Mac was upgraded; never fails the unit on kernels
-    without the switch."""
+    """Puts the kernel on the v2 interface when this Mac was upgraded; a
+    no-op on kernels without the switch. The supervisor unit does the same
+    itself (ExecStartPre=speakerguardd-gate interface); this command stays
+    for scripts that call it."""
     store = Store(a.store)
     mode, card = interface_mode()
     if mode != "dual":
@@ -1110,8 +1111,8 @@ def main(argv=None):
             "interface-apply": cmd_interface_apply, "revert": cmd_revert}
     try:
         if a.cmd in ("status", "interface-apply"):
-            # Never behind the lock: run restarts speakerguardd, whose
-            # ExecStartPre is interface-apply.
+            # Never behind the lock: status only reads, and interface-apply
+            # only repeats the gate's switch; neither waits for a run.
             return cmds[a.cmd](a)
         with locked():
             return cmds[a.cmd](a)

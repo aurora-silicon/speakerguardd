@@ -63,9 +63,9 @@ aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read
 4. **Switch, only on a pass.** On kernels with the interlock, the tool
    writes "Speaker Protection" to the kernel's "Speaker Protection
    Interface" control. Its setting lives in
-   `/var/lib/aurora-speaker-upgrade/interface`, and the
-   `50-aurora-speaker-upgrade.conf` drop-in applies it before the v2
-   supervisor starts at every boot. On kernels with only the v2 interface
+   `/var/lib/aurora-speaker-upgrade/interface`, and the v2 supervisor's
+   own `ExecStartPre=speakerguardd-gate interface` applies it before every
+   start (a refused switch fails the start). On kernels with only the v2 interface
    (fleet kernels), the switch only restarts the v2 supervisor. On kernels
    with only the legacy interface, the tool refuses the switch. If v2 does
    not take the speakers within 30 s, the tool goes back to the legacy
