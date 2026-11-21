@@ -3,14 +3,12 @@
 //! the core properties.
 
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use sgv2_core::Telemetry;
 use sgv2_lv2::page::EnginePage;
 use sgv2_lv2::{lv2_descriptor, VARIANTS};
 
-/// The C ABI reads its paths from the environment: tests take turns.
-static ENV: Mutex<()> = Mutex::new(());
+mod common;
 
 /// FINDING 13 (lane B): when any program input or output port is null,
 /// `run` returns before touching anything, so every connected output keeps
@@ -19,9 +17,8 @@ static ENV: Mutex<()> = Mutex::new(());
 /// for the call. A missing port should mute every connected output.
 #[test]
 fn a_null_program_port_mutes_the_connected_outputs() {
-    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-adversarial");
-    std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-adversarial");
+    let lock = common::lock();
+    let _env = common::TestEnv::new(&lock);
     let (_, channels, sense, _) = VARIANTS[0];
     assert_eq!((channels, sense), (2, 0), "variant 0 is the 2-channel, no-sense one");
     let d = lv2_descriptor(0);
@@ -95,9 +92,8 @@ fn the_engine_page_reports_the_most_restrictive_gain() {
 /// in place and crossed connections render exactly like distinct buffers.
 #[test]
 fn in_place_and_crossed_ports_render_like_distinct_buffers() {
-    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-adversarial");
-    std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-adversarial");
+    let lock = common::lock();
+    let _env = common::TestEnv::new(&lock);
     let (_, channels, sense, _) = VARIANTS[0];
     assert_eq!((channels, sense), (2, 0));
     let d = lv2_descriptor(0);
