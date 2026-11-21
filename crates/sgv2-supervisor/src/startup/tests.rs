@@ -174,10 +174,10 @@ impl Host {
         .blob
     }
 
-    fn refused(&mut self, path: Option<&Path>, voicing: bool, why: &str) {
+    fn refused(&mut self, path: Option<&Path>, voicing: bool, why: &str) -> startup::Error {
         let result = startup::start(self, path, voicing);
         let error = result.err().expect("must refuse before publication");
-        let message = match error {
+        let message = match &error {
             startup::Error::Config(m) | startup::Error::Unavailable(m) => m,
         };
         assert!(message.contains(why), "expected {why:?}, got {message:?}");
@@ -185,6 +185,7 @@ impl Host {
         assert!(self.published.is_none());
         assert!(!self.root.join("run/params.bin").exists());
         println!("REFUSED {why}: no publication; no device implementation available");
+        error
     }
 
     fn manifest(&mut self, edit: impl FnOnce(&mut serde_json::Value)) {
@@ -259,13 +260,40 @@ fn malformed_speaker_id_and_unknown_board_refuse() {
 }
 
 #[test]
-fn missing_bundle_does_not_fall_back_to_a_stale_blob() {
+fn bundle_io_is_unavailable_until_source_returns_without_stale_fallback() {
     for explicit in [false, true] {
-        let mut host = Host::new(&format!("missing-{explicit}"), "spp3", false);
-        std::fs::write(host.root.join("params.bin"), host.reference(false)).unwrap();
-        std::fs::remove_dir_all(host.root.join("bundle")).unwrap();
-        let path = explicit.then(|| host.root.join("bundle"));
-        host.refused(path.as_deref(), false, "No such file");
+        for voicing in [false, true] {
+            let mut host = Host::new(&format!("retry-{explicit}-{voicing}"), "spp3", voicing);
+            let reference = host.reference(voicing);
+            std::fs::write(host.root.join("params.bin"), &reference).unwrap();
+            let source = host.root.join("bundle");
+            let held = host.root.join("held-bundle");
+            std::fs::rename(&source, &held).unwrap();
+            let path = explicit.then_some(source.as_path());
+            let expected = Bundle::open(&source).unwrap_err();
+            assert!(matches!(expected, aurora_speaker_tuning::Error::Io { .. }));
+            let error = host.refused(path, voicing, &expected.to_string());
+            assert!(matches!(error, startup::Error::Unavailable(_)), "expected Unavailable, got {error:?}");
+            let selection = if explicit { "explicit" } else { "discover" };
+            assert_eq!(host.events, ["identity", "selfcheck", selection]);
+            println!("IO_UNAVAILABLE explicit={explicit} voicing={voicing}: {error:?}; no publication");
+
+            // A later startup must load and verify the source afresh; the
+            // stale compiled blob is never an alternate input.
+            std::fs::rename(&held, &source).unwrap();
+            host.events.clear();
+            let ready = startup::start(&mut host, path, voicing).unwrap();
+            assert_eq!(host.events, ["identity", "selfcheck", selection, "kernel", "publish"]);
+            assert_eq!(host.published.as_deref(), Some(reference.as_slice()));
+            assert_eq!(std::fs::read(host.root.join("run/params.bin")).unwrap(), reference);
+            assert_eq!(sha256_hex(&reference), ready.bind.params_sha256);
+            assert_eq!(ready.bind, host.bind);
+            println!(
+                "RETRY_OK explicit={explicit} voicing={voicing}: {} exact compiler bytes SHA256 {} matches self-check",
+                reference.len(),
+                sha256_hex(&reference)
+            );
+        }
     }
 }
 
@@ -273,27 +301,27 @@ fn missing_bundle_does_not_fall_back_to_a_stale_blob() {
 fn invalid_manifest_and_corrupt_digest_refuse() {
     let mut host = Host::new("invalid-manifest", "spp3", false);
     std::fs::write(host.root.join("bundle/manifest.json"), b"{}").unwrap();
-    host.refused(None, false, "manifest");
+    assert!(matches!(host.refused(None, false, "manifest"), startup::Error::Config(_)));
     let mut host = Host::new("bad-digest", "spp3", false);
     host.manifest(|m| m["files"][0]["sha256"] = "0".repeat(64).into());
-    host.refused(None, false, "sha256");
+    assert!(matches!(host.refused(None, false, "sha256"), startup::Error::Config(_)));
 }
 
 #[test]
 fn unverified_bundle_is_refused_even_if_its_bytes_match_the_selfcheck() {
     let mut host = Host::new("unverified", "spp3", false);
     host.unverified = true;
-    host.refused(None, false, "not verified");
+    assert!(matches!(host.refused(None, false, "not verified"), startup::Error::Config(_)));
 }
 
 #[test]
 fn wrong_board_and_wrong_unit_refuse() {
     let mut host = Host::new("wrong-board", "spp3", false);
     host.manifest(|m| m["board"] = "j999".into());
-    host.refused(None, false, "collected on a j999");
+    assert!(matches!(host.refused(None, false, "collected on a j999"), startup::Error::Config(_)));
     let mut host = Host::new("wrong-unit", "spp3", false);
     host.manifest(|m| m["unit_id"] = other_unit().into());
-    host.refused(None, false, "another Mac");
+    assert!(matches!(host.refused(None, false, "another Mac"), startup::Error::Config(_)));
 }
 
 #[test]
@@ -312,11 +340,11 @@ fn unsupported_mechanism_and_invalid_parameters_refuse() {
         ),
     );
     write_dir(&host.root.join("bundle"), &files, &manifest_json(&files, "25G83"));
-    host.refused(None, false, "64005");
+    assert!(matches!(host.refused(None, false, "64005"), startup::Error::Config(_)));
     let mut host = Host::new("bad-parameters", "spp3", false);
     files.insert(sc, binary::write(&dict(vec![])));
     write_dir(&host.root.join("bundle"), &files, &manifest_json(&files, "25G83"));
-    host.refused(None, false, "required field Version");
+    assert!(matches!(host.refused(None, false, "required field Version"), startup::Error::Config(_)));
 }
 
 #[test]
@@ -333,14 +361,14 @@ fn selfcheck_kernel_hash_board_result_and_geometry_must_match() {
                 host.bind.sense = 4;
             }
         }
-        host.refused(None, false, why);
+        assert!(matches!(host.refused(None, false, why), startup::Error::Config(_)));
     }
 }
 
 #[test]
 fn voicing_mode_change_needs_its_own_exact_selfcheck() {
     let mut host = Host::new("voicing-hash", "spp3", false);
-    host.refused(None, true, "parameters");
+    assert!(matches!(host.refused(None, true, "parameters"), startup::Error::Config(_)));
 }
 
 #[test]

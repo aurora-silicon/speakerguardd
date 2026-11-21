@@ -100,7 +100,13 @@ pub fn start(env: &mut impl Environment, path: Option<&Path>, voicing_pre: bool)
     let board = &identity.board;
     let bind = env.selfcheck().map_err(Config)?;
     let machine = selfcheck::machine_for(board, &bind).map_err(Config)?;
-    let bundle = env.bundle(path).map_err(|e| Config(e.to_string()))?;
+    // Bundle I/O is eligible for a later systemd start, including missing
+    // sources; it need not be transient and start limits still apply.
+    // Other loader errors remain configuration refusals.
+    let bundle = env.bundle(path).map_err(|e| match e {
+        aurora_speaker_tuning::Error::Io { .. } => Unavailable(e.to_string()),
+        _ => Config(e.to_string()),
+    })?;
     let mut diags = Diagnostics::default();
     let compiled = (|| {
         let tuning =
