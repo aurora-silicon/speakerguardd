@@ -209,16 +209,10 @@ def sha256(path):
 
 def find_card(hw, dt="/proc/device-tree"):
     """(index, id) of the ALSA card whose device is the DT sound node."""
-    want = os.path.realpath(os.path.join(dt, hw["sound"]))
-    for d in sorted(os.listdir("/sys/class/sound")):
-        if not re.fullmatch(r"card\d+", d):
-            continue
-        of = f"/sys/class/sound/{d}/device/of_node"
-        if os.path.exists(of) and os.path.realpath(of) == want:
-            idx = int(d[4:])
-            with open(f"/proc/asound/card{idx}/id") as f:
-                return idx, f.read().strip()
-    raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+    live = wiring.live_card(hw, dt)
+    if live is None:
+        raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+    return live
 
 
 def pcm_ids(idx):
@@ -1028,8 +1022,15 @@ def run_locked(args):
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
+        # The card is the one bound to the device tree's sound node, and its
+        # id is the card's own (wiring.cap_card): the graph opens that card,
+        # whatever name the device tree's model would suggest.
         if card != desc["card"]:
-            errs.append(f"the speaker card is {card}; macaudio names it {desc['card']} from the device tree's model")
+            log(f"the speaker card is {card} (bound to {hw['sound']}); the device tree's model suggests {desc['card']}")
+        desc = wiring.describe(hw, w, (idx, card))
+        report["machine"] = desc
+        # every capability the description rests on, with its source
+        report["caps"] = wiring.caps_report(wiring.probe(hw, (idx, card), w))
         if args.defer and w["method"] == "derived":
             if not errs:
                 # No record is written: the previous one stays (stale for
