@@ -719,7 +719,13 @@ def sense_path(hw):
     if not dmas or any(d is None for d in dmas) or not t.get("sense_dma"):
         return Cap(carries, "dt:no sense dma-names on the back-end; proven by the self-check's silent sense test")
     names = sorted({n for d in dmas for n in d})
-    return Cap(carries, f"dt:back-end dma-names {names} ({'names' if carries else 'no'} {t['sense_dma']!r})")
+    if t["sense_dma"] in names:
+        return Cap(carries, f"dt:back-end dma-names {names} (names {t['sense_dma']!r})")
+    if not carries:
+        return Cap(carries, f"dt:back-end dma-names {names} (names {t.get('speaker_dma')!r}, no {t['sense_dma']!r})")
+    # dma-names that name neither channel describe nothing about sense
+    return Cap(carries, f"dt:back-end dma-names {names} name neither {t.get('speaker_dma')!r} nor {t['sense_dma']!r}; "
+                        "proven by the self-check's silent sense test")
 
 
 def cap_amps(hw):
@@ -755,8 +761,13 @@ def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/
         of = os.path.join(sysfs, d, "device", "of_node")
         if os.path.exists(of) and os.path.realpath(of) == want:
             idx = int(d[4:])
-            with open(os.path.join(proc, f"card{idx}", "id")) as f:
-                return idx, f.read().strip()
+            path = os.path.join(proc, f"card{idx}", "id")
+            try:
+                with open(path) as f:
+                    return idx, f.read().strip()
+            except OSError as e:
+                raise Refused(f"the speaker card {d} is bound to {hw['sound']}, but its id cannot be read ({path}: "
+                              f"{e.strerror or e})") from None
     return None
 
 
