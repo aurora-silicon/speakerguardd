@@ -1,11 +1,28 @@
 # Single-resonator compensation component
 
 This component implements the finite-damping, single-resonator transfer
-observed through the native AudioUnit interface. It is not connected to the
-LSM2 protection unit. In particular, the placement relative to its nonlinear
-gain laws, its adaptive model updates, and the other J813 model features are
-not established by this component's small-signal verification. The compiler
-and fleet gate continue to refuse unsupported protection configurations.
+observed through the native AudioUnit interface.
+
+## In LSM2
+
+With `CompensateResonators` on, a channel whose speaker type's
+acceleration-manager block sets `UseCompensation` runs this transfer on its
+input ahead of the unit's models and limiter: the models, the meters and the
+limited output all see the compensated signal. The request is that block's
+`DesiredResonatorFrequency`, `DesiredResonatorQuality`, `MaxDCBoost` and
+`MaxResonanceCut`. The physical model is that block's own, resolved against
+its `UseGenericModelParameters` flags like the other managers' (the
+tuning's embedded family row where a flag is set). The compiler refuses a
+compensating block that turns resonator 1 off or enables resonator 2, LR2
+inductance, creep or a passive radiator, which this single-resonator
+transfer cannot represent.
+
+A channel without the flag, and every channel with `CompensateResonators`
+off, is not filtered. A request the filter refuses makes the unit the
+failsafe; reset clears the filter's history with the rest of the unit. The
+filter sees the metered sample: a non-finite input is 0 to it, as to the
+audio. The placement is checked by the differential rig. How compensation
+interacts with adaptive model updates is not established here.
 
 Given the runtime model's resistance R, force factor B, moving mass M,
 mechanical damping D and stiffness K, let:

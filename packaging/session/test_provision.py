@@ -1460,6 +1460,19 @@ class Gate(Base):
         policy["board_overrides"] = {"k116": "allow"}
         self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
 
+    def test_lsid_qualifies_only_when_the_compiler_releases_it(self):
+        policy = dict(GATE, units_at_parity=["spp3", "atsp", "lsm2", "lsid"])
+        gated = "warning[lsm2-release-gated] compile: unqualified companion/model/flow laws: output MUTED"
+        released = "warning[lsid-static-release] compile: the LSID estimator is not run"
+        for board, warning, ok in (("k116", gated, False), ("j713", released, True)):
+            with self.subTest(board=board):
+                self.board(board)
+                self.ctl({"board": board, "unit": "lsm2", "lsid": True, "warnings": [warning]})
+                self.assertEqual(self.run_(), 0 if ok else 1)
+                if ok:
+                    self.checked()
+                self.assertEqual(self.decide(gate_data=policy), (ok, False))
+
     def test_four_reference_boards_qualify_without_a_board_list(self):
         import gen
         for board, kind in (("j316s", "spp3"), ("j413", "spp3"), ("j616s", "spp3"), ("j700", "lsm2")):
@@ -1480,7 +1493,7 @@ class Gate(Base):
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        self.assertEqual(g["units_at_parity"], ["spp3", "lsm2", "atsp"])
+        self.assertEqual(g["units_at_parity"], ["spp3", "lsm2", "atsp", "lsid"])
         self.assertNotIn("qualified", g)
         self.assertNotIn("require_qualified_board", g)
         self.assertEqual(g["denied_boards"], [])

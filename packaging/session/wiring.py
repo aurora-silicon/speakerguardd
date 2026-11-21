@@ -290,6 +290,70 @@ def _links(snd, root, phandles, sysfs):
     return links
 
 
+def audio_stack(sound, root="/proc/device-tree", modules="/sys/module"):
+    """A fingerprint (16 hex digits) of what carries the speaker and sense
+    words on this boot, beyond the kernel release: the speaker card's node
+    `sound` (relative to `root`, with everything under it), the nodes its
+    links' `sound-dai` lists point at (the serializer and amp nodes, their
+    own properties), and the build ID of every loaded sound module (and of
+    the AOP core). A
+    rebuilt module or a changed device tree under the same release (the
+    J615's MCA receiver moved one bit clock by a module and a DT property)
+    changes it. "-" when `sound` is not in the tree."""
+    root = os.path.realpath(root)
+    snd = os.path.join(root, sound)
+    if not sound or not os.path.isdir(snd):
+        return "-"
+    h = hashlib.sha256()
+
+    def props(node, recursive):
+        for d, dirs, files in os.walk(node):
+            dirs.sort()
+            for name in sorted(files):
+                f = os.path.join(d, name)
+                h.update(os.path.relpath(f, root).encode() + b"\0")
+                try:
+                    h.update(_read(f))
+                except OSError:
+                    h.update(b"\xff")
+                h.update(b"\0")
+            if not recursive:
+                dirs[:] = []
+
+    props(snd, True)
+    phandles = _phandles(root)
+    nodes = set()
+    for d in sorted(os.listdir(snd)):
+        for side in ("cpu", "codec"):
+            f = os.path.join(snd, d, side, "sound-dai")
+            if os.path.exists(f):
+                try:
+                    nodes.update(_dai_list(_read(f), phandles))
+                except Refused:
+                    h.update(f"unresolved {d}/{side}".encode())
+    for node in sorted(nodes):
+        props(node, False)
+    try:
+        names = sorted(os.listdir(modules))
+    except OSError:
+        names = []
+    for m in names:
+        # the sound modules, and the AOP core the AOP Macs' speaker and
+        # sense rings run through (not its sensor clients)
+        if not (m.startswith("snd") or m == "aop"):
+            continue
+        h.update(f"module {m}\0".encode())
+        # the loaded binary: its GNU build ID note (srcversion exists only
+        # for modules with a MODULE_VERSION or CONFIG_MODULE_SRCVERSION_ALL)
+        for f in ("notes/.note.gnu.build-id", "srcversion"):
+            try:
+                h.update(_read(os.path.join(modules, m, f)))
+            except OSError:
+                h.update(b"-")
+            h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
 def has_speaker_link(node):
     """Whether a macaudio device tree node has the link macaudio drives
     speakers on ("Speaker" or "Speakers"); the J614s/J616s/J713 jack-only

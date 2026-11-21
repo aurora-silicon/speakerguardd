@@ -513,6 +513,7 @@ pub fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
         (id::C_ATTACK, 4.0),
         (id::C_FAST_RELEASE, 150.0),
         (id::C_SLOW_RELEASE, 15000.0),
+        (id::C_LATENCY, 22.0 / 3.0),
         (id::C_FILTERBANK_LATENCY, 10.0 / 3.0),
         (id::C_LOOKAHEAD, 2.0 / 3.0),
         (id::C_UNLINK_TEMPERATURE, 0.0),

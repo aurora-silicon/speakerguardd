@@ -83,9 +83,82 @@ impl Pace {
     }
 }
 
+/// When to say "protection ready" (every check holds, nothing plays yet).
+///
+/// Said once per spell. A spell starts at boot and at every grant, release,
+/// demand, fault or new kernel-side problem; it does not start again when a
+/// tick's readings merely went stale and fresh again. While idle the pollers
+/// run every [`IDLE_POLL_NS`] and the loop also ticks when they wake it, so
+/// an engine that keeps beating with nothing granted reads clean on one
+/// tick and stale on the next. Keyed to the previous tick, the line came
+/// back on every poll (every 100 ms on the J316s).
+#[derive(Debug, Default)]
+pub struct ReadyNote {
+    said: bool,
+}
+
+/// What a tick did, for [`ReadyNote::tick`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spell {
+    /// Nothing that starts a new spell.
+    Same,
+    /// A grant, release, fault, lapse, demand or a changed problem.
+    New,
+    /// The grant was given back with every check holding: the release is
+    /// reported on its own, and readiness is not said again for it.
+    GivenBack,
+}
+
+impl ReadyNote {
+    /// Whether to say the line on this tick: `ready` is this tick's verdict.
+    pub fn tick(&mut self, ready: bool, spell: Spell) -> bool {
+        match spell {
+            Spell::New => self.said = false,
+            Spell::GivenBack => {
+                self.said = true;
+                return false;
+            }
+            Spell::Same => {}
+        }
+        if ready && !self.said {
+            self.said = true;
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_is_said_once_however_the_readings_flicker() {
+        let mut n = ReadyNote::default();
+        // boot: said on the first ready tick
+        assert!(!n.tick(false, Spell::Same));
+        assert!(n.tick(true, Spell::Same));
+        // an idle engine that beats: clean, stale, clean ... for 21 s of
+        // 100 ms polls (the J316s row that said it 211 times)
+        let said = (0..420).filter(|i| n.tick(i % 2 == 0, Spell::Same)).count();
+        assert_eq!(said, 0);
+        // a grant and its release start a new spell
+        assert!(!n.tick(false, Spell::New));
+        assert!(n.tick(true, Spell::Same));
+        assert!(!n.tick(true, Spell::Same));
+        // a problem that comes and goes: said again once it holds
+        assert!(!n.tick(false, Spell::New));
+        assert!(!n.tick(false, Spell::Same));
+        // the tick it clears on is a new spell, and ready: said once
+        assert!(n.tick(true, Spell::New));
+        assert!(!n.tick(true, Spell::Same));
+        // the grant given back after a stream: not said for it
+        let mut n = ReadyNote::default();
+        n.tick(true, Spell::Same);
+        n.tick(false, Spell::New);
+        assert!(!n.tick(true, Spell::GivenBack));
+        assert!(!n.tick(true, Spell::Same));
+    }
 
     const MS: u64 = 1_000_000;
 

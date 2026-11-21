@@ -144,14 +144,35 @@ pub fn blob_full_scales(blob: &[u8]) -> Result<Vec<u32>, String> {
     Ok(per)
 }
 
-/// Half a 0.5 dB gain step: a different gain setting never matches.
+/// The widest operating-point tolerance: 0.25 dB, the distance a stored
+/// tuning full scale (two decimals of a volt) may sit from the gain it was
+/// collected at. Against a gain readback the tolerance is also held to half
+/// that control's own step ([`gain_tolerance_db`]).
 pub const OPERATING_POINT_TOLERANCE_DB: f64 = 0.25;
 
-/// Whether `measured_mv` is the operating point `expected_mv` names.
+/// Whether `measured_mv` is the operating point `expected_mv` names, within
+/// [`OPERATING_POINT_TOLERANCE_DB`] (the blob's channels against each other,
+/// and a fixed-gain amp's channels against the blob's).
 pub fn same_operating_point(measured_mv: f64, expected_mv: u32) -> bool {
+    same_operating_point_within(measured_mv, expected_mv, OPERATING_POINT_TOLERANCE_DB)
+}
+
+/// Whether `measured_mv` is the operating point `expected_mv` names, within
+/// `tolerance_db`.
+pub fn same_operating_point_within(measured_mv: f64, expected_mv: u32, tolerance_db: f64) -> bool {
     expected_mv > 0
         && measured_mv > 0.0
-        && (20.0 * (measured_mv / f64::from(expected_mv)).log10()).abs() <= OPERATING_POINT_TOLERANCE_DB
+        && (20.0 * (measured_mv / f64::from(expected_mv)).log10()).abs() <= tolerance_db
+}
+
+/// The tolerance for an amp gain read back on a control whose TLV states a
+/// step of `step_centi_db`: half that step, so the neighbouring gain setting
+/// never matches, and never wider than [`OPERATING_POINT_TOLERANCE_DB`].
+/// `None` (no grant) for a step that is not positive. On the tas2764 and
+/// tas2770 "Amp Gain Volume" (0.5 dB a step) this is the 0.25 dB used
+/// before the step was read.
+pub fn gain_tolerance_db(step_centi_db: i32) -> Option<f64> {
+    (step_centi_db > 0).then(|| (f64::from(step_centi_db) / 200.0).min(OPERATING_POINT_TOLERANCE_DB))
 }
 
 #[cfg(test)]
@@ -185,6 +206,35 @@ mod tests {
         assert!(!same_operating_point(mv, 0));
         // the Neo's two channels against its one fixed full scale
         assert!(same_operating_point(7_300.0, 7_330));
+    }
+
+    #[test]
+    fn the_gain_tolerance_is_half_the_controls_own_step() {
+        // 0.5 dB, every tas2764/tas2770 "Amp Gain Volume" today: exactly
+        // the constant it replaces, so nothing changes on those Macs
+        assert_eq!(gain_tolerance_db(50).unwrap().to_bits(), OPERATING_POINT_TOLERANCE_DB.to_bits());
+        for g in 0..=15 {
+            let mv = full_scale_mv(1100 + 50 * g);
+            for stored in [11_890u32, 8_410, 7_300, 5_000, 3_550] {
+                assert_eq!(
+                    same_operating_point_within(mv, stored, gain_tolerance_db(50).unwrap()),
+                    same_operating_point(mv, stored)
+                );
+            }
+        }
+        // a 0.25 dB step: 0.125 dB, so the neighbouring setting is refused
+        let t = gain_tolerance_db(25).unwrap();
+        assert_eq!(t, 0.125);
+        assert!(same_operating_point_within(full_scale_mv(1850), 11_890, t));
+        assert!(!same_operating_point_within(full_scale_mv(1875), 11_890, t));
+        assert!(!same_operating_point_within(full_scale_mv(1825), 11_890, t));
+        // with the fixed 0.25 dB the setting below would have matched
+        // (18.25 dBV is 0.243 dB under the stored 11.89 V)
+        assert!(same_operating_point(full_scale_mv(1825), 11_890));
+        // a coarser step never widens it
+        assert_eq!(gain_tolerance_db(100), Some(OPERATING_POINT_TOLERANCE_DB));
+        assert_eq!(gain_tolerance_db(0), None);
+        assert_eq!(gain_tolerance_db(-50), None);
     }
 
     #[test]

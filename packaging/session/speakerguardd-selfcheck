@@ -156,6 +156,15 @@ PCM_WAIT_S = 15
 # channels show 40-80 distinct values in 0.4-1 s, switched-off ones 1-3.
 LIVE = 16
 QUIET = 4
+# With digital silence playing, an amp's live sense is its idle noise: a few
+# counts to a few tens of counts RMS (J316, J413, J615: 7-9). A capture that
+# samples the serial words a bit clock early or late is just as "live" by the
+# count of distinct values, but each word then carries a bit of its neighbour
+# in place of its sign bit, so idle noise reads near full scale (J615 before
+# its receiver was moved one bit clock: about 23,000 RMS on every channel) and
+# the power computed from it is meaningless. Above this many counts RMS, in
+# S16, a live idle channel is not an amp's sense.
+IDLE_RMS_MAX = 2048
 
 # ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
 _ID_FMT = "IiII44sI"
@@ -471,6 +480,12 @@ def classify(st):
     return ["live" if c["distinct"] >= LIVE else "quiet" if c["distinct"] <= QUIET else "unclear" for c in st["ch"]]
 
 
+def idle_too_loud(st):
+    """The channels of a capture taken with digital silence playing whose
+    RMS no amp's idle sense reaches (IDLE_RMS_MAX)."""
+    return [k for k, c in enumerate(st["ch"]) if c["rms"] > IDLE_RMS_MAX]
+
+
 class Streams:
     """One capture, armed before playback, spans the entire silent test.
 
@@ -717,6 +732,12 @@ def check_sense(ctl, idx, card, devs, w, runs, widths=None):
         if any(c != "live" for c in cls):
             errs.append(f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live")
             return errs, st.fmt
+        loud = idle_too_loud(base)
+        if loud:
+            errs.append(f"with digital silence playing, sense channels {loud} read up to "
+                        f"{max(base['ch'][c]['rms'] for c in loud):.0f} counts RMS (an amp's idle sense is a few counts, "
+                        f"at most {IDLE_RMS_MAX}): the sense words are misframed, e.g. sampled a bit clock early or late")
+            return errs, st.fmt
         if not k:
             for p, a, kind in switches:
                 nm = names[(a["prefix"], kind)]
@@ -859,9 +880,22 @@ def lv2_shadows(users=None, etc="/etc", environ=None):
     return found
 
 
+# What a passing record is bound to: a reused pass must match all of them.
+# "audio" (wiring.audio_stack) covers what the kernel release does not: the
+# sound modules actually loaded and the device tree nodes that carry the
+# speaker and sense words.
+BOUND = ("board", "kernel", "params_sha256", "wiring", "audio")
+
+
+def audio_of(hw):
+    return wiring.audio_stack(hw.get("sound", ""))
+
+
 def bind_lines(rec):
-    keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "card", "amps", "sense", "family", "key", "method"]
-    out = [f"{k}={rec[k]}" for k in keys]
+    keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "audio", "card", "amps", "sense", "family", "key", "method"]
+    # a record from before "audio" was bound has none: written as "-",
+    # which no fingerprint equals, so its pass is never reused
+    out = [f"{k}={rec.get(k, '-') if k == 'audio' else rec[k]}" for k in keys]
     if rec["reasons"]:
         out.append("reason=" + rec["reasons"][0].replace("\n", " "))
     return "\n".join(out) + "\n"
@@ -913,13 +947,19 @@ def derive_live(args):
 
 def report_matches(path, bind):
     """The self-check record at `path` is a pass for the same board,
-    kernel, parameters and wiring as `bind`."""
+    kernel, parameters, wiring and audio stack as `bind`."""
     try:
         with open(path) as f:
             r = json.load(f)["record"]
     except (OSError, ValueError, KeyError, TypeError):
         return False
-    return r.get("result") == "pass" and all(str(r.get(k)) == bind.get(k) for k in ("board", "kernel", "params_sha256", "wiring"))
+    # a record from before "audio" was bound has none: "-", as bind_lines
+    # writes it (run_locked never reuses such a pass: a fingerprint is no "-")
+    def same(k):
+        if k == "audio":
+            return str(r.get(k, "-")) == bind.get(k, "-")
+        return str(r.get(k)) == bind.get(k)
+    return r.get("result") == "pass" and all(same(k) for k in BOUND)
 
 
 def set_deferred(path, text=None):
@@ -953,7 +993,7 @@ def run_locked(args):
     kernel = os.uname().release
     rec = {
         "schema": 1, "version": VERSION, "result": "fail", "board": "-", "kernel": kernel,
-        "params_sha256": "-", "wiring": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
+        "params_sha256": "-", "wiring": "-", "audio": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
         "method": "-", "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     report = {"record": rec}
@@ -971,19 +1011,20 @@ def run_locked(args):
             errs.append(f"the parameters are compiled for {blob_rate(args.params)} Hz, the tuning's graph runs at {w['rate']} Hz")
         report["machine"] = desc
         rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
-                   family=w["family"], key=w["key"], method=w["method"])
+                   family=w["family"], key=w["key"], method=w["method"], audio=audio_of(hw))
         report["wiring"] = w
         old = read_bind(bind_path)
         if (
             not args.force and not errs
             and old.get("result") == "pass" and old.get("version") == str(VERSION)
-            and all(old.get(k) == str(rec[k]) for k in ("board", "kernel", "params_sha256", "wiring"))
+            and all(old.get(k) == str(rec[k]) for k in BOUND)
             # the graph is generated from the record: a bind without its
             # record (lost or removed) is checked again, not reused
             and report_matches(report_path, old)
         ):
             set_deferred(args.deferred)
-            log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}: nothing to do")
+            log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}, "
+                f"audio stack {rec['audio']}: nothing to do")
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
@@ -1153,7 +1194,8 @@ def cmd_pending(args):
 
 def cmd_check(args):
     b = read_bind(os.path.join(args.state, "selfcheck.bind"))
-    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    hw = wiring.read_dt()
+    want = {"board": hw["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params), "audio": audio_of(hw)}
     bad = [k for k, v in want.items() if b.get(k) != v]
     if b.get("result") != "pass" or bad or not report_matches(os.path.join(args.state, "selfcheck.json"), b):
         log(f"no passing self-check for this kernel and these parameters (result {b.get('result')}, stale {bad})")
@@ -1217,7 +1259,8 @@ def verify_hardware(args):
     if not os.path.exists(args.params):
         raise Cannot(f"no parameter blob at {args.params}: provision first")
     b = read_bind(os.path.join(args.state, "selfcheck.bind"))
-    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    hw = wiring.read_dt()
+    want = {"board": hw["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params), "audio": audio_of(hw)}
     if not b:
         raise Cannot("the silent hardware self-check has not run (speakerguardd-selfcheck run)")
     stale = [k for k, v in want.items() if b.get(k) != v]
