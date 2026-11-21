@@ -5,6 +5,7 @@ with a stand-in tuning reader, device tree and speaker card.
     python3 -I packaging/session/test_provision.py
 """
 import contextlib
+import configparser
 import glob
 import hashlib
 import importlib.machinery
@@ -171,10 +172,12 @@ class Provision(Base):
         self.patch(gen, "voicing_enabled", lambda board: False)
         self.assertEqual(self.run_(), 0)
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
+        self.assertNotIn("--voicing-pre", prov.read_kv(self.p.conf)["SGV2_ARGS"])
         self.patch(gen, "voicing_enabled", lambda board: board == "j316s")
         self.assertEqual(self.run_(), 0)
         self.assertTrue(self.record()["compiled"])
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "true")
+        self.assertIn("--voicing-pre", prov.read_kv(self.p.conf)["SGV2_ARGS"])
         with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
             self.assertIn("--voicing-pre", f.read())
         self.assertEqual(self.run_(), 0)
@@ -183,6 +186,7 @@ class Provision(Base):
         self.assertEqual(self.run_(), 0)
         self.assertTrue(self.record()["compiled"])
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
+        self.assertNotIn("--voicing-pre", prov.read_kv(self.p.conf)["SGV2_ARGS"])
 
 
     def test_compiles_binds_and_configures(self):
@@ -192,7 +196,7 @@ class Provision(Base):
         self.assertEqual(conf["SGV2_MACHINE"], "j316")
         self.assertEqual(conf["SGV2_USER"], ME.pw_name)
         self.assertEqual(conf["SGV2_UID"], str(ME.pw_uid))
-        self.assertEqual(conf["SGV2_ARGS"], f"--card AppleJ316 --pcm 1 --uid {ME.pw_uid} --params {self.p.params}")
+        self.assertEqual(conf["SGV2_ARGS"], f"--card AppleJ316 --pcm 1 --uid {ME.pw_uid} --voicing-pre")
         self.assertEqual(conf["SGV2_PARAMS"], self.p.params)
         self.assertEqual(conf["SGV2_TUNING"], "")
         bind = prov.read_kv(self.p.bind)
@@ -321,6 +325,8 @@ class Provision(Base):
         os.makedirs(b)
         self.assertEqual(self.run_(bundle=b), 0)
         self.assertEqual(prov.read_kv(self.p.conf)["SGV2_TUNING"], b)
+        self.assertIn(f"--bundle {b}", prov.read_kv(self.p.conf)["SGV2_ARGS"])
+        self.assertNotIn("--params", prov.read_kv(self.p.conf)["SGV2_ARGS"])
         self.assertEqual(self.run_(bundle=os.path.join(self.t, "absent")), 1)
         self.assertEqual(self.run_(bundle=os.path.join(self.t, "a b")), 1)
 
@@ -1739,6 +1745,124 @@ class CardOrder(unittest.TestCase):
         # a registered speaker card answers whatever the tree scan says
         self.speaker(1)
         self.assertEqual(gate.kernel_interface(0, self.sysfs, dt=self.dt({})), ("dual", "AppleJ616"))
+
+
+class StartLimit:
+    """Offline model, not a running systemd manager.
+
+    Fixed-window admission from systemd v243 src/basic/ratelimit.c:
+    https://github.com/systemd/systemd/blob/v243/src/basic/ratelimit.c
+    A window resets strictly AFTER the interval, not at its boundary.
+    Only admission is modelled; counters after rejection are not exposed.
+    """
+
+    def __init__(self, interval, burst):
+        self.interval, self.burst = interval, burst
+        self.begin, self.count = None, 0
+
+    def below(self, now):
+        if not self.interval or not self.burst:
+            return True
+        if self.begin is None or now - self.begin > self.interval:
+            self.begin, self.count = now, 0
+        if self.count >= self.burst:
+            return False
+        self.count += 1
+        return True
+
+
+class RestartPolicy(unittest.TestCase):
+    """Source-backed schedule model of the packaged policy, in milliseconds.
+
+    systemd v243 src/core/service.c: service_shall_restart excludes prevented
+    exit codes; service_enter_dead arms restart_usec AFTER failure/teardown;
+    service_enter_restart queues JOB_RESTART (including dependencies);
+    service_start checks unit_test_start_limit before starting commands and
+    disables further restarts on a rejected start. See also systemd.unit(5)
+    StartLimitIntervalSec and systemd.service(5) Restart/RestartSec.
+
+    Synthetic main-process exit codes only, passing conditions/dependencies,
+    no other starts, drop-ins, counter resets, GC, suspend or scheduling lag.
+    Does not execute services, provisioning, gates, devices or audio.
+    """
+
+    @staticmethod
+    def milliseconds(value):
+        for suffix, scale in (("ms", 1), ("min", 60_000), ("s", 1000)):
+            if value.endswith(suffix):
+                return int(value[:-len(suffix)]) * scale
+        return int(value) * 1000
+
+    def policy(self, interval=10_000, burst=5):
+        # Read the real unit in its real sections. Defaults are upstream's
+        # DefaultStartLimitIntervalSec/Burst, overridden by explicit settings.
+        cfg = configparser.ConfigParser(strict=False, interpolation=None)
+        cfg.read(os.path.join(HERE, "..", "systemd", "speakerguardd.service"))
+        unit, service = cfg["Unit"], cfg["Service"]
+        # This model intentionally supports fixed-delay on-failure only.
+        self.assertEqual(service["Restart"], "on-failure")
+        for key in ("RestartSteps", "RestartMaxDelaySec", "RestartRandomizedDelaySec",
+                    "RestartForceExitStatus", "SuccessExitStatus"):
+            self.assertNotIn(key, service)
+        return (self.milliseconds(service["RestartSec"]),
+                self.milliseconds(unit["StartLimitIntervalSec"]) if "StartLimitIntervalSec" in unit else interval,
+                int(unit.get("StartLimitBurst", burst)),
+                {int(code) for code in service["RestartPreventExitStatus"].split()})
+
+    def schedule(self, exit_code=lambda now: 69, runtime=0, dependency_delay=0, defaults=None):
+        delay, interval, burst, prevent = self.policy(**(defaults or {}))
+        limit = StartLimit(interval, burst)
+        now, starts = 0, []
+        for _ in range(100):
+            if not limit.below(now):
+                return starts, now, "start-limit-hit"
+            starts.append(now)
+            code = exit_code(now)
+            now += runtime  # attempt and teardown time before the restart sleep
+            if code == 0 or code in prevent:
+                return starts, now, "success" if code == 0 else "prevented"
+            now += delay + dependency_delay  # dependencies may rerun before admission
+        return starts, now, "still-retrying"
+
+    def test_transient_io_recovers_after_twelve_seconds(self):
+        self.assertEqual(self.schedule(lambda now: 69 if now < 12_000 else 0),
+                         ([0, 5000, 10_000, 15_000], 15_000, "success"))
+
+    def test_last_retry_can_recover_at_twenty_seconds(self):
+        self.assertEqual(self.schedule(lambda now: 69 if now < 20_000 else 0),
+                         ([0, 5000, 10_000, 15_000, 20_000], 20_000, "success"))
+
+    def test_persistent_io_stops_after_five_prompt_attempts(self):
+        self.assertEqual(self.schedule(), ([0, 5000, 10_000, 15_000, 20_000], 25_000, "start-limit-hit"))
+        # Restoration after the last admitted start cannot revive this loop.
+        self.assertEqual(self.schedule(lambda now: 69 if now < 20_001 else 0)[2], "start-limit-hit")
+
+    def test_config_refusal_and_clean_exit_do_not_restart(self):
+        for code, outcome in ((78, "prevented"), (0, "success")):
+            with self.subTest(code=code):
+                self.assertEqual(self.schedule(lambda now: code), ([0], 0, outcome))
+
+    def test_healthy_uptime_does_not_use_up_future_restart_budget(self):
+        self.assertEqual(self.schedule(lambda now: 1 if now == 0 else 0, runtime=120_000),
+                         ([0, 125_000], 245_000, "success"))
+
+    def test_unit_limits_override_manager_defaults(self):
+        expected = self.schedule()
+        for defaults in ({"interval": 0, "burst": 0}, {"interval": 1, "burst": 1},
+                         {"interval": 3_600_000, "burst": 1000}):
+            with self.subTest(defaults=defaults):
+                self.assertEqual(self.schedule(defaults=defaults), expected)
+
+    def test_startup_and_dependency_time_are_additional(self):
+        self.assertEqual(self.schedule(runtime=1000, dependency_delay=2000),
+                         ([0, 8000, 16_000, 24_000, 32_000], 40_000, "start-limit-hit"))
+
+    def test_slow_failures_can_roll_into_a_new_window(self):
+        # Five restart sleeps plus 35 s of work land exactly on 60 s: denied.
+        self.assertEqual(self.schedule(runtime=7000)[1:], (60_000, "start-limit-hit"))
+        # Beyond that boundary the window resets: this is NOT a lifetime cap
+        # or a fixed wall-clock deadline. Provisioning alone can take 300 s.
+        self.assertEqual(self.schedule(runtime=7001)[2], "still-retrying")
 
 
 class Units(unittest.TestCase):
