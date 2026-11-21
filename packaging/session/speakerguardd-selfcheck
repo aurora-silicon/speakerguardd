@@ -1512,6 +1512,17 @@ def cmd_generate(args):
             bound_mode = any(line.strip() == "voicing_pre=true" for line in f)
     if enabled != bound_mode:
         raise SystemExit("voicing gate changed since compilation: run speakerguardd-provision again")
+    if enabled:
+        # The speaker identity selects the voicing trims: the record's must
+        # be the one of the bundle provisioning compiled the blob from.
+        try:
+            with open(os.path.join(args.state, "provision.json")) as f:
+                provisioned = json.load(f).get("aid")
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"the provisioning record cannot be read ({e}): run speakerguardd-provision again")
+        if provisioned != c["aid"]:
+            raise SystemExit(f"the self-check record names speaker identity {c['aid']!r}, the provisioned bundle "
+                             f"{provisioned!r}: run speakerguardd-provision and the self-check again")
     src = f"the self-check of {rec['board']} ({rec['kernel']})"
     for d, name, text in (
         (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src, voicing_pre=enabled)),

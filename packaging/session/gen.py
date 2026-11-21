@@ -128,11 +128,14 @@ def speaker_table(name, gate):
 
 
 def speaker_identity(c):
-    """The speaker identity (AID) of the bundle a description was made from.
-    Without one, no speaker table can be read, so the voicing refuses."""
+    """The speaker identity (AID<n>) of the bundle a description was made
+    from. Only that form can match a speaker table's key, so anything else
+    (missing, "-", "13", "aid13", a placeholder) refuses the voicing rather
+    than reading no entry and silently dropping a speaker's bound."""
     aid = c.get("aid")
-    if not isinstance(aid, str) or not aid:
-        raise ValueError(f"{c.get('board', c.get('key'))}: the description names no speaker identity (aid)")
+    if not isinstance(aid, str) or not SPEAKER_KEY.fullmatch(aid):
+        raise ValueError(f"{c.get('board', c.get('key'))}: the description names no speaker identity "
+                         f"(aid {aid!r}, want AID<n>)")
     return aid
 
 

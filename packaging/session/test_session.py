@@ -20,6 +20,18 @@ import gen  # noqa: E402
 
 # Every machine with a fixture, as the derivation describes it.
 MACHINES = {m: gen.machine(m)[0] for m in gen.machines()}
+# A speaker identity no table names. The fixtures of Macs whose bundle
+# identity is not recorded carry "-" (no identity), which refuses the
+# voicing as on a running Mac; the graph-structure tests that generate the
+# voicing for every fixture give those this one instead.
+STRUCTURE_AID = "AID0"
+
+
+def voiced(m):
+    c, w = gen.machine(m)
+    if not gen.SPEAKER_KEY.fullmatch(str(c.get("aid"))):
+        c = dict(c, aid=STRUCTURE_AID)
+    return c, w
 
 
 class FakeGraph(sgs.Graph):
@@ -833,13 +845,26 @@ class Generated(unittest.TestCase):
         # The same description from another speaker gets no J413 trim.
         other = gen.pipewire_conf("j413", dict(c, aid="AID21"), w, voicing_pre=True)
         self.assertNotIn("label = linear", other)
-        # No speaker identity: the voicing refuses rather than run untrimmed.
-        for missing in (None, "", 13):
+        # No speaker identity, or one no table key can match: the voicing
+        # refuses rather than run untrimmed (the J413 would lose its bound).
+        for missing in (None, "", 13, "13", "aid13", "AID13 ", "synthetic", "-"):
             with self.assertRaises(ValueError):
                 gen.voicing_conf("j413", dict(c, aid=missing), w)
         bare = {k: v for k, v in c.items() if k != "aid"}
         with self.assertRaises(ValueError):
             gen.voicing_conf("j413", bare, w)
+        # The fixtures carry the real identity where the bundle's is known,
+        # else "-": those refuse the voicing exactly as a running Mac would.
+        known = {"j316": "AID9", "j413": "AID13", "j616": "AID35", "j700": "AID44"}
+        for m in gen.machines():
+            fc, fw = gen.machine(m)
+            if m in known:
+                self.assertEqual(fc["aid"], known[m])
+                gen.voicing_conf(m, fc, fw)
+            else:
+                self.assertEqual(fc["aid"], "-", m)
+                with self.assertRaises(ValueError):
+                    gen.voicing_conf(m, fc, fw)
         # The interim graph reads no speaker table, so it needs no identity.
         self.assertEqual(gen.pipewire_conf("j413", bare, w, voicing_pre=False), gen.pipewire_conf("j413", c, w, voicing_pre=False))
 
@@ -859,7 +884,7 @@ class Generated(unittest.TestCase):
         on = sorted(m for m in gen.machines() if gen.voicing_lowpass(gen.machine(m)[0]["aid"]) is not None)
         self.assertEqual(sorted(set(on)), [])
         for m in gen.machines():
-            c, w = gen.machine(m)
+            c, w = voiced(m)
             conf = gen.pipewire_conf(m, c, w, voicing_pre=True)
             lp = gen.voicing_lowpass(c["aid"])
             if lp is None:
@@ -885,7 +910,7 @@ class Generated(unittest.TestCase):
 
     def test_both_modes_target_the_same_protect_input_and_only_generated_mode_owns_volume(self):
         for m in gen.machines():
-            c, w = gen.machine(m)
+            c, w = voiced(m)
             interim = gen.pipewire_conf(m, c, w, voicing_pre=False)
             generated = gen.pipewire_conf(m, c, w, voicing_pre=True)
             self.assertNotIn('sgv2.stage = "voicing-pre"', interim)
@@ -909,7 +934,7 @@ class Generated(unittest.TestCase):
         # A desktop that lists it, or resolves its volume keys through the
         # voicing to it, would change its volume and drop the carrier.
         for m in gen.machines():
-            c, w = gen.machine(m)
+            c, w = voiced(m)
             for pre in (False, True):
                 conf = gen.pipewire_conf(m, c, w, voicing_pre=pre)
                 block = conf.split(f'node.name          = "{gen.PROTECT_INPUT}"', 1)[1].split("}", 1)[0]
@@ -920,7 +945,7 @@ class Generated(unittest.TestCase):
         # of a graph, not as a device sink or source; the group is the same
         # set as node.group, so the drivers do not change.
         for m in gen.machines():
-            c, w = gen.machine(m)
+            c, w = voiced(m)
             n = gen.names(m)
             for pre in (False, True):
                 conf = gen.pipewire_conf(m, c, w, voicing_pre=pre)
@@ -938,7 +963,7 @@ class Generated(unittest.TestCase):
         # client then wedged the path (the amps can never start). The amps
         # sink, the protect stage and the voicing sink hold the PCM rate.
         for m in gen.machines():
-            c, w = gen.machine(m)
+            c, w = voiced(m)
             for voicing_pre in (False, True):
                 text = gen.pipewire_conf(m, c, w, voicing_pre=voicing_pre)
                 sink = text.split("factory.name           = api.alsa.pcm.sink", 1)[1].split("}", 1)[0]
@@ -957,7 +982,7 @@ class Generated(unittest.TestCase):
         # device and no clock of its own, outside the amps' group (a link to
         # it never wakes the amps), at the PCM rate.
         for m in gen.machines():
-            c, w = gen.machine(m)
+            c, w = voiced(m)
             n = gen.names(m)
             for pre in (False, True):
                 text = gen.pipewire_conf(m, c, w, voicing_pre=pre)
