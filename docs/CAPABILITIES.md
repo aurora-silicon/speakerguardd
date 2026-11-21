@@ -21,7 +21,7 @@ every value, and the self-check stores the same report in
 | `dt:` | the device tree, as macaudio reads it | speaker dai-link, amp nodes and their `sound-name-prefix`, sense slots, back-end `dma-names` |
 | `alsa:` | the running card | the card bound to the device tree's sound node; control dB scales (supervisor) |
 | `tuning:` | the Mac's own tuning bundle (reader's graph trace) | protection unit, channel roles, sample rate, speaker identity (AID) |
-| `driver:` | a constant of the kernel driver a compatible binds | sample formats, ring cadence; keyed by the **block's** compatible |
+| `driver:` | a constant of the kernel driver a compatible binds | sample formats, ring cadence; keyed by the **block's** compatible (see "Driver constants" below) |
 | `derived:` | computed from the above | PCM widths, plugin variant, channel and sense maps |
 
 The board name is still read, as an identity: the self-check record, the
@@ -37,7 +37,7 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Speaker transport (MCA, AOP variants) | graph format and buffering | `driver:` back-end compatible (`TRANSPORTS`) | capability (per block); a new block needs an entry, never a board entry |
 | Sense present on this Mac | wiring method, unit admission | `dt:` back-end `dma-names` names the driver's sense channel (or not) | capability |
 | Sense slots and their order | sense map | `dt:` `ti,vmon-slot-no` / `ti,imon-slot-no` | capability, proven silently by the self-check |
-| ALSA card id | graph (`hw:CARD=`), supervisor | `alsa:` the card bound to the sound node (**this change**); offline `dt:` model | capability |
+| ALSA card id | graph (`hw:CARD=`), supervisor, provisioning | `alsa:` the card bound to the sound node (**this change**; the self-check and provisioning use the same lookup, and a reused pass needs the same id); offline `dt:` model | capability |
 | Machine key (`apple,<key>-macaudio`) | names the voicing graph and the generated file | `dt:` sound node compatible | naming only |
 | Protection unit, roles, rate | wiring, blob | `tuning:` | capability |
 | Units that may run without sense | wiring | `tuning:` unit kind (spp3 needs sense) | capability |
@@ -46,7 +46,7 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Speaker identity (`spid`) | tuning selection | bundle manifest; `dt:` `/chosen` export when present | provider gap (below) |
 | Fixed volume ceiling under the lease | supervisor grant check | not read: the supervisor expects 0 dB and latches on anything else | provider gap (below) |
 | Interim voicing trims, low-pass, deployment overrides | voicing graph | `gate.json` tables keyed by board | policy, to re-key (below) |
-| High-pass in front of protection for a speaker without a model | protect graph | not on main | tuning, keyed by the bundle (below) |
+| High-pass in front of protection for a speaker without a model | protect graph | not on main | read from the Mac's own tuning bundle; absent = refused (below) |
 | Board identity | record, blob, thermal state | `dt:` root compatible | identity binding, stays |
 
 ## Failing closed
@@ -61,8 +61,24 @@ Each capability either has a source or refuses:
   test must see it on the card, or the record fails.
 - No ALSA card bound to the sound node: the self-check fails.
 - A grant at any volume other than the one expected: the supervisor latches.
+- A protection value the Mac does not report (a fixed volume ceiling, a
+  high-pass in front of protection) is never filled from a table of ours,
+  whatever the table is keyed by: no grant, muted. Today a fixed ceiling
+  latches the supervisor (0 dB expected), and a high-pass has no reader
+  yet, so a speaker that needs one has no way in.
 
-The only defaults are the safe ones. No missing value admits a Mac.
+The only defaults are the safe ones. One missing value still admits a Mac
+today, and it is tracked:
+
+- **Speaker ID unknown on a database with one chain per vendor.** When the
+  tuning database has per-vendor configurations and neither the bundle
+  manifest nor the loader names this Mac's speaker ID,
+  `aurora-speaker-tuning` (`select.rs`, `select-speaker-id-unknown`) warns
+  and compiles the vendor-neutral chain. That chain may carry protection
+  parameters meant for another vendor's assembly. The fix makes this a
+  refusal (no blob, muted); it changes the tuning reader, so it lands as its
+  own change with a re-run of the macOS parity gate and a fleet row showing
+  no Mac takes this path today.
 
 ## Providers first, fallbacks second
 
@@ -70,15 +86,20 @@ Where a capability must first be exposed by the kernel, the device tree or
 the loader, that provider lands first. speakerguardd reads it when present
 and keeps today's path as the fallback when it is absent; the fallback goes
 once a release carries the provider. The fallback is never more permissive
-than the provider.
+than the provider, and for a value that protects the speaker the only
+fallback is refusal.
 
 1. **Fixed ceiling under the lease.** The kernel knows the level its lease
    lifts the speaker to on a machine with a fixed ceiling. Provider: the
    kernel reports it to userspace (the leased volume control's own range,
    or a read-only control). Reader: the self-check records it and the
-   supervisor grants only at exactly that level. Fallback until then: a
-   `gate.json` value, which only lowers the volume and is cross-checked
-   against the card; with neither, 0 dB is expected and a ceiling latches.
+   supervisor grants only at exactly that level. Until the provider exists
+   there is no fallback value: 0 dB is expected, a ceiling latches, and a
+   Mac that needs a ceiling the kernel does not report gets no grant and
+   stays muted. A value of ours (`gate.json`, keyed by board or by speaker)
+   is not a fallback: a ceiling set too high is exactly the failure this
+   protects against, so "it only lowers the volume" does not make a guessed
+   one safe.
 2. **Speaker identity.** Linux has no passive reader of the speaker-ID
    straps. Provider: the loader exports the ID under `/chosen`. Reader:
    `aurora-speaker-tuning` already reads it when present. Fallback: the
@@ -88,29 +109,55 @@ than the provider.
    and T8132 AOP. A new driver entry names its `speaker_dma` and
    `sense_dma`.
 
-## Per-model data is tuning
+## Voicing trims are tuning; protection values come from the machine
 
-Values that compensate for an open voicing law, or protect a speaker that
-has no model, belong to the speaker, not the board. They stay as tuning
-keyed by what the bundle names (its speaker identity), never as a code
-gate, and never as a value that admits a Mac on its own:
+Two kinds of per-model data, with opposite rules:
 
-- `gate.json` `voicing_pre_bound_db` (0 dB on every lane except the
-  J413's woofers, -0.043 dB) and `voicing_pre_lowpass` (empty) are
-  re-keyed by the bundle's speaker identity in a follow-up. Entries that
-  have no effect (0 dB, empty) are dropped, and any new interim entry is
-  keyed the same way.
+- **Voicing trims** compensate for an open voicing law. They only
+  attenuate, they never admit a Mac, and a missing entry means "no trim",
+  which is harmless. They belong to the speaker, not the board, so they
+  stay as tuning keyed by what the bundle names (its speaker identity),
+  never as a code gate.
+  - `gate.json` `voicing_pre_bound_db`: 0 dB on every lane except the
+    J413's woofers, -0.043 dB. The value is ours, not Apple's: the bound
+    `bound.py` computes from our full-chain safety scan of v2's voicing
+    against the macOS chain's own render (VirtBass/Tone onset precision
+    puts v2 a few hundredths of a dB over on woofer bursts). It is a voicing
+    trim, not a protection level: it is validated as never positive and
+    sits before protection, which is unchanged by it.
+  - `voicing_pre_lowpass` (empty).
+  Both are re-keyed by the bundle's speaker identity in a follow-up.
+  Entries that have no effect (0 dB, empty) are dropped, and any new
+  interim entry is keyed the same way.
 - `voicing_pre` overrides equal the runtime default (generated voicing) on
   every board they name; they keep the offline fixtures' recorded mode and
   are re-keyed with the fixtures.
-- A protect-stage high-pass for a speaker without a model is tuning, keyed
-  the same way.
+- **Protection values** (a volume ceiling under the lease, a high-pass in
+  front of protection for a speaker without a model, any excursion,
+  thermal or gain limit) protect the hardware. They come from the machine
+  only: the kernel/driver (a control's range, a read-only control) or the
+  Mac's own tuning bundle. They are never a table of ours, keyed by board
+  or by speaker identity, and the keyed-table helper the voicing trims use
+  is not reused for them. Absent from the machine = refused: no grant,
+  muted.
+
+## Driver constants
+
+`driver:` values (amp `FAMILY` gain control and fault status, `TRANSPORTS`
+formats, headroom and IRQ cadence) are userspace copies of kernel
+constants, keyed by the block's compatible: no board gate. They are meant
+as the offline value only; on a running Mac the live reading should win
+and a mismatch refuse. Today that holds for the sample format: the
+self-check reads the applied hw params and fails on a mismatch. Gain
+control and fault status are not yet compared with the card's own control
+list (the supervisor uses the copy); reading them from the card, and
+refusing when the copy disagrees, is an open item.
 
 ## Open changes and the capability layer
 
 | Change | Its machine-specific part | Maps onto |
 |---|---|---|
-| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; `operating_volume_db`; `protect_highpass` keyed by board | transport entry as is (per block); ceiling via provider 1 with the table as fallback; high-pass as tuning keyed by the bundle |
+| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; `operating_volume_db`; `protect_highpass` keyed by board | transport entry as is (per block); the ceiling only via provider 1 and the high-pass only from the bundle. Neither ships as a table of ours (board- or speaker-keyed); until the providers exist that Mac gets no grant |
 | T8142/T6050 transport without a sense channel | `speaker_dma`/`sense_dma` on the driver entry | as is: per block, `sense_path` |
 | K114c sense on the v2 path | applied sense geometry | as is: `alsa:` applied hw params |
 | Fail closed on an unproven method; units without sense by name | method dispatch, `NO_SENSE_UNITS` | as is: `tuning:` unit kind |
