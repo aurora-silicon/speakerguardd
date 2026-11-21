@@ -43,7 +43,7 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Units that may run without sense | wiring | `tuning:` unit kind (spp3 needs sense) | capability |
 | Volume step and dB level | supervisor operating point | `alsa:` control TLV | capability |
 | Applied sense geometry (format, channels, period) | self-check | `alsa:` applied hw params | capability |
-| Speaker identity (`spid`) | tuning selection | bundle manifest; `dt:` `/chosen` export when present | provider gap (below) |
+| Speaker identity (`spid`) | tuning selection | `dt:` `/chosen/asahi,speaker-id` (the loader, from the ADT straps); bundle manifest without it | capability where the loader exports it (below) |
 | Fixed volume ceiling under the lease | supervisor grant check | not read: the supervisor expects 0 dB and latches on anything else | provider gap (below) |
 | Interim voicing trims and low-pass | voicing graph | `gate.json` tables keyed by the bundle's speaker identity (`aid`) | tuning (below) |
 | Voicing deployment overrides | offline fixtures' recorded mode | `gate.json` `voicing_pre` keyed by board | policy, to re-key with the fixtures (below) |
@@ -81,9 +81,12 @@ than the provider.
    `gate.json` value, which only lowers the volume and is cross-checked
    against the card; with neither, 0 dB is expected and a ceiling latches.
 2. **Speaker identity.** Linux has no passive reader of the speaker-ID
-   straps. Provider: the loader exports the ID under `/chosen`. Reader:
-   `aurora-speaker-tuning` already reads it when present. Fallback: the
-   bundle manifest's `speaker_id`.
+   straps. Provider: the loader reads the straps the ADT names
+   (`find-speaker-id`, `function-speaker-id0/1`, `valid-speaker-ids`) and
+   exports the ID as `/chosen/asahi,speaker-id`; aura does this
+   (`kboot_audio.c`), and the J616s and J713 boot with it. Reader:
+   `aurora-speaker-tuning` reads it when present. Fallback, for a boot
+   chain without the export: the bundle manifest's `speaker_id`.
 3. **Sense presence on a new transport.** Provider: the back-end node's
    `dma-names` (sense channel named or not), already used for the T6041
    and T8132 AOP. A new driver entry names its `speaker_dma` and
