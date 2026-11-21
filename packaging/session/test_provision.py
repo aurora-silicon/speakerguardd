@@ -160,6 +160,16 @@ class Base(unittest.TestCase):
     def run_(self, **kw):
         return prov.cmd_run(self.args(**kw), self.p)
 
+    def current_bind(self, digest, **kw):
+        """selfcheck.bind of a passing switch test on this (synthetic) Mac:
+        every field provisioning's selfcheck_current() compares."""
+        import wiring
+        hw = wiring.read_dt(self.dt)
+        rec = dict(result="pass", board=hw["board"], kernel=os.uname().release, params_sha256=digest,
+                   audio=wiring.audio_stack(hw.get("sound", ""), root=self.dt))
+        rec.update(kw)
+        return "".join(f"{k}={v}\n" for k, v in rec.items() if v is not None)
+
     def record(self):
         with open(self.p.report) as f:
             return json.load(f)
@@ -641,8 +651,7 @@ class Graph(Base):
         # The switch test passed after login: its activate generates the
         # graph while the test is still marked pending (until ExecStopPost).
         digest = prov.sha256_file(self.p.params)
-        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
-                          f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), self.current_bind(digest))
         from unittest import mock
         done = types.SimpleNamespace(returncode=0, stderr="", stdout="")
         with mock.patch.object(prov.subprocess, "run", return_value=done) as run:
@@ -663,6 +672,27 @@ class Graph(Base):
         self.assertEqual(os.listdir(wpd), ["59-sgv2-raw.conf"])
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
 
+    def test_activate_keeps_the_switch_test_pending_for_a_stale_record(self):
+        """speakerguardd-selfcheck.service's ExecStartPost activate, after a
+        `run --defer` that found no current pass: a record that still names
+        this kernel and blob but another audio stack (a rebuilt sound module
+        or changed speaker/sense nodes), another board, or no "audio" at all
+        (written before it was bound, e.g. by 0.48 before an upgrade) is not
+        current. No graph, and the marker stays, so speakerguardd-switchtest
+        runs the switch test after login."""
+        self.provisioned()
+        digest = prov.sha256_file(self.p.params)
+        from unittest import mock
+        for stale in (dict(audio=None), dict(audio="0123456789abcdef"), dict(board="j999")):
+            with self.subTest(stale=stale):
+                prov.write_atomic(self.p.deferred, "kernel=k\n")
+                prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), self.current_bind(digest, **stale))
+                with mock.patch.object(prov.subprocess, "run") as run:
+                    self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+                run.assert_not_called()
+                self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pending")
+                self.assertTrue(os.path.exists(self.p.deferred))
+
     def test_switch_test_activate_does_not_wait_on_the_session(self):
         """The switch test passed while the seat user's PipeWire runs (a
         switch in a live session): activate starts the user's graph unit and
@@ -672,8 +702,7 @@ class Graph(Base):
         home = self.provisioned()
         prov.write_atomic(self.p.deferred, "kernel=k\n")
         digest = prov.sha256_file(self.p.params)
-        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
-                          f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), self.current_bind(digest))
         started = []
 
         def refresh(p, user, changed_us, unit):

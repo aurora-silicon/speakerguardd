@@ -894,15 +894,27 @@ def publish_voicing_parameters(p, previous_voicing=False):
     write_atomic(p.published, data)
 
 
-def selfcheck_current(p):
-    """The self-check's record is a pass for this kernel and this blob (the
-    switch test after login has passed; `generate` checks the rest)."""
+def selfcheck_current(p, dt=DT):
+    """The self-check's record is a pass for this Mac as it runs now (the
+    switch test after login has passed): the same board, kernel, blob and
+    audio stack that speakerguardd-selfcheck binds and its `check` compares.
+    "audio" (wiring.audio_stack) covers the sound modules and the device
+    tree nodes that carry the speaker and sense words, which can change
+    under the same kernel release; a record from before "audio" was bound
+    has none, so it is not current and the deferred switch test runs again.
+    `generate` checks the rest."""
     b = read_kv(os.path.join(p.state, "selfcheck.bind"))
     try:
         digest = sha256_file(p.params)
     except OSError:
         return False
-    return b.get("result") == "pass" and b.get("kernel") == os.uname().release and b.get("params_sha256") == digest
+    if not (b.get("result") == "pass" and b.get("kernel") == os.uname().release and b.get("params_sha256") == digest):
+        return False
+    try:
+        hw = wiring.read_dt(dt)
+    except (wiring.Refused, OSError):
+        return False
+    return b.get("board") == hw["board"] and b.get("audio") == wiring.audio_stack(hw.get("sound", ""), root=dt)
 
 
 def cmd_activate(args, p):
@@ -914,7 +926,7 @@ def cmd_activate(args, p):
         return 1
     os.makedirs(p.graph, mode=0o755, exist_ok=True)
     os.chmod(p.graph, 0o755)  # the seat user's session reads it, whatever the caller's umask
-    if os.path.exists(p.deferred) and not selfcheck_current(p):
+    if os.path.exists(p.deferred) and not selfcheck_current(p, args.dt):
         # Before login, with the switch test still to run: no graph (and
         # none left from earlier in this boot). speakerguardd-switchtest
         # runs the test after login and activates again; until it ends no
