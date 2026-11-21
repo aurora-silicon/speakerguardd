@@ -188,6 +188,34 @@ kernel and publication dependencies into the same startup function the binary
 calls. They do not run the daemon or prove physical speaker behaviour, live
 service deployment, or qualification on every v2 board.
 
+Bundle-access I/O errors exit 69 and are eligible for automatic retry; format,
+verification, compile, identity and self-check refusals exit 78 and do not
+restart. Each retry must pass all startup checks again. The packaged service
+uses a fixed `RestartSec=5s`, `StartLimitIntervalSec=60s` and `StartLimitBurst=5`,
+independent of manager defaults. This trades a five-second delay after an
+otherwise healthy supervisor crashes for a useful transient recovery window
+and fewer failed starts while the kernel floor holds.
+
+With prompt failures, passing dependencies/conditions, a fresh rate counter
+and negligible scheduling delay, starts occur at 0, 5, 10, 15 and 20 seconds;
+the sixth request is refused at 25 seconds and automatic retries stop. A
+source restored after 12 seconds can therefore recover at the 15-second
+attempt; restoration after the last admitted attempt needs a later external
+start. This is a rate limit, not a lifetime attempt cap or fixed wall-clock
+deadline: startup, teardown and rerun dependencies (including provisioning)
+add time, and starts beyond the 60-second window reset its counter. The
+five-attempt termination bound applies when the sixth request is still within
+that first window. Other starts also consume the budget; unit unloading or
+an explicit reset clears it. No timer automatically retries after a limit hit.
+
+These settings are supported by systemd 243, already required by the unit's
+`ExecCondition=`; no systemd 254 backoff directives are needed. See
+[systemd.service](https://www.freedesktop.org/software/systemd/man/systemd.service.html#RestartSec=)
+and [systemd.unit](https://www.freedesktop.org/software/systemd/man/systemd.unit.html#StartLimitIntervalSec=).
+`python3 -I packaging/session/test_provision.py RestartPolicy -v` exercises a
+source-backed offline schedule model, not a live manager. Physical startup
+timing and real-boot qualification for spp3, lsm2 and atsp remain outstanding.
+
 ## 5. The fleet gate (`speakerguardd-gate`)
 
 Distributions install v2 on every Mac beside the older daemons

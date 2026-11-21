@@ -17,6 +17,11 @@ After=systemd-user-sessions.service
 Requires=speakerguardd-provision.service speakerguardd-selfcheck.service
 Requires=speakerguardd-switchtest.service
 ConditionPathExists=/proc/device-tree/compatible
+# Explicit limits, independent of manager defaults. With prompt failures:
+# starts at 0/5/10/15/20 s, next start refused at 25 s. Startup, teardown
+# and dependency time add to this; slow attempts can outlive the interval.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 Type=notify
@@ -39,9 +44,9 @@ ExecStartPre=/usr/libexec/speakerguardd/speakerguardd-gate interface
 EnvironmentFile=-/etc/speakerguardd/speakerguardd.conf
 ExecStart=/usr/bin/speakerguardd $SGV2_ARGS
 Restart=on-failure
-# The kernel's floor holds while it is down: come back quickly. A crash
-# loop still ends in the unit's start limit, at the floor.
-RestartSec=100ms
+# The kernel's floor holds while down. Trade a 5 s recovery delay for a
+# useful bundle-I/O retry window without a tight crash loop (see above).
+RestartSec=5s
 RestartPreventExitStatus=78
 # A stall itself is caught by the kernel, whose 30 ms lease floors the amps
 # when it is not renewed. A hung supervisor is aborted by its own hang watch
