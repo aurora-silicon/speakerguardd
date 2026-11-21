@@ -184,6 +184,15 @@ failed or stale records fail closed. Older unbound extraction records must
 be recollected on the Mac's macOS. Every distribution ships the same policy.
 `speakerguardd-gate explain` prints the final decision.
 
+A speaker card can register after boot: a card on a coprocessor (the M4 Mac
+mini's, on its AOP) waits for that processor's firmware, and a module loaded
+later registers its card whenever it loads. The gate waits up to 15 s for the
+speaker card when the device tree describes one. Past that,
+`packaging/udev/70-speakerguardd.rules` starts the supervisor, and with it
+the chain it requires, when the macaudio card's control device appears.
+Distributions install that rule beside the units, naming the same supervisor
+unit.
+
 ## 6. The self-check (`speakerguardd-selfcheck`)
 
 This is automatic. It runs before the supervisor, while the kernel holds
