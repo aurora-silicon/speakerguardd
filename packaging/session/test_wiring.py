@@ -1499,7 +1499,7 @@ class Deferral(unittest.TestCase):
         self.w["method"] = "derived-static" if static else "derived"
         self.desc = wiring.describe(self.hw, self.w)
 
-    def run_sc(self, *argv, kernel="7.3.0-test", audio="a1a1a1a1a1a1a1a1"):
+    def run_sc(self, *argv, kernel="7.3.0-test", audio="a1a1a1a1a1a1a1a1", card=None, live=True):
         def active(idx, card, w, report, args=None):
             self.calls.append("active")
             return list(self.hw_errs)
@@ -1513,7 +1513,8 @@ class Deferral(unittest.TestCase):
                 mock.patch.object(sgsc, "derive_live", return_value=(self.hw, self.w, self.desc, [])), \
                 mock.patch.object(sgsc, "blob_rate", return_value=self.w["rate"]), \
                 mock.patch.object(sgsc, "audio_of", return_value=audio), \
-                mock.patch.object(sgsc, "find_card", return_value=(0, self.desc["card"])), \
+                mock.patch.object(sgsc, "find_card", return_value=(0, card or self.desc["card"])), \
+                mock.patch.object(sgsc.wiring, "live_card", return_value=(0, card or self.desc["card"]) if live else None), \
                 mock.patch.object(sgsc, "active", side_effect=active), \
                 mock.patch.object(sgsc, "static", side_effect=static), \
                 mock.patch.object(sgsc.os, "uname", return_value=fake), \
@@ -1565,6 +1566,37 @@ class Deferral(unittest.TestCase):
         self.assertEqual(self.run_sc("run", audio="b2b2b2b2b2b2b2b2"), 0)
         self.assertEqual(self.calls, ["active", "active"])
         self.assertEqual(self.bind()["audio"], "b2b2b2b2b2b2b2b2")
+
+    def test_a_changed_card_id_is_checked_again(self):
+        # The graph opens hw:CARD=<id>: a pass bound to one card id is not
+        # reused when the card bound to the sound node has another, and the
+        # new record, its machine description and the generated graph all
+        # carry the running card's id.
+        import gen
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
+        self.assertEqual(self.bind()["card"], self.desc["card"])
+        self.assertEqual(self.run_sc("run", "--defer", card="AppleJ413Renamed"), 0)
+        self.assertEqual(self.run_sc("pending"), 0, "the switch test is due again")
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("run", card="AppleJ413Renamed"), 0)
+        self.assertEqual(self.calls, ["active", "active"])
+        self.assertEqual(self.bind()["card"], "AppleJ413Renamed")
+        with open(os.path.join(self.state, "selfcheck.json")) as f:
+            report = json.load(f)
+        self.assertEqual(report["record"]["card"], "AppleJ413Renamed")
+        self.assertEqual(report["machine"]["card"], "AppleJ413Renamed")
+        w = report["wiring"]
+        conf = gen.pipewire_conf(w["key"], dict(report["machine"], board=report["record"]["board"]),
+                                 (w["unit_channels"], w["sense_ports"], w["hash"]), "test", voicing_pre=False)
+        self.assertIn("hw:CARD=AppleJ413Renamed", conf)
+        self.assertNotIn(f"hw:CARD={self.desc['card']},", conf)
+        # a card not bound yet (an AOP card after this unit) cannot
+        # contradict the record: the pass is reused
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
+        self.assertEqual(self.run_sc("run", "--defer", live=False), 0)
+        self.assertEqual(self.run_sc("pending"), 1)
+        self.assertEqual(self.calls, ["active", "active"])
 
     def test_a_pass_without_an_audio_stack_is_not_reused(self):
         # a record from before the audio stack was bound
@@ -1694,6 +1726,12 @@ class Capabilities(unittest.TestCase):
         c = wiring.probe(j773g(None)["hw"])
         self.assertTrue(c["sense_path"].value)
         self.assertIn("silent sense test", c["sense_path"].source)
+        # dma-names that name neither channel: the same, and the source
+        # does not claim the sense channel is named
+        c = wiring.probe(j773g(("tx", "rx"))["hw"])
+        self.assertTrue(c["sense_path"].value)
+        self.assertIn("silent sense test", c["sense_path"].source)
+        self.assertNotIn("(names", c["sense_path"].source)
 
     def test_driver_capabilities_by_family(self):
         self.assertEqual(wiring.probe(fx("j316")["hw"])["fault_status"].value, True)
@@ -1751,6 +1789,21 @@ class Capabilities(unittest.TestCase):
             self.assertEqual(wiring.describe(hw, w)["card"], wiring.card_id(hw))
             self.assertTrue(wiring.probe(hw)["card"].source.startswith("dt:"))
         self.assertIsNone(wiring.live_card(hw, "/nonexistent", "/nonexistent"))
+
+    def test_an_unreadable_card_id_refuses(self):
+        import tempfile
+
+        f = fx("j413")
+        with tempfile.TemporaryDirectory() as d:
+            dt = os.path.join(d, "dt")
+            os.makedirs(dt)
+            fake_dt(dt, f["hw"])
+            hw = wiring.read_dt(dt, sysfs=os.path.join(d, "none"))
+            sysfs, proc = self._sysfs(d, dt, "sound", idx=1)
+            os.unlink(os.path.join(proc, "card1", "id"))
+            with self.assertRaises(wiring.Refused) as e:
+                wiring.live_card(hw, dt, sysfs, proc)
+            self.assertIn(os.path.join(proc, "card1", "id"), str(e.exception))
 
     def test_back_end_nodes_are_recorded_for_the_report(self):
         import tempfile
