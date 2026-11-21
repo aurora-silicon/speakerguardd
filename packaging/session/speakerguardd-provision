@@ -455,6 +455,12 @@ def compile_blob(cli, source, out, voicing_pre=False):
         lines = [l for l in r.stderr.splitlines() if l.startswith(("error", "fatal"))] or r.stderr.splitlines()[-5:]
         raise Failed("the tuning bundle does not compile for this Mac:\n" + "\n".join(lines))
     lines = r.stderr.strip().splitlines()
+    # A companion the compiler could not release compiles to a blob whose
+    # unit mutes every output. That is not a qualified board: fail closed
+    # here rather than admit a supervisor that can never play.
+    gated = [l for l in lines if l.startswith("warning[lsm2-release-gated]")]
+    if gated:
+        raise Failed("the tuning compiles only to a blob its LSID companion mutes:\n" + "\n".join(gated))
     return "\n".join(lines[:1] + [l for l in lines[1:] if l.startswith("warning")])
 
 

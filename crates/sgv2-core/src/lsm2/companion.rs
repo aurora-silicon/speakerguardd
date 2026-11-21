@@ -5,6 +5,12 @@
 //! bundles, so their bytes and ABI remain unchanged. TODO(SPEC): qualify flow,
 //! system-selector encoding and appended feature laws. Unqualified configurations
 //! are loadable for offline work but are muted by the single governing unit.
+//!
+//! One class is released: a companion whose estimator is never run (no
+//! twelve-lane topology, so no estimator is built) beside a complete
+//! 1,021-record LSM2 model. The governing unit then runs that static model,
+//! the unit's own mode when it holds no valid estimate. Its release gates are
+//! zero; every other companion keeps nonzero gates and stays muted.
 use super::{ids, InitError, Params};
 use crate::{
     blob::{BlobError, Header, Pod},
@@ -135,7 +141,8 @@ pub fn validate_records(records: &[(u32, f32)], extended: bool) -> Result<(), Bl
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Companion {
-    /// Nonzero blocks audible release; no flag can enable adaptation.
+    /// Nonzero blocks audible release; no flag can enable adaptation. Zero
+    /// only for the static class ([`Companion::is_static`]).
     pub gates: u32,
     pub channels: u32,
     pub lsm2_records: Vec<(u32, f32)>,
@@ -155,10 +162,12 @@ impl Companion {
         if self.channels == 0
             || self.channels as usize > MAX_CHANNELS
             || self.flow.len() > MAX_FLOW
-            || self.gates == 0
             || self.gates & !15 != 0
         {
             return Err(BlobError::Channels);
+        }
+        if self.gates == 0 && !self.is_static() {
+            return Err(BlobError::Version);
         }
         validate_records(&self.lsm2_records, self.channels == 6)?;
         if self.channels == 6 {
@@ -171,7 +180,7 @@ impl Companion {
                 return Err(BlobError::Channels);
             }
         } else {
-            if self.topology.is_some() || self.gates & LEGACY_ESTIMATOR == 0 {
+            if self.topology.is_some() || (self.gates != 0 && self.gates & LEGACY_ESTIMATOR == 0) {
                 return Err(BlobError::Version);
             }
             let mut records = self.lsid_records.clone();
@@ -184,6 +193,21 @@ impl Companion {
             }
         }
         Ok(())
+    }
+    /// The released class: the estimator is never run (no topology, so the
+    /// unit builds none, and not the six-lane schema whose adaptation is the
+    /// point of the companion), and the governing model is the complete
+    /// 1,021-record base schema, every ID bound. The companion's own records
+    /// are carried opaque and never interpreted.
+    pub fn is_static(&self) -> bool {
+        if self.channels == 6 || self.topology.is_some() || self.lsm2_records.len() != 1021 {
+            return false;
+        }
+        let mut ids: Vec<u32> = self.lsm2_records.iter().map(|r| r.0).collect();
+        ids.sort_unstable();
+        let mut base = base_ids();
+        base.sort_unstable();
+        ids == base
     }
     pub fn geometry_error(&self) -> Option<&'static str> {
         if self.channels != 6 {
