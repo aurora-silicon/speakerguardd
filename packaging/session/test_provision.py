@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import pwd
 import shutil
 import sys
@@ -160,15 +161,27 @@ class Base(unittest.TestCase):
     def run_(self, **kw):
         return prov.cmd_run(self.args(**kw), self.p)
 
-    def current_bind(self, digest, **kw):
-        """selfcheck.bind of a passing switch test on this (synthetic) Mac:
-        every field provisioning's selfcheck_current() compares."""
-        import wiring
-        hw = wiring.read_dt(self.dt)
-        rec = dict(result="pass", board=hw["board"], kernel=os.uname().release, params_sha256=digest,
-                   audio=wiring.audio_stack(hw.get("sound", ""), root=self.dt))
-        rec.update(kw)
-        return "".join(f"{k}={v}\n" for k, v in rec.items() if v is not None)
+    def targets(self, **kw):
+        """What a deferred switch test must bind, as speakerguardd-selfcheck's
+        deferral_text() writes it: the record version and every BOUND field."""
+        rec = dict(board="j316", wiring="w1", audio="a1", params_sha256=prov.sha256_file(self.p.params))
+        rec.update({k: v for k, v in kw.items() if k in ("board", "wiring", "audio", "params_sha256")})
+        sc = load("sc", "speakerguardd-selfcheck")
+        text = sc.deferral_text(rec, kw.get("kernel", os.uname().release))
+        if "version" in kw:
+            text = re.sub(r"^version=.*$", f"version={kw['version']}", text, flags=re.M)
+        return text
+
+    def pending(self, text):
+        prov.write_atomic(self.p.deferred, text)
+
+    def bound(self, text, result="pass", **kw):
+        """selfcheck.bind as the self-check writes it for `text`'s values (kw
+        overrides one field, None drops it)."""
+        rec = dict(line.split("=", 1) for line in text.splitlines() if line)
+        rec.update(result=result, **kw)
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
+                          "".join(f"{k}={v}\n" for k, v in rec.items() if v is not None))
 
     def record(self):
         with open(self.p.report) as f:
@@ -650,8 +663,9 @@ class Graph(Base):
         self.assertEqual(os.listdir(os.path.join(self.p.graph, "wireplumber")), [])
         # The switch test passed after login: its activate generates the
         # graph while the test is still marked pending (until ExecStopPost).
-        digest = prov.sha256_file(self.p.params)
-        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), self.current_bind(digest))
+        t = self.targets()
+        self.pending(t)  # the run after login rewrote it with what it binds
+        self.bound(t)
         from unittest import mock
         done = types.SimpleNamespace(returncode=0, stderr="", stdout="")
         with mock.patch.object(prov.subprocess, "run", return_value=done) as run:
@@ -674,24 +688,34 @@ class Graph(Base):
 
     def test_activate_keeps_the_switch_test_pending_for_a_stale_record(self):
         """speakerguardd-selfcheck.service's ExecStartPost activate, after a
-        `run --defer` that found no current pass: a record that still names
-        this kernel and blob but another audio stack (a rebuilt sound module
-        or changed speaker/sense nodes), another board, or no "audio" at all
-        (written before it was bound, e.g. by 0.48 before an upgrade) is not
-        current. No graph, and the marker stays, so speakerguardd-switchtest
-        runs the switch test after login."""
+        `run --defer` that found no current pass: the pending file names what
+        the next pass must bind, and a record that differs in any of it (the
+        audio stack, the wiring derivation, the record version, the board) or
+        lacks a field (a 0.48 record has no "audio") is not current. No
+        graph, and the file stays, so speakerguardd-switchtest runs the test.
+        A pending file from an older self-check (no version) is never
+        satisfied either."""
         self.provisioned()
-        digest = prov.sha256_file(self.p.params)
+        t = self.targets()
         from unittest import mock
-        for stale in (dict(audio=None), dict(audio="0123456789abcdef"), dict(board="j999")):
-            with self.subTest(stale=stale):
-                prov.write_atomic(self.p.deferred, "kernel=k\n")
-                prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), self.current_bind(digest, **stale))
+        for name, kw in (("audio", dict(audio="a0")), ("no audio", dict(audio=None)), ("wiring", dict(wiring="w0")),
+                         ("version", dict(version="2")), ("board", dict(board="j999")), ("failed", dict(result="fail"))):
+            with self.subTest(stale=name):
+                self.pending(t)
+                self.bound(t, **kw)
                 with mock.patch.object(prov.subprocess, "run") as run:
                     self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
                 run.assert_not_called()
                 self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pending")
                 self.assertTrue(os.path.exists(self.p.deferred))
+        with self.subTest(stale="old pending file"):
+            old = "".join(line + "\n" for line in t.splitlines() if not line.startswith(("version=", "audio=")))
+            self.pending(old)
+            self.bound(t)
+            with mock.patch.object(prov.subprocess, "run") as run:
+                self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+            run.assert_not_called()
+            self.assertTrue(os.path.exists(self.p.deferred))
 
     def test_switch_test_activate_does_not_wait_on_the_session(self):
         """The switch test passed while the seat user's PipeWire runs (a
@@ -700,9 +724,9 @@ class Graph(Base):
         activate must end the pending state first, or the two wait on each
         other until the user manager's timeout and the switch test fails."""
         home = self.provisioned()
-        prov.write_atomic(self.p.deferred, "kernel=k\n")
-        digest = prov.sha256_file(self.p.params)
-        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"), self.current_bind(digest))
+        t = self.targets()
+        self.pending(t)
+        self.bound(t)
         started = []
 
         def refresh(p, user, changed_us, unit):
@@ -1412,6 +1436,52 @@ class Gate(Base):
             self.assertEqual(pcm.call_count, 3)
             # A self-check alone cannot approve an uncompiled replacement.
             self.assertEqual(self.decide(), (False, False))
+
+    def test_a_deferred_run_names_what_the_next_pass_must_bind(self):
+        """`run --defer` on a sense board writes the record version and every
+        BOUND field to the pending file; the run after login rewrites it with
+        what it binds itself (here a sound module loaded in between: another
+        audio stack) before the switch test, so its activate finds the
+        record current."""
+        import gen
+        import wiring
+        from unittest import mock
+        sc = load("sc", "speakerguardd-selfcheck")
+        self.board("j999")
+        self.ctl({"board": "j999", "unit": "lsm2"})
+        self.assertEqual(self.run_(), 0)
+        fx = gen.fixture("j700")
+        hw = fx["hw"]
+        hw.update(board="j999", compatible=["apple,j999", "apple,t8140"],
+                  sound_compatible=["apple,j999-macaudio", "apple,macaudio"], model="Synthetic Mac J999")
+        w = wiring.derive(hw, fx["tuning"])
+        w["method"] = "derived"
+        desc = wiring.describe(hw, w)
+        args = types.SimpleNamespace(state=self.p.state, params=self.p.params, force=False, defer=True, deferred=self.p.deferred,
+                                     pipewire_dir=os.path.join(self.t, "pw"), wireplumber_dir=os.path.join(self.t, "wp"))
+        audio = ["a-before-login"]
+        seen = []
+
+        def tested(*a, **kw):
+            seen.append(prov.read_kv(self.p.deferred))
+            return []
+        with mock.patch.object(sc, "derive_live", return_value=(hw, w, desc, [])), \
+                mock.patch.object(sc, "lv2_shadows", return_value=[]), \
+                mock.patch.object(sc, "blob_rate", return_value=w["rate"]), \
+                mock.patch.object(sc, "find_card", return_value=(0, desc["card"])), \
+                mock.patch.object(sc, "audio_of", side_effect=lambda hw: audio[0]), \
+                mock.patch.object(sc, "active", side_effect=tested):
+            self.assertEqual(sc.cmd_run(args), 0)
+            want = prov.read_kv(self.p.deferred)
+            self.assertEqual(set(want), {"version", *sc.BOUND})
+            self.assertEqual((want["version"], want["board"], want["kernel"], want["wiring"], want["audio"]),
+                             (str(sc.VERSION), "j999", os.uname().release, w["hash"], "a-before-login"))
+            self.assertEqual(want["params_sha256"], prov.sha256_file(self.p.params))
+            audio[0] = "a-after-login"
+            args.defer = False
+            self.assertEqual(sc.cmd_run(args), 0)
+        self.assertEqual(seen[0]["audio"], "a-after-login")
+        self.assertTrue(prov.deferral_satisfied(self.p))
 
     def test_refusal_or_compiler_failure_stays_muted(self):
         self.board("j999")
