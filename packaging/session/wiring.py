@@ -4,6 +4,8 @@
     wiring.py {derive|describe} [--dt ROOT | --dtb FILE.dtb | --hw HW.json]
                                 (--tuning-json DUMP.json | -- TUNING-CLI-ARGS...) [--key KEY]
     wiring.py hardware [--dt ROOT | --dtb FILE.dtb | --hw HW.json]
+    wiring.py caps [--dt ROOT | --dtb FILE.dtb | --hw HW.json] [--live]
+                   [--tuning-json DUMP.json | -- TUNING-CLI-ARGS...]
 
 The protect stage needs two maps (packaging/session/gen.py):
 
@@ -62,6 +64,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections import namedtuple
 
 SCHEMA = 1
 
@@ -278,6 +281,7 @@ def _links(snd, root, phandles, sysfs):
                 c["i2c"] = i2c
             codecs.append(c)
         cpu_compat, cpu_dmas = [], []
+        cpu_nodes = [os.path.relpath(node, root) for node in cpu]
         for node in cpu:
             f = os.path.join(node, "compatible")
             cpu_compat.append(_strs(_read(f)) if os.path.exists(f) else [])
@@ -285,7 +289,7 @@ def _links(snd, root, phandles, sysfs):
             cpu_dmas.append(_strs(_read(f)) if os.path.exists(f) else None)
         links.append(
             {"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "cpu_compatible": cpu_compat,
-             "cpu_dma_names": cpu_dmas, "codecs": codecs}
+             "cpu_dma_names": cpu_dmas, "cpu_nodes": cpu_nodes, "codecs": codecs}
         )
     return links
 
@@ -503,45 +507,6 @@ def speaker_format(t):
     return fmt
 
 
-def describe(hw, w):
-    """Everything the protect stage's graph needs that is not the channel
-    map: derived from the device tree (and the wiring derived from it),
-    and the tuning's sample rate.
-    The self-check checks the card id and the format against ALSA."""
-    t = transport(hw)
-    # LSID is a side-chain inside the existing LSM2 governor. Plain LSM2
-    # bundles still have no sense ports; only an explicit companion requests
-    # the V/I variant. The self-check proves the sense map either way.
-    n = len(w["amps"])
-    takes_sense = w.get("unit_kind") in (None, *SENSE_UNITS) or w.get("sense_companion", False)
-    s = len(w["sense"]) if takes_sense else 0
-    plugin = PLUGINS.get((n, s))
-    if plugin is None:
-        raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
-    fmt = speaker_format(t)
-    speaker_pcm, sense_pcm = pcm_widths(t, n, len(w["sense"]))
-    return {
-        "key": machine_key(hw),
-        "board": hw["board"],
-        "card": card_id(hw),
-        "name": hw.get("model") or card_id(hw),
-        "transport": t["transport"],
-        "amps": n,
-        "sense": s,
-        # the PCMs' own widths: the amps' lanes come first (PCM widths above)
-        "speaker_pcm": speaker_pcm,
-        "sense_pcm": sense_pcm,
-        "rate": w["rate"],
-        "plugin": plugin,
-        "alsa_format": fmt,
-        "speaker_format": PW_FORMAT[fmt],
-        "speaker_headroom": t["speaker_headroom"],
-        "sense_headroom": SENSE_HEADROOM if s else 0,
-        "sense_batch": t["sense_batch"],
-        "speaker_irq": t["speaker_irq"],
-    }
-
-
 def pcm_widths(t, amps, sense):
     """The channel counts the speaker and sense PCMs open with, for `amps`
     amps and `sense` sense lanes on transport `t` (PCM widths above)."""
@@ -669,6 +634,222 @@ def hardware(hw):
         if chans != list(range(2 * len(amps))):
             raise Refused(f"the sense slots give channels {chans}, not 0..{2 * len(amps) - 1} once each")
     return amps
+
+
+# ------------------------------------------------------------- capabilities
+#
+# speakerguardd selects nothing by board, model or SoC. Every fact the
+# protect stage, the self-check and the supervisor depend on is a
+# *capability*, read from a source the machine itself provides, and each one
+# carries that source (`Cap.source`) so a report says where it came from:
+#
+# - ``dt:``    the device tree, as macaudio reads it: the speaker dai-link,
+#              its back-end (CPU DAI) and amp (codec) nodes, their
+#              compatibles, `dma-names`, `sound-name-prefix` and sense slots;
+# - ``alsa:``  the running card: the card bound to the device tree's sound
+#              node, and (supervisor side) its controls' own dB scales;
+# - ``tuning:`` the Mac's own tuning bundle, through the reader's graph trace:
+#              the protection unit, its channel roles, its sample rate, the
+#              speaker identity (AID) it names;
+# - ``driver:`` a constant of the kernel driver a compatible binds (sample
+#              formats, ring cadence). Keyed by the block's compatible,
+#              never by the board that carries it;
+# - ``derived:`` computed from the capabilities above (the PCM widths, the
+#              plugin variant), never from an identity.
+#
+# A capability no source establishes is a refusal (Refused): the
+# speakers stay muted exactly as before, with the reason. There is no
+# default that admits a Mac; the only defaults are ones that keep a Mac
+# safe (no sense proven: the unit must run without sense; no fixed ceiling
+# named: the supervisor latches on any other grant volume).
+#
+# The board itself is still read (``dt:/compatible``) but only as an
+# identity: the self-check record and the parameter blob are bound to the Mac
+# they were made on, so one Mac's proof never admits another. It is never
+# used to choose a value.
+#
+# See docs/CAPABILITIES.md for the inventory, the providers and the plan.
+
+# A capability: its value and where it came from.
+Cap = namedtuple("Cap", "value source")
+
+# Everything an amp family's driver offers userspace, by the family the
+# amp's compatible names (AMPS). The supervisor checks each of these
+# against the card's controls before a grant (crates/sgv2-supervisor
+# machine.rs Amp): these are the driver's, not the board's.
+FAMILY = {
+    "sn012776": {"gain_control": True, "fault_status": True},
+    "tas2770": {"gain_control": True, "fault_status": False},
+    "max98360a": {"gain_control": False, "fault_status": False},
+}
+
+
+def _src_cpu(hw):
+    link = _speaker_link(hw)
+    nodes = link.get("cpu_nodes")
+    where = ", ".join(nodes) if nodes else f"link {link['name']!r} cpu"
+    return f"dt:{where}/compatible"
+
+
+def cap_transport(hw):
+    """The speaker back-end's driver and what it offers (TRANSPORTS)."""
+    t = transport(hw)
+    return Cap(t, "driver:" + t["transport"] + " (" + _src_cpu(hw) + ")")
+
+
+def sense_path(hw):
+    """Whether this Mac returns its amps' V/I sense: the amp family must
+    offer it and the speaker transport carry it (transport_senses), and
+    from which value.
+
+    - An amp family without sense (AMPS): none, by the family's driver.
+    - The back-end names the driver's sense DMA channel: it does.
+    - It names its speaker channel and not the sense one: it does not.
+    - It names neither, or no dma-names at all: the amp family's sense
+      stands, and the self-check's silent sense test must then see it on
+      the card; a transport that sends none fails that test (muted).
+    """
+    link = _speaker_link(hw)
+    fams = {AMPS[x] for c in link["codecs"] for x in c.get("compatible", []) if x in AMPS}
+    if fams and not any(f[1] for f in fams):
+        return Cap(False, f"driver:{', '.join(sorted(f[0] for f in fams))} returns no V/I sense")
+    dmas = link.get("cpu_dma_names")
+    t = transport(hw)
+    carries = transport_senses(hw)
+    if not dmas or any(d is None for d in dmas) or not t.get("sense_dma"):
+        return Cap(carries, "dt:no sense dma-names on the back-end; proven by the self-check's silent sense test")
+    names = sorted({n for d in dmas for n in d})
+    return Cap(carries, f"dt:back-end dma-names {names} ({'names' if carries else 'no'} {t['sense_dma']!r})")
+
+
+def cap_amps(hw):
+    """The amps in speaker PCM order (hardware), and the family's
+    driver capabilities."""
+    a = hardware(hw)
+    fam = a[0]["family"]
+    if fam not in FAMILY:
+        raise Refused(f"amp family {fam} has no driver capabilities this probe knows")
+    sensed = sum(1 for x in a if "v_ch" in x)
+    return {
+        "amps": Cap(len(a), "dt:speaker dai-link codec sound-dai"),
+        "family": Cap(fam, "dt:amp compatible"),
+        "roles": Cap([[x["side"], x["role"], x["ordinal"]] for x in a], "dt:amp sound-name-prefix"),
+        "gain_control": Cap(FAMILY[fam]["gain_control"], f"driver:{fam}"),
+        "fault_status": Cap(FAMILY[fam]["fault_status"], f"driver:{fam}"),
+        "sense_slots": Cap(2 * sensed, "dt:ti,vmon-slot-no / ti,imon-slot-no" if sensed else "dt:no sense slots"),
+        "_amps": a,
+    }
+
+
+def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/asound"):
+    """(index, id) of the ALSA card whose device is the device tree's sound
+    node: the running card's own id. None when no card is bound to it."""
+    want = os.path.realpath(os.path.join(dt, hw["sound"]))
+    try:
+        names = sorted(os.listdir(sysfs))
+    except OSError:
+        return None
+    for d in names:
+        if not re.fullmatch(r"card\d+", d):
+            continue
+        of = os.path.join(sysfs, d, "device", "of_node")
+        if os.path.exists(of) and os.path.realpath(of) == want:
+            idx = int(d[4:])
+            with open(os.path.join(proc, f"card{idx}", "id")) as f:
+                return idx, f.read().strip()
+    return None
+
+
+def cap_card(hw, live=None):
+    """The speaker card's ALSA id. On a running Mac (`live`, from
+    live_card()) it is the card's own; offline (fixtures, a .dtb) it is the
+    name macaudio gives it from the device tree's model, which the
+    self-check then confirms on the card."""
+    if live is not None:
+        return Cap(live[1], f"alsa:card{live[0]} (of_node {hw['sound']})")
+    return Cap(card_id(hw), f"dt:/{hw['sound']}/model (macaudio's naming; confirmed on the card by the self-check)")
+
+
+def probe(hw, live=None, w=None):
+    """Every capability of the speaker path, each with its source: the
+    hardware's, and with a wiring `w` (derive) the tuning's too. Refuses
+    (Refused) on anything no source establishes."""
+    t = cap_transport(hw)
+    a = cap_amps(hw)
+    s = sense_path(hw)
+    fmt = speaker_format(t.value)
+    caps = {
+        "board": Cap(hw["board"], "dt:/compatible (identity binding only)"),
+        "machine_key": Cap(machine_key(hw), f"dt:/{hw['sound']}/compatible"),
+        "model": Cap(hw.get("model"), f"dt:/{hw['sound']}/model"),
+        "card": cap_card(hw, live),
+        "transport": Cap(t.value["transport"], t.source),
+        "speaker_format": Cap(fmt, f"driver:{t.value['transport']} formats {t.value['formats']}"),
+        "speaker_irq": Cap(t.value["speaker_irq"], f"driver:{t.value['transport']}"),
+        "speaker_headroom": Cap(t.value["speaker_headroom"], f"driver:{t.value['transport']}"),
+        "sense_batch": Cap(t.value["sense_batch"], f"driver:{t.value['transport']}"),
+        "sense_path": s,
+    }
+    caps.update({k: v for k, v in a.items() if not k.startswith("_")})
+    if w is not None:
+        caps.update(
+            unit=Cap(w["unit_kind"], "tuning:the protection unit the graph trace names"),
+            aid=Cap(w["aid"], "tuning:the bundle's speaker identity"),
+            rate=Cap(w["rate"], "tuning:the graph's sample rate"),
+            unit_channels=Cap(w["unit_channels"], "derived:dt roles matched to the tuning's channel roles"),
+            sense_ports=Cap(w["sense_ports"], "derived:dt sense slots matched to the unit's channels"),
+        )
+    caps["_transport"] = t.value
+    caps["_amps"] = a["_amps"]
+    return caps
+
+
+def describe(hw, w, live=None):
+    """ the machine description the protect stage's graph
+    is generated from, built from the capabilities (probe) and the wiring
+    derived from the device tree and the tuning. Byte for byte what the
+    description was before the probe layer, except that on a running Mac
+    the card id is the card's own (`live`)."""
+    c = probe(hw, live, w)
+    t = c["_transport"]
+    n = len(w["amps"])
+    if n != c["amps"].value:
+        raise Refused(f"the wiring has {n} amps, the device tree {c['amps'].value}")
+    # LSID is a side-chain inside the existing LSM2 governor. Plain LSM2
+    # bundles still have no sense ports; only an explicit companion requests
+    # the V/I variant. The self-check proves the sense map either way.
+    takes_sense = w.get("unit_kind") in (None, *SENSE_UNITS) or w.get("sense_companion", False)
+    s = len(w["sense"]) if takes_sense else 0
+    plugin = PLUGINS.get((n, s))
+    if plugin is None:
+        raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
+    speaker_pcm, sense_pcm = pcm_widths(t, n, len(w["sense"]))
+    fmt = c["speaker_format"].value
+    return {
+        "key": c["machine_key"].value,
+        "board": c["board"].value,
+        "card": c["card"].value,
+        "name": c["model"].value or c["card"].value,
+        "transport": c["transport"].value,
+        "amps": n,
+        "sense": s,
+        # the PCMs' own widths: the amps' lanes come first (PCM widths in py)
+        "speaker_pcm": speaker_pcm,
+        "sense_pcm": sense_pcm,
+        "rate": c["rate"].value,
+        "plugin": plugin,
+        "alsa_format": fmt,
+        "speaker_format": PW_FORMAT[fmt],
+        "speaker_headroom": c["speaker_headroom"].value,
+        "sense_headroom": SENSE_HEADROOM if s else 0,
+        "sense_batch": c["sense_batch"].value,
+        "speaker_irq": c["speaker_irq"].value,
+    }
+
+
+def caps_report(caps):
+    """The capabilities as JSON-able {name: {"value", "source"}}."""
+    return {k: {"value": v.value, "source": v.source} for k, v in caps.items() if not k.startswith("_")}
 
 
 # ------------------------------------------------------------------ tuning
@@ -1004,7 +1185,8 @@ def main(argv):
     import argparse
 
     ap = argparse.ArgumentParser(prog="wiring.py")
-    ap.add_argument("cmd", choices=["derive", "hardware", "describe"])
+    ap.add_argument("cmd", choices=["derive", "hardware", "describe", "caps"])
+    ap.add_argument("--live", action="store_true", help="caps: read the running card too (read-only)")
     ap.add_argument("--dt", default="/proc/device-tree")
     ap.add_argument("--dtb", help="a compiled device tree (.dtb) instead of the live one")
     ap.add_argument("--hw", help="a hardware description (JSON) instead of the live device tree")
@@ -1017,6 +1199,15 @@ def main(argv):
         hw = json.load(open(a.hw)) if a.hw else read_dtb(a.dtb) if a.dtb else read_dt(a.dt)
         if a.cmd == "hardware":
             print(json.dumps({"hw": hw, "amps": hardware(hw)}, indent=1))
+            return 0
+        if a.cmd == "caps":
+            live = live_card(hw, a.dt) if a.live else None
+            if a.live and live is None:
+                raise Refused(f"no ALSA card is bound to the device tree's {hw['sound']} node")
+            w = None
+            if a.tuning_json or a.rest:
+                w = derive(hw, json.load(open(a.tuning_json)) if a.tuning_json else tuning_dump(a.rest, a.tuning_cli), a.key)
+            print(json.dumps(caps_report(probe(hw, live, w)), indent=1))
             return 0
         dump = json.load(open(a.tuning_json)) if a.tuning_json else tuning_dump(a.rest, a.tuning_cli)
         w = derive(hw, dump, a.key)
