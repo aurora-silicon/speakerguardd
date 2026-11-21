@@ -4,6 +4,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+mod review_common;
+
 use sgv2_core::{atsp, lsm2, placeholder, spp3, Io, ProtectionUnit, Telemetry};
 
 struct Counting;
@@ -109,6 +111,11 @@ fn no_unit_allocates_in_process() {
     run(&mut real, 5, 12);
     run(&mut placeholder::Unit::new(placeholder::Params { channels: 6, ..Default::default() }), 6, 12);
     run(&mut lsm2::Unit::new(lsm2::Params::default()), 2, 0);
+    let mut compensated = review_common::lsm2_params();
+    compensated.ch[0].compensation = [1.0, 250.0, 1.0, 2.0, 6.0, 4.0, 0.8, 0.0002, 0.2, 1500.0];
+    let mut compensated = lsm2::Unit::new(compensated);
+    assert!(!compensated.is_failsafe());
+    run(&mut compensated, 2, 0);
     run(&mut atsp::Unit::new(atsp::Params::default()), 4, 0);
     let slot = atsp::Slot {
         channel_mask: 0b1111,

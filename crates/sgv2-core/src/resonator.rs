@@ -1,9 +1,10 @@
 //! Single-resonator compensation, from the measured transfer specified in
 //! `docs/RESONATOR-COMPONENT.md`. The caller supplies every model parameter.
 //!
-//! This is a standalone component, not a [`crate::ProtectionUnit`]. It is
-//! intentionally not wired into LSM2: small-signal filter agreement cannot
-//! establish its ordering against the nonlinear limiter or adaptive models.
+//! This is a component, not a [`crate::ProtectionUnit`]. LSM2 runs it ahead
+//! of its models and limiter on a channel whose tuning requests it
+//! (`CompensateResonators` and the type's acceleration-manager block with
+//! `UseCompensation`), see `docs/RESONATOR-COMPONENT.md`.
 
 /// Runtime physical model and requested compensation. SI units, except for
 /// frequency (Hz), sample rate (Hz), and the two nonnegative limits (dB).
