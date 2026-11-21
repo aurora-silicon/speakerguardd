@@ -1645,5 +1645,35 @@ class GatePath(unittest.TestCase):
                     gen.voicing_enabled("j413")
 
 
+
+class DumpRefusalReason(unittest.TestCase):
+    """A strict dump that the reader refuses names the reason (the journal
+    is all a user on a muted Mac sees)."""
+
+    def run_dump(self, rc, stdout, stderr=""):
+        r = mock.Mock(returncode=rc, stdout=stdout, stderr=stderr)
+        with mock.patch.object(wiring.subprocess, "run", return_value=r):
+            with self.assertRaises(wiring.Refused) as e:
+                wiring.tuning_dump(["bundle"], strict=True)
+        return str(e.exception)
+
+    def test_load_error_diagnostics(self):
+        out = json.dumps({"items": [
+            {"severity": "warning", "code": "w", "context": "x", "message": "ignored"},
+            {"severity": "error", "code": "load", "context": "DSP database",
+             "message": "speaker ID unknown (no speaker_id in the bundle manifest and no /chosen/asahi,speaker-id)"},
+        ]})
+        m = self.run_dump(1, out)
+        self.assertIn("(exit 1): load: speaker ID unknown (no speaker_id", m)
+        self.assertNotIn("ignored", m)
+
+    def test_errors_in_a_loaded_dump(self):
+        out = json.dumps({"tuning": {}, "diagnostics": {"items": [
+            {"severity": "error", "code": "spp3-channel-count", "context": "x", "message": "2 != 4"}]}})
+        self.assertIn("spp3-channel-count: 2 != 4", self.run_dump(1, out))
+
+    def test_no_json_falls_back_to_stderr(self):
+        self.assertIn("(exit 1): boom", self.run_dump(1, "", "line\nboom\n"))
+
 if __name__ == "__main__":
     unittest.main()

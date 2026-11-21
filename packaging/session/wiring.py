@@ -984,13 +984,29 @@ def role_errors(w, units):
     return errs
 
 
+def dump_errors(r):
+    """The reader's error diagnostics ("code: message"), so a refusal says
+    why in the journal: from the JSON (a failed load prints the bare
+    diagnostics, a load with errors the tuning and its diagnostics), else
+    the last stderr line."""
+    try:
+        v = json.loads(r.stdout)
+        items = (v.get("diagnostics", v) if isinstance(v, dict) else {}).get("items", [])
+        errs = [f"{d.get('code')}: {d.get('message')}" for d in items if d.get("severity") == "error"]
+    except (ValueError, AttributeError):
+        errs = []
+    if not errs and r.stderr.strip():
+        errs = [r.stderr.strip().splitlines()[-1]]
+    return (": " + "; ".join(errs))[:600] if errs else ""
+
+
 def tuning_dump(cli_args, cli="aurora-speaker-tuning", strict=False):
     """Run the tuning reader's JSON dump; its exit code reports refusals,
     which offline derivation does not need. Qualification uses strict=True
     to require success and an empty refusal/error set."""
     r = subprocess.run([cli, "dump", "--json", *cli_args], capture_output=True, text=True, timeout=60)
     if strict and r.returncode != 0:
-        raise Refused(f"{cli} dump refused the tuning (exit {r.returncode})")
+        raise Refused(f"{cli} dump refused the tuning (exit {r.returncode}){dump_errors(r)}")
     try:
         result = json.loads(r.stdout)
         if strict:
