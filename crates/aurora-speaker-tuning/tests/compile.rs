@@ -706,9 +706,11 @@ fn owner_fill_completes_short_state_without_changing_carried_records() {
     let compiled = compile(&guarded, &mut Diagnostics::default()).unwrap();
     let unit = sgv2_core::lsm2::Unit::from_blob(&compiled.blob).unwrap();
     assert_eq!(unit.companion().unwrap().lsm2_records.len(), 1021);
-    assert!(unit.companion().unwrap().gates != 0);
+    // A filled four-lane companion is the static class: released.
+    assert_eq!(unit.companion().unwrap().gates, 0);
+    assert!(unit.companion().unwrap().is_static());
     assert_eq!(unit.params().ch[0].displacement_limit, 0.0005);
-    assert!(unit.is_failsafe(), "the fill never lifts companion release gates");
+    assert!(!unit.is_failsafe());
     let mut extra_section = t.clone();
     extra_section.protection.state.sections.push(ParamSection { scope: 1, element: 0, params: vec![(0, 1.0)] });
     assert!(compile(&extra_section, &mut Diagnostics::default()).is_err());
@@ -947,14 +949,15 @@ fn short_preset_with_a_published_append_id_compiles_the_base_model() {
     assert!(d.items.iter().any(|i| i.code == "lsm2-append-ids-not-compiled"));
     let expected = compile(&tuning(&files_with_state(&full), "fill-append-full"), &mut Diagnostics::default()).unwrap();
     assert_eq!(actual.blob, expected.blob);
-    // Guarded: the fill and the append ID never lift the mandatory mute.
+    // Guarded: the append ID stays out of the companion's 1,021-ID model,
+    // which is then the released static class.
     let mut guarded = t.clone();
     guarded.lsid = Some(synthetic_legacy_companion());
     let compiled = compile(&guarded, &mut Diagnostics::default()).unwrap();
     let unit = sgv2_core::lsm2::Unit::from_blob(&compiled.blob).unwrap();
     assert_eq!(unit.companion().unwrap().lsm2_records.len(), 1021);
-    assert!(unit.companion().unwrap().gates != 0);
-    assert!(unit.is_failsafe());
+    assert_eq!(unit.companion().unwrap().gates, 0);
+    assert!(!unit.is_failsafe());
 }
 
 #[test]
@@ -1019,10 +1022,10 @@ fn lsm2_pressure_records_follow_the_lane_sides() {
     guarded.lsid = Some(synthetic_legacy_companion());
     let c = compile(&guarded, &mut Diagnostics::default()).unwrap();
     assert_eq!(first_taps(&c.blob), [1.0, 2.0, 1.0, 2.0]);
-    // The masking path never lifts the companion's mute.
+    // A complete four-lane companion is the released static class.
     let unit = sgv2_core::lsm2::Unit::from_blob(&c.blob).unwrap();
-    assert!(unit.companion().unwrap().gates != 0);
-    assert!(unit.is_failsafe());
+    assert_eq!(unit.companion().unwrap().gates, 0);
+    assert!(!unit.is_failsafe());
     // Any other record count with a companion: no masking path, as before.
     for marks in [&[1.0][..], &[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0, 4.0]] {
         let mut guarded = tuning(&flow_files(&full, marks), &format!("c-lsm2-flow-{}", marks.len()));
@@ -1030,4 +1033,132 @@ fn lsm2_pressure_records_follow_the_lane_sides() {
         let c = compile(&guarded, &mut Diagnostics::default()).unwrap();
         assert_eq!(first_taps(&c.blob), [0.0; 4], "{} records", marks.len());
     }
+}
+
+// ---------------------------------------------------------------- static LSID release
+
+fn static_case(name: &str, tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> (Tuning, Tuning) {
+    let state = lsm2_state(|m| {
+        for id in sgv2_core::lsm2::companion::base_ids() {
+            m.entry(id).or_insert(0.0);
+        }
+        tweak(m);
+    });
+    let plain = tuning(&files_with_state(&state), name);
+    let mut guarded = plain.clone();
+    guarded.lsid = Some(synthetic_legacy_companion());
+    (plain, guarded)
+}
+
+fn released(t: &Tuning) -> (sgv2_core::lsm2::Unit, Diagnostics) {
+    let mut d = Diagnostics::default();
+    let c = compile(t, &mut d).unwrap();
+    let unit = sgv2_core::lsm2::Unit::from_blob(&c.blob).unwrap();
+    assert_eq!(unit.companion().unwrap().gates, 0);
+    assert!(!unit.is_failsafe());
+    assert!(d.items.iter().any(|i| i.code == "lsid-static-release"));
+    assert!(!d.items.iter().any(|i| i.code == "lsm2-release-gated"));
+    (unit, d)
+}
+
+fn refusal(t: &Tuning) -> String {
+    match compile(t, &mut Diagnostics::default()) {
+        Ok(_) => panic!("compiled"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn static_lsid_companion_plays_on_its_model() {
+    use sgv2_core::{Io, ProtectionUnit};
+    let (_, guarded) = static_case("c-lsid-static", |_| {});
+    let (mut unit, _) = released(&guarded);
+    assert_eq!(unit.params().model_only, 1);
+    assert!(unit.estimator().is_none(), "the companion's estimator is never built");
+    let latency = unit.params().latency_frames();
+    let frames = latency + 4096;
+    let input: Vec<f32> = (0..frames).map(|i| 0.1 * (i as f32 * 0.05).sin()).collect();
+    let mut storage = vec![vec![0.0f32; frames]; 4];
+    let mut output: Vec<_> = storage.iter_mut().map(|s| s.as_mut_slice()).collect();
+    let h = unit.process(Io { input: &[&input[..]; 4], output: &mut output, sense: &[], frames });
+    assert!(!h.is_failsafe(), "{h:?}");
+    let first: Vec<_> = storage.iter().map(|lane| lane.iter().position(|&v| v != 0.0)).collect();
+    assert!(first.iter().all(|p| p.is_some()), "every lane plays: first nonzero {first:?}, latency {latency}");
+    // A six-lane companion, or an incomplete model, stays gated (tests/lsid.rs
+    // and absent_fill_keeps_the_guarded_model_only_mute cover those blobs).
+}
+
+#[test]
+fn static_lsid_leaves_estimation_to_the_unrun_companion() {
+    let (plain, guarded) = static_case("c-lsid-owned", |m| {
+        m.insert(id::ENABLE_CLOSED_LOOP_TEMPERATURE, 1.0);
+        m.insert(id::BYPASS_SYS_ID, 0.0);
+    });
+    released(&guarded);
+    let why = refusal(&plain);
+    assert!(why.contains("closed-loop temperature") && why.contains("system identification"), "{why}");
+}
+
+#[test]
+fn static_lsid_accepts_power_only_models_only_with_the_power_axis_off() {
+    let soft = |control_power: f32| {
+        move |m: &mut BTreeMap<u32, f32>| {
+            m.insert(id::controller(id::C_CONTROL_POWER), control_power);
+            m.insert(id::amp0(id::A_SOFT_LIMIT), 50.0);
+            m.insert(id::amp0(id::A_ENABLE_MID), 1.0);
+        }
+    };
+    let (plain, guarded) = static_case("c-lsid-power-off", soft(0.0));
+    released(&guarded);
+    assert!(refusal(&plain).contains("power soft limits"));
+    let (_, guarded) = static_case("c-lsid-power-on", soft(1.0));
+    let why = refusal(&guarded);
+    assert!(why.contains("power soft limits") && why.contains("mid rail"), "{why}");
+}
+
+#[test]
+fn static_lsid_lanes_may_use_their_tuning_bank() {
+    let (plain, guarded) = static_case("c-lsid-bank", |m| {
+        for c in 2..4 {
+            m.insert(id::CH_TUNING + c, 1.0);
+        }
+        // bank 1's pilot amplitude, which the peak axis then reserves
+        m.insert(id::PILOT[1] + id::P_AMPLITUDE_DB, -40.0);
+    });
+    released(&guarded);
+    assert!(refusal(&plain).contains("Ch2Tuning selects bank 1"));
+}
+
+#[test]
+fn static_lsid_admittance_inductance_must_not_raise_the_modeled_power() {
+    let branch = |r2: f32, le: f32, l2: f32| {
+        move |m: &mut BTreeMap<u32, f32>| {
+            for ty in 0..3 {
+                // a damped first resonator, as on real microspeakers: the
+                // motional part stays small beside Rdc
+                m.insert(id::model(id::MANAGER_ADMITTANCE, ty, id::M_RMS), 1.0);
+                m.insert(id::model(id::MANAGER_ADMITTANCE, ty, id::M_BL), 0.5);
+                for (k, v) in [(id::M_ENABLE_LR2, 1.0), (id::M_LR2_R2, r2), (id::M_LR2_LE, le), (id::M_LR2_L2, l2)] {
+                    m.insert(id::model(id::MANAGER_ADMITTANCE, ty, k), v);
+                }
+            }
+        }
+    };
+    // A resistive-inductive branch only adds impedance at every frequency.
+    let (plain, guarded) = static_case("c-lsid-lr2", branch(0.2, 60e-6, 35e-6));
+    let (_, d) = released(&guarded);
+    assert!(d.items.iter().any(|i| i.code == "lsm2-lr2-bounded"));
+    assert!(refusal(&plain).contains("LR2 inductance"));
+    // A large L2 behind a tiny R2 lowers |Z| just above the resonance, where
+    // the motional part is capacitive: the model without it would under-read.
+    let (_, guarded) = static_case("c-lsid-lr2-up", branch(1e-5, 1e-6, 0.2));
+    assert!(refusal(&guarded).contains("admittance inductance would raise the modeled power"));
+    // A negative field is never bounded.
+    let (_, guarded) = static_case("c-lsid-lr2-neg", branch(-0.1, 60e-6, 35e-6));
+    assert!(refusal(&guarded).contains("admittance inductance"));
+    // Other managers' inductance is not modelled at all: refused.
+    let (_, guarded) = static_case("c-lsid-lr2-disp", |m| {
+        m.insert(id::model(id::MANAGER_DISPLACEMENT, 0, id::M_ENABLE_LR2), 1.0);
+    });
+    assert!(refusal(&guarded).contains("displacement LR2 inductance"));
 }

@@ -42,11 +42,16 @@ six playback and twelve sense channels. These results establish transport
 recognition, the PCM widths and the wiring derivation. They do not establish
 protected playback or PipeWire timing.
 
-J713's native tuning selects LSM2 with an LSID companion and requests
-mechanisms the live engine cannot yet represent. The compiler must continue
-refusing that configuration, LSM2 with that companion remains outside
-`units_at_parity`, and J713 is not added to the qualified-board list. No
-graph file is shipped for it.
+J713's native tuning selects LSM2 with a four-lane LSID companion. The
+compiler releases it in the static class (`docs/LSID.md`): the estimator is
+not run and the LSM2 unit protects on its complete static model, completed by
+the owner-local fill. Its compensating acceleration block runs (resonator
+compensation), each lane takes its side's pressure response, the filterbank
+stage comes from the unit's total latency, and the admittance model's
+inductive branch passes the compiler's power bound. The power-only amplifier
+models are inert because `ControlPower` is off. As for every board, the
+self-check, provenance and parity gates still decide; there is no board list
+and no graph file is shipped for it.
 
 v2 needs the kernel's `Speaker Protection` ownership interface (Linux
 [#922](https://github.com/aurora-silicon/linux/pull/922)). A kernel with only

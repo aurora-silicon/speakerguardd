@@ -582,6 +582,15 @@ pub mod ids {
     pub const M_KMS: u32 = 7;
     pub const M_ENABLE_RES2: u32 = 8;
     pub const M_ENABLE_LR2: u32 = 13;
+    /// The inductive branch's generic flag and its three fields: the series
+    /// resistance R2 of the R2 || L2 branch, the voice-coil inductance Le and
+    /// L2. TODO(SPEC): the field names are not specified; this order is the
+    /// one whose impedance fits our own V/I sense measurements of the
+    /// speakers (docs/LSID.md, "The inductive branch").
+    pub const M_USE_GENERIC_LR2: u32 = 14;
+    pub const M_LR2_R2: u32 = 15;
+    pub const M_LR2_LE: u32 = 16;
+    pub const M_LR2_L2: u32 = 17;
     pub const M_CREEP: u32 = 18;
     pub const M_USE_COMPENSATION: u32 = 24;
     pub const M_DESIRED_RESONATOR_HZ: u32 = 25;
@@ -3411,6 +3420,43 @@ mod fault_tests {
         let mut outs: [&mut [f32]; 2] = [&mut o0, &mut o1];
         let h = u.process(Io { frames: n, input: &ins, sense: &[], output: &mut outs });
         (o0, h)
+    }
+
+    #[test]
+    fn only_the_static_class_carries_zero_gates() {
+        let base: Vec<(u32, f32)> = companion::base_ids().into_iter().map(|id| (id, 0.0)).collect();
+        let released = companion::Companion {
+            gates: 0,
+            channels: 4,
+            lsm2_records: base.clone(),
+            lsid_records: vec![(0, 1.0)],
+            topology: None,
+            flow: Vec::new(),
+            property_64004: 0,
+            flow_roles: [[0; 2]; 6],
+            systems: [0; MAX_CHANNELS],
+        };
+        assert!(released.is_static());
+        let bytes = released.encode().unwrap();
+        assert_eq!(companion::Companion::decode(&bytes).unwrap(), released);
+        // An incomplete model, or one record off the base schema, is gated.
+        let mut short = released.clone();
+        short.lsm2_records.pop();
+        assert!(!short.is_static());
+        assert!(short.encode().is_err());
+        let mut renumbered = released.clone();
+        renumbered.lsm2_records[0].0 = 999_999;
+        assert!(!renumbered.is_static());
+        assert!(renumbered.encode().is_err());
+        // The six-lane schema runs its estimator: never released.
+        let mut six = released.clone();
+        six.channels = 6;
+        assert!(!six.is_static());
+        assert!(six.encode().is_err());
+        // The same complete companion with a gate stays loadable and muted.
+        let mut gated = released.clone();
+        gated.gates = companion::LEGACY_ESTIMATOR;
+        assert!(gated.encode().is_ok());
     }
 
     #[test]
