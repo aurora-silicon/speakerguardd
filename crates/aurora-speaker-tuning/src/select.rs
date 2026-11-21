@@ -207,13 +207,29 @@ pub fn speaker_chain(b: &Bundle, speaker_id: Option<i128>, diags: &mut Diagnosti
             candidates.iter().copied().filter(neutral).collect()
         }
         Some(id) => candidates.iter().copied().filter(|c| c.speaker_id == Some(id)).collect(),
-        None => {
+        // A raw macOS Tunings tree read offline (attestation, rigs; never a
+        // Mac's own bundle, which is always verified) implies no speaker
+        // assembly: its vendor-neutral chain is listed, with a warning, so
+        // the tools can enumerate every configuration.
+        None if !b.verified => {
             diags.warn(
                 "select-speaker-id-unknown",
                 ctx,
-                format!("speaker ID unknown: using the vendor-neutral (spid {SPID_GENERIC} or none) configuration"),
+                format!("speaker ID unknown: using the vendor-neutral (spid {SPID_GENERIC} or none) configuration of a raw tuning tree"),
             );
             candidates.iter().copied().filter(neutral).collect()
+        }
+        // A Mac's bundle whose database has one chain per speaker vendor,
+        // and this Mac's speaker assembly is not established (no manifest
+        // `speaker_id`, no loader export): the vendor-neutral chain may
+        // carry another vendor's protection, so nothing is selected and the
+        // speakers stay muted until the ID is known.
+        None => {
+            return Err(Error::format(
+                ctx,
+                "speaker ID unknown: the database has one configuration per speaker vendor, \
+                 and selecting one needs this Mac's speaker ID",
+            ));
         }
     };
     let c = match pick.as_slice() {

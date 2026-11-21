@@ -137,8 +137,10 @@ fn selection_by_speaker_id() {
     assert!(t.selection.strip.ends_with("_7.austrip"));
     assert!(!d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
     assert_eq!(t.selection.all.len(), 3);
-    let (t, _) = load(&b, None);
-    assert!(t.unwrap().selection.strip.ends_with("general.austrip"));
+    // No speaker ID for a database with one chain per vendor: refused,
+    // never the vendor-neutral chain (it may carry another vendor's
+    // protection).
+    assert!(load(&b, None).0.is_err());
     // An ID the database does not know is an error, not a fallback.
     assert!(load(&b, Some(3)).0.is_err());
 }
@@ -180,12 +182,22 @@ fn speaker_id_comes_from_the_manifest_then_the_device_tree() {
     let t = load_with(&b, Options { device_tree_speaker_id: Some(7), ..Options::default() }).unwrap();
     assert!(t.selection.strip.ends_with("_7.austrip"));
     assert_eq!(t.speaker_id_source, Some("device-tree"));
-    // Neither: the vendor-neutral fallback, with a warning.
+    // Neither: refused (no vendor-neutral fallback), so the Mac stays muted.
+    let e = load_with(&b, Options::default()).expect_err("an unknown speaker ID refuses");
+    assert!(e.to_string().contains("speaker ID unknown"), "{e}");
+    // The vendor-neutral entry alone (65535, the strap's invalid value) is
+    // an ID, not an unknown one: it still takes the general route.
+    let t = load_with(&b, Options { device_tree_speaker_id: Some(65535), ..Options::default() }).unwrap();
+    assert!(t.selection.strip.ends_with("general.austrip"));
+    // The same database read as a raw macOS Tunings tree (offline tools; no
+    // manifest, never a Mac's bundle) still lists its vendor-neutral chain,
+    // with the warning, so attestation can enumerate every configuration.
+    let raw = Bundle::from_tunings_root(&b.source, ACOUSTIC_ID).unwrap();
+    assert!(!raw.verified);
     let mut d = Diagnostics::default();
-    let t = Tuning::load(&b, &Options::default(), &mut d).unwrap();
+    let t = Tuning::load(&raw, &Options::default(), &mut d).unwrap();
     assert!(t.selection.strip.ends_with("general.austrip"));
     assert!(d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
-    assert_eq!(t.speaker_id, None);
     // The manifest and the device tree disagree: not this Mac's bundle.
     let b = spid_bundle("e2e-spid-clash", Some(7));
     assert!(load_with(&b, Options { device_tree_speaker_id: Some(3), ..Options::default() }).is_err());
