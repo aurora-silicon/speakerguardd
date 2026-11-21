@@ -749,7 +749,8 @@ def cap_amps(hw):
 
 def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/asound"):
     """(index, id) of the ALSA card whose device is the device tree's sound
-    node: the running card's own id. None when no card is bound to it."""
+    node: the running card's own id. None when no card is bound to it, or
+    when the bound card has no id yet (still registering)."""
     want = os.path.realpath(os.path.join(dt, hw["sound"]))
     try:
         names = sorted(os.listdir(sysfs))
@@ -761,13 +762,24 @@ def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/
         of = os.path.join(sysfs, d, "device", "of_node")
         if os.path.exists(of) and os.path.realpath(of) == want:
             idx = int(d[4:])
-            path = os.path.join(proc, f"card{idx}", "id")
-            try:
-                with open(path) as f:
-                    return idx, f.read().strip()
-            except OSError as e:
-                raise Refused(f"the speaker card {d} is bound to {hw['sound']}, but its id cannot be read ({path}: "
-                              f"{e.strerror or e})") from None
+            # The id from sysfs: the attribute exists as soon as the card
+            # device does. snd_card_register() adds the device (and its
+            # of_node link) before the card's proc entries, so a card that is
+            # still registering may have no /proc id yet (the proc copy is the
+            # fallback). Not there yet = not bound yet (None: the caller waits
+            # or keeps the record); any other error refuses.
+            for path in (os.path.join(sysfs, d, "id"), os.path.join(proc, f"card{idx}", "id")):
+                try:
+                    with open(path) as f:
+                        cid = f.read().strip()
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    raise Refused(f"the speaker card {d} is bound to {hw['sound']}, but its id cannot be read ({path}: "
+                                  f"{e.strerror or e})") from None
+                if cid:
+                    return idx, cid
+            return None
     return None
 
 

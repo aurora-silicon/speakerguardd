@@ -37,7 +37,7 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Speaker transport (MCA, AOP variants) | graph format and buffering | `driver:` back-end compatible (`TRANSPORTS`) | capability (per block); a new block needs an entry, never a board entry |
 | Sense present on this Mac | wiring method, unit admission | `dt:` back-end `dma-names` names the driver's sense channel (or not) | capability |
 | Sense slots and their order | sense map | `dt:` `ti,vmon-slot-no` / `ti,imon-slot-no` | capability, proven silently by the self-check |
-| ALSA card id | graph (`hw:CARD=`), supervisor, provisioning | `alsa:` the card bound to the sound node (**this change**; the self-check and provisioning use the same lookup, and a reused pass needs the same id); offline `dt:` model | capability |
+| ALSA card id | graph (`hw:CARD=`), supervisor, provisioning | `alsa:` the card bound to the sound node (**this change**; the self-check and provisioning use the same lookup, and a reused pass needs the same id; the gate's interface read still finds the card by its speaker link, the same card today); offline `dt:` model | capability |
 | Machine key (`apple,<key>-macaudio`) | names the voicing graph and the generated file | `dt:` sound node compatible | naming only |
 | Protection unit, roles, rate | wiring, blob | `tuning:` | capability |
 | Units that may run without sense | wiring | `tuning:` unit kind (spp3 needs sense) | capability |
@@ -66,8 +66,13 @@ Each capability either has a source or refuses:
 - A protection value the Mac does not report (a fixed volume ceiling, a
   high-pass in front of protection) is never filled from a table of ours,
   whatever the table is keyed by: no grant, muted. Today a fixed ceiling
-  latches the supervisor (0 dB expected), and a high-pass has no reader
-  yet, so a speaker that needs one has no way in.
+  latches the supervisor (0 dB expected). Nothing reads a high-pass
+  requirement yet, though: a Mac whose speakers need one but have no fixed
+  ceiling would derive (`derived-nosense`) and get a grant without it. So
+  a transport entry for such a Mac lands only together with a refusal that
+  does not depend on the ceiling: `derive()` refuses when the Mac's bundle
+  names a high-pass in front of protection that the reader does not
+  compile yet.
 
 The only defaults are the safe ones. One missing value still admits a Mac
 today, and it is tracked:
@@ -168,7 +173,7 @@ refusing when the copy disagrees, is an open item.
 
 | Change | Its machine-specific part | Maps onto |
 |---|---|---|
-| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; `operating_volume_db`; `protect_highpass` keyed by board | transport entry as is (per block); the ceiling only via provider 1 and the high-pass only from the bundle. Neither ships as a table of ours (board- or speaker-keyed); until the providers exist that Mac gets no grant |
+| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; `operating_volume_db`; `protect_highpass` keyed by board | transport entry per block, but only together with a refusal that does not depend on the ceiling latch (`derive()` refuses a bundle that names a high-pass the reader does not compile); the ceiling only via provider 1 and the high-pass only from the bundle. Neither ships as a table of ours (board- or speaker-keyed); until the providers exist that Mac gets no grant |
 | T8142/T6050 transport without a sense channel | `speaker_dma`/`sense_dma` on the driver entry | as is: per block, `sense_path` |
 | K114c sense on the v2 path | applied sense geometry | as is: `alsa:` applied hw params |
 | Fail closed on an unproven method; units without sense by name | method dispatch, `NO_SENSE_UNITS` | as is: `tuning:` unit kind |

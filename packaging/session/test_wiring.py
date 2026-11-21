@@ -1790,7 +1790,12 @@ class Capabilities(unittest.TestCase):
             self.assertTrue(wiring.probe(hw)["card"].source.startswith("dt:"))
         self.assertIsNone(wiring.live_card(hw, "/nonexistent", "/nonexistent"))
 
-    def test_an_unreadable_card_id_refuses(self):
+    def test_a_card_still_registering_is_not_bound_yet(self):
+        # snd_card_register() adds the card device and its of_node link
+        # before the card's proc entries: no id yet is "not bound yet"
+        # (None), so provisioning keeps waiting and the self-check keeps its
+        # record. The sysfs id is read first; an id that exists but cannot be
+        # read refuses with its path.
         import tempfile
 
         f = fx("j413")
@@ -1801,9 +1806,15 @@ class Capabilities(unittest.TestCase):
             hw = wiring.read_dt(dt, sysfs=os.path.join(d, "none"))
             sysfs, proc = self._sysfs(d, dt, "sound", idx=1)
             os.unlink(os.path.join(proc, "card1", "id"))
+            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
+            with open(os.path.join(sysfs, "card1", "id"), "w") as fh:
+                fh.write("AppleJ413Sys\n")
+            self.assertEqual(wiring.live_card(hw, dt, sysfs, proc), (1, "AppleJ413Sys"))
+            os.unlink(os.path.join(sysfs, "card1", "id"))
+            os.makedirs(os.path.join(sysfs, "card1", "id"))
             with self.assertRaises(wiring.Refused) as e:
                 wiring.live_card(hw, dt, sysfs, proc)
-            self.assertIn(os.path.join(proc, "card1", "id"), str(e.exception))
+            self.assertIn(os.path.join(sysfs, "card1", "id"), str(e.exception))
 
     def test_back_end_nodes_are_recorded_for_the_report(self):
         import tempfile

@@ -1672,6 +1672,12 @@ class SpeakerCard(unittest.TestCase):
             self.assertEqual(prov.find_card(hw, "AppleJ614", 0, dt, sysfs, proc), (2, "AppleJ616"))
             with self.assertRaises(prov.Failed):
                 prov.find_card({"sound": "sound-missing"}, "AppleJ616", 0, dt, sysfs, proc)
+            # a card still registering (of_node link, no id yet) is waited
+            # for, not refused: the wait runs out with "no card bound"
+            os.unlink(os.path.join(proc, "card2", "id"))
+            with self.assertRaises(prov.Failed) as e:
+                prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc)
+            self.assertIn("no ALSA card bound", str(e.exception))
 
     def test_no_speaker_link_is_no_speaker_card(self):
         with tempfile.TemporaryDirectory() as sysfs:
