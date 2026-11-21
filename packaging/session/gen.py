@@ -39,6 +39,7 @@ The graph, per machine:
 import json
 import math
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -110,31 +111,57 @@ def runtime_voicing_enabled(board):
     return True
 
 
-def voicing_bound(board, gate=None):
-    """Interim never-louder bound for a board's generated voicing: one gain
+SPEAKER_KEY = re.compile(r"AID[0-9]+")
+
+
+def speaker_table(name, gate):
+    """A gate.json table keyed by the speaker identity a tuning bundle names
+    (its AID). The values belong to the speaker, not the board, so a Mac
+    with the same speakers gets the same entry and no entry names a board.
+    A key that is not a speaker identity refuses the table: an entry left
+    under a board name would otherwise be skipped without a word.
+    """
+    t = gate.get(name, {})
+    if not isinstance(t, dict) or not all(isinstance(k, str) and SPEAKER_KEY.fullmatch(k) for k in t):
+        raise ValueError(f"{name}: keys must be speaker identities (AID<n>), got {sorted(t) if isinstance(t, dict) else type(t).__name__}")
+    return t
+
+
+def speaker_identity(c):
+    """The speaker identity (AID) of the bundle a description was made from.
+    Without one, no speaker table can be read, so the voicing refuses."""
+    aid = c.get("aid")
+    if not isinstance(aid, str) or not aid:
+        raise ValueError(f"{c.get('board', c.get('key'))}: the description names no speaker identity (aid)")
+    return aid
+
+
+def voicing_bound(aid, gate=None):
+    """Interim never-louder bound for a speaker's generated voicing: one gain
     in dB (<= 0) per unit lane, applied after the voicing plugin, from
-    gate.json voicing_pre_bound_db. It exists only while a voicing law is
-    still open (it keeps every lane at or below macOS on the full-chain
-    safety scan) and goes when the law is exact. Anything malformed, any
-    positive value or a wrong lane count refuses the board's voicing.
+    gate.json voicing_pre_bound_db, keyed by the bundle's speaker identity.
+    It exists only while a voicing law is still open (it keeps every lane at
+    or below macOS on the full-chain safety scan) and goes when the law is
+    exact. Anything malformed, any positive value or a wrong lane count
+    refuses the voicing.
     """
     if gate is None:
         gate = load_gate()
-    b = gate.get("voicing_pre_bound_db", {}).get(board)
+    b = speaker_table("voicing_pre_bound_db", gate).get(aid)
     if b is None:
         return None
     if not isinstance(b, list) or not all(isinstance(x, (int, float)) and not isinstance(x, bool) and -12.0 <= x <= 0.0 for x in b):
-        raise ValueError(f"voicing_pre_bound_db for {board}: want a list of dB values in [-12, 0]")
+        raise ValueError(f"voicing_pre_bound_db for {aid}: want a list of dB values in [-12, 0]")
     return [float(x) for x in b]
 
 
 LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
 
 
-def voicing_lowpass(board, gate=None):
-    """INTERIM never-louder band limit for a board's generated voicing, from
-    gate.json voicing_pre_lowpass: {"hz": corner, "order": even Butterworth
-    order}. It is not a macOS law. It exists only because one voicing law is
+def voicing_lowpass(aid, gate=None):
+    """INTERIM never-louder band limit for a speaker's generated voicing,
+    from gate.json voicing_pre_lowpass, keyed by the bundle's speaker
+    identity: {"hz": corner, "order": even Butterworth order}. It is not a macOS law. It exists only because one voicing law is
     still open and makes a board louder than macOS in a band no lane trim
     can hold: on the j700 (AID44) v2's ControlFreak lacks the AU's
     reconstruction low-pass, so above ~17 kHz the box is up to +23 dB
@@ -146,11 +173,11 @@ def voicing_lowpass(board, gate=None):
     bq_lowpass (RBJ) at the corner with the Butterworth Q of its pole pair,
     so the cascade is the bilinear Butterworth response, monotonic and
     never above 0 dB. It goes when the ControlFreak law is exact. Anything
-    malformed refuses the board's voicing.
+    malformed refuses the voicing.
     """
     if gate is None:
         gate = load_gate()
-    lp = gate.get("voicing_pre_lowpass", {}).get(board)
+    lp = speaker_table("voicing_pre_lowpass", gate).get(aid)
     if lp is None:
         return None
     hz = lp.get("hz") if isinstance(lp, dict) else None
@@ -165,7 +192,7 @@ def voicing_lowpass(board, gate=None):
         or isinstance(order, bool)
         or order not in LOWPASS_ORDERS
     ):
-        raise ValueError(f"voicing_pre_lowpass for {board}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
+        raise ValueError(f"voicing_pre_lowpass for {aid}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
     return float(hz), order
 
 
@@ -181,9 +208,10 @@ def voicing_conf(m, c, w):
     """
     amps = c["amps"]
     unit = w[0]
-    bound = voicing_bound(c.get("board", m))
+    aid = speaker_identity(c)
+    bound = voicing_bound(aid)
     if bound is not None and len(bound) != amps:
-        raise ValueError(f"voicing_pre_bound_db for {c.get('board', m)}: {len(bound)} lanes, the board has {amps}")
+        raise ValueError(f"voicing_pre_bound_db for {aid}: {len(bound)} lanes, this Mac has {amps}")
     trims = {k: bound[k] for k in range(amps) if bound and bound[k] < 0.0}
     outputs = " ".join(f'"b{unit[p]}:Out"' if unit[p] in trims else f'"voicing:out_{unit[p]}"' for p in range(amps))
     extra_nodes = "".join(
@@ -193,11 +221,11 @@ def voicing_conf(m, c, w):
     links = "".join(f' {{ output = "voicing:out_{k}" input = "b{k}:In" }}' for k in sorted(trims))
     inputs = '"voicing:in_0" "voicing:in_1"'
     pre_nodes = ""
-    lp = voicing_lowpass(c.get("board", m))
+    lp = voicing_lowpass(aid)
     if lp is not None:
         hz, order = lp
         if hz >= c["rate"] / 2:
-            raise ValueError(f"voicing_pre_lowpass for {c.get('board', m)}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
+            raise ValueError(f"voicing_pre_lowpass for {aid}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
         qs = butterworth_q(order)
         for ch in (0, 1):
             pre_nodes += "".join(
@@ -296,7 +324,9 @@ def machine(m):
         raise SystemExit(f"{m}: {e}")
     if c["key"] != m:
         raise SystemExit(f"fixtures/{m}.json: its device tree names machine {c['key']}")
-    return c, (w["unit_channels"], w["sense_ports"], w["hash"])
+    # the speaker tables (voicing_pre_bound_db, voicing_pre_lowpass) are
+    # keyed by the bundle's speaker identity, as on a running Mac
+    return dict(c, aid=w["aid"]), (w["unit_channels"], w["sense_ports"], w["hash"])
 
 
 def pipewire_conf(m, c, w, source=None, voicing_pre=None):

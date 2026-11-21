@@ -1368,6 +1368,23 @@ class Gate(Base):
                 self.assertIn("sgv2#voicing", f.read())
             with open(os.path.join(args.wireplumber_dir, "60-sgv2-j999.conf")) as f:
                 self.assertIn("node.software-dsp.rules = []", f.read())
+            # The speaker tables are read by the speaker identity the record's
+            # wiring carries (the bundle's AID): a 4-lane AID13 bound on this
+            # 2-amp Mac refuses its voicing, and a record without one cannot
+            # generate the voicing at all.
+            record = os.path.join(self.p.state, "selfcheck.json")
+            with open(record) as f:
+                saved = f.read()
+            for aid in ("AID13", None):
+                report = json.loads(saved)
+                report["wiring"]["aid"] = aid
+                with open(record, "w") as f:
+                    json.dump(report, f)
+                with self.assertRaises(ValueError, msg=aid):
+                    sc.cmd_generate(args)
+            with open(record, "w") as f:
+                f.write(saved)
+            self.assertEqual(sc.cmd_generate(args), 0)
             # Kernel and blob changes re-run the silent check. Until it
             # passes again, the stale graph record cannot admit the board.
             self.checked(kernel="old-kernel")

@@ -1493,7 +1493,7 @@ def cmd_generate(args):
     units = wiring.qualification(args.state, rec["board"], os.uname().release)
     gen.qualification_policy(rec["board"], units)
     m = rec["key"]
-    c = dict(c, board=rec["board"])
+    c = dict(c, board=rec["board"], aid=w.get("aid"))
     enabled = gen.runtime_voicing_enabled(rec["board"])
     bind_path = os.path.join(args.state, "provision.bind")
     bound_mode = False

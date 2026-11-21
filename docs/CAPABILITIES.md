@@ -45,7 +45,8 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Applied sense geometry (format, channels, period) | self-check | `alsa:` applied hw params | capability |
 | Speaker identity (`spid`) | tuning selection | bundle manifest; `dt:` `/chosen` export when present | provider gap (below) |
 | Fixed volume ceiling under the lease | supervisor grant check | not read: the supervisor expects 0 dB and latches on anything else | provider gap (below) |
-| Interim voicing trims, low-pass, deployment overrides | voicing graph | `gate.json` tables keyed by board | policy, to re-key (below) |
+| Interim voicing trims and low-pass | voicing graph | `gate.json` tables keyed by the bundle's speaker identity (`aid`) | tuning (below) |
+| Voicing deployment overrides | offline fixtures' recorded mode | `gate.json` `voicing_pre` keyed by board | policy, to re-key with the fixtures (below) |
 | High-pass in front of protection for a speaker without a model | protect graph | not on main | tuning, keyed by the bundle (below) |
 | Board identity | record, blob, thermal state | `dt:` root compatible | identity binding, stays |
 
@@ -95,11 +96,13 @@ has no model, belong to the speaker, not the board. They stay as tuning
 keyed by what the bundle names (its speaker identity), never as a code
 gate, and never as a value that admits a Mac on its own:
 
-- `gate.json` `voicing_pre_bound_db` (0 dB on every lane except the
-  J413's woofers, -0.043 dB) and `voicing_pre_lowpass` (empty) are
-  re-keyed by the bundle's speaker identity in a follow-up. Entries that
-  have no effect (0 dB, empty) are dropped, and any new interim entry is
-  keyed the same way.
+- `gate.json` `voicing_pre_bound_db` and `voicing_pre_lowpass` are keyed
+  by the bundle's speaker identity (`AID<n>`, the `aid` the wiring carries
+  from the tuning). The one entry with an effect is `AID13`, the J413's
+  speakers (woofers -0.043 dB); the 0 dB entries were dropped. A key that
+  is not a speaker identity refuses the table, and a description without
+  an `aid` cannot generate the voicing, so no Mac loses its bound without
+  a word.
 - `voicing_pre` overrides equal the runtime default (generated voicing) on
   every board they name; they keep the offline fixtures' recorded mode and
   are re-keyed with the fixtures.

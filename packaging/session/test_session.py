@@ -795,36 +795,73 @@ class Generated(unittest.TestCase):
         self.assertEqual(on, ["j316s", "j413", "j616s", "j700"])
 
     def test_voicing_bound_is_validated_and_never_positive(self):
-        self.assertIsNone(gen.voicing_bound("j616s", {}))
-        self.assertEqual(gen.voicing_bound("j616s", {"voicing_pre_bound_db": {"j616s": [0, -1.5]}}), [0.0, -1.5])
+        self.assertIsNone(gen.voicing_bound("AID35", {}))
+        self.assertEqual(gen.voicing_bound("AID35", {"voicing_pre_bound_db": {"AID35": [0, -1.5]}}), [0.0, -1.5])
         for bad in ([0.1], ["-1"], [True], -1.0, [-13.0], [float("nan")]):
             with self.assertRaises(ValueError):
-                gen.voicing_bound("j616s", {"voicing_pre_bound_db": {"j616s": bad}})
+                gen.voicing_bound("AID35", {"voicing_pre_bound_db": {"AID35": bad}})
         for m in gen.machines():
             c, w = gen.machine(m)
-            b = gen.voicing_bound(c.get("board", m))
+            b = gen.voicing_bound(c["aid"])
             if gen.voicing_enabled(c.get("board", m)) and b is not None:
                 self.assertEqual(len(b), c["amps"])
 
+    def test_the_speaker_tables_are_keyed_by_the_bundles_speaker_identity(self):
+        # Only speaker identities key the tables; an entry left under a board
+        # name refuses the table instead of being skipped (that Mac would
+        # lose its never-louder bound without a word).
+        for table, value in (("voicing_pre_bound_db", [-0.5, -0.5]), ("voicing_pre_lowpass", {"hz": 17400, "order": 8})):
+            for key in ("j413", "aid13", "AID", "AID13 ", "13", ""):
+                with self.assertRaises(ValueError, msg=(table, key)):
+                    gen.speaker_table(table, {table: {key: value}})
+            with self.assertRaises(ValueError):
+                gen.speaker_table(table, {table: [value]})
+            self.assertEqual(gen.speaker_table(table, {table: {"AID44": value}}), {"AID44": value})
+        lookup = {"voicing_pre_bound_db": gen.voicing_bound, "voicing_pre_lowpass": gen.voicing_lowpass}
+        for table, value in (("voicing_pre_bound_db", [-0.5, -0.5]), ("voicing_pre_lowpass", {"hz": 17400, "order": 8})):
+            with self.assertRaises(ValueError):
+                lookup[table]("AID44", {table: {"AID44": value, "j700": value}})
+        # The shipped tables: one entry, the J413's speakers (AID13), woofers
+        # -0.043 dB; it reaches the J413's graph through the bundle's AID.
+        gate = gen.load_gate()
+        self.assertEqual(gen.speaker_table("voicing_pre_bound_db", gate), {"AID13": [-0.043, -0.043, 0.0, 0.0]})
+        self.assertEqual(gen.speaker_table("voicing_pre_lowpass", gate), {})
+        c, w = gen.machine("j413")
+        self.assertEqual(c["aid"], "AID13")
+        conf = gen.pipewire_conf("j413", c, w, voicing_pre=True)
+        self.assertEqual(conf.count('"Mult" = 0.995061676'), 2)
+        # The same description from another speaker gets no J413 trim.
+        other = gen.pipewire_conf("j413", dict(c, aid="AID21"), w, voicing_pre=True)
+        self.assertNotIn("label = linear", other)
+        # No speaker identity: the voicing refuses rather than run untrimmed.
+        for missing in (None, "", 13):
+            with self.assertRaises(ValueError):
+                gen.voicing_conf("j413", dict(c, aid=missing), w)
+        bare = {k: v for k, v in c.items() if k != "aid"}
+        with self.assertRaises(ValueError):
+            gen.voicing_conf("j413", bare, w)
+        # The interim graph reads no speaker table, so it needs no identity.
+        self.assertEqual(gen.pipewire_conf("j413", bare, w, voicing_pre=False), gen.pipewire_conf("j413", c, w, voicing_pre=False))
+
     def test_voicing_lowpass_is_interim_validated_and_only_on_the_j700(self):
-        self.assertIsNone(gen.voicing_lowpass("j700", {}))
-        self.assertEqual(gen.voicing_lowpass("j700", {"voicing_pre_lowpass": {"j700": {"hz": 17400, "order": 8}}}), (17400.0, 8))
+        self.assertIsNone(gen.voicing_lowpass("AID44", {}))
+        self.assertEqual(gen.voicing_lowpass("AID44", {"voicing_pre_lowpass": {"AID44": {"hz": 17400, "order": 8}}}), (17400.0, 8))
         for bad in ({"hz": 17400}, {"hz": 17400, "order": 7}, {"hz": 17400, "order": 8.0}, {"hz": "17400", "order": 8},
                     {"hz": True, "order": 8}, {"hz": 500, "order": 8}, {"hz": 30000, "order": 8}, {"hz": float("nan"), "order": 8},
                     {"hz": 17400, "order": 8, "gain": 0}, [17400, 8], 17400):
             with self.assertRaises(ValueError):
-                gen.voicing_lowpass("j700", {"voicing_pre_lowpass": {"j700": bad}})
+                gen.voicing_lowpass("AID44", {"voicing_pre_lowpass": {"AID44": bad}})
         # Butterworth pole-pair Qs (order 2: 1/sqrt(2); order 8: the four classic values)
         self.assertAlmostEqual(gen.butterworth_q(2)[0], 2 ** -0.5, places=12)
         self.assertEqual([round(q, 4) for q in gen.butterworth_q(8)], [2.5629, 0.9, 0.6013, 0.5098])
         # Shipped gate: no board needs the interim band limit since the AID44 ControlFreak saturation
         # law is exact (2026-11-08); the mechanism stays for a future open law.
-        on = sorted(b for b in (gen.fixture(m)["hw"]["board"] for m in gen.machines()) if gen.voicing_lowpass(b) is not None)
+        on = sorted(m for m in gen.machines() if gen.voicing_lowpass(gen.machine(m)[0]["aid"]) is not None)
         self.assertEqual(sorted(set(on)), [])
         for m in gen.machines():
             c, w = gen.machine(m)
             conf = gen.pipewire_conf(m, c, w, voicing_pre=True)
-            lp = gen.voicing_lowpass(c.get("board", m))
+            lp = gen.voicing_lowpass(c["aid"])
             if lp is None:
                 self.assertNotIn("bq_lowpass", conf)
                 self.assertIn('inputs = [ "voicing:in_0" "voicing:in_1" ]', conf)
@@ -840,7 +877,7 @@ class Generated(unittest.TestCase):
         c, w = gen.machine(m)
         orig = gen.voicing_lowpass
         try:
-            gen.voicing_lowpass = lambda board, gate=None: (24000.0, 8)
+            gen.voicing_lowpass = lambda aid, gate=None: (24000.0, 8)
             with self.assertRaises(ValueError):
                 gen.voicing_conf(m, c, w)
         finally:
@@ -857,7 +894,7 @@ class Generated(unittest.TestCase):
             self.assertIn('audio.position = [ FL FR ]', generated)
             self.assertIn('capture.volumes = [ { control = "voicing:volume"', generated)
             self.assertIn('scale = cubic', generated)
-            b = gen.voicing_bound(c.get("board", m)) or []
+            b = gen.voicing_bound(c["aid"]) or []
             ports = " ".join(f'"b{lane}:Out"' if lane < len(b) and b[lane] < 0 else f'"voicing:out_{lane}"' for lane in w[0])
             self.assertIn(f'outputs = [ {ports} ]', generated)
             wp_old = gen.wireplumber_conf(m, c, voicing_pre=False)
