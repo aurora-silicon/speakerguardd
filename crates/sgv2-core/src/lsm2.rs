@@ -185,6 +185,58 @@ fn vector_frames(ms: f32, rate: u32) -> usize {
     // writes): no one-vector minimum.
     libm::round(f / vector as f64) as usize * vector
 }
+/// A `FilterbankLatency` in milliseconds as one filterbank stage in frames,
+/// on the rate family's two-vector grid.
+fn filterbank_stage_frames(ms: f32, rate: u32) -> usize {
+    let f = ms as f64 * 1e-3 * rate as f64;
+    let vector = 2 * SUBSTEPS * rate_family(rate);
+    if rate == 32_000 {
+        libm::floor(f / vector as f64) as usize * vector
+    } else {
+        libm::round(f / vector as f64) as usize * vector
+    }
+}
+
+/// The `FilterbankLatency` the reference unit runs at, from the tuning's
+/// total `Latency` (controller ID 0) and its speaker-response look-ahead, at
+/// `rate`; `None` when they give no stage.
+///
+/// The reference builds its two filterbank stages from the total latency,
+/// not from its own `FilterbankLatency` parameter. Rendered offline on
+/// macOS 25G83, its output and delay stay bit-identical for every
+/// `FilterbankLatency` tried (1 to 5 ms, saved in the preset or written
+/// before initialisation), on a short and on a full preset, while the delay
+/// follows `Latency`: the total rounded to whole frames, less the
+/// look-ahead, halved and floored to the two-vector grid. A short preset
+/// leaves the field out and the unit then publishes 2 ms while it runs a
+/// 160-frame stage (2 x 160 + 32 = 352 frames at 48 kHz). This reproduces
+/// the measured delays at 32, 44.1, 48, 88.2 and 96 kHz and for total
+/// latencies from 4 to 9 ms with the look-ahead the tunings carry. A
+/// look-ahead off the stage grid (not a multiple of two vectors) leaves the
+/// reference's total where it was; this engine's total is then shorter by
+/// the remainder, which its controller-cadence check still bounds.
+pub fn effective_filterbank_latency_ms(latency_ms: f32, lookahead_ms: f32, rate: u32) -> Option<f32> {
+    let ok = |v: f32| v.is_finite() && v >= 0.0;
+    if !(ok(latency_ms) && ok(lookahead_ms)) || rate == 0 {
+        return None;
+    }
+    let total = libm::round(latency_ms as f64 * 1e-3 * rate as f64);
+    if total > (1u64 << 20) as f64 {
+        return None;
+    }
+    let vector = 2 * SUBSTEPS * rate_family(rate);
+    let stage = (total as usize).checked_sub(vector_frames(lookahead_ms, rate))? / 2 / vector * vector;
+    // The nearest millisecond value, nudged up past any float shortfall so
+    // `filterbank_stage_frames` gives back exactly this stage.
+    let mut ms = (stage as f64 * 1e3 / rate as f64) as f32;
+    for _ in 0..8 {
+        if filterbank_stage_frames(ms, rate) >= stage {
+            break;
+        }
+        ms = f32::from_bits(ms.to_bits() + 1);
+    }
+    (filterbank_stage_frames(ms, rate) == stage).then_some(ms)
+}
 /// Filterbank bands.
 pub const BANDS: usize = 5;
 /// Taps of the property-6632 pressure response.
@@ -531,6 +583,9 @@ pub mod ids {
     pub const T_AMBIENT: u32 = 7;
     pub const T_ENABLE: u32 = 15;
     // Controller-general offsets.
+    /// The unit's total algorithmic latency in milliseconds; it sets the
+    /// filterbank geometry ([`super::effective_filterbank_latency_ms`]).
+    pub const C_LATENCY: u32 = 0;
     pub const C_FAST_RELEASE: u32 = 1;
     pub const C_SLOW_RELEASE: u32 = 2;
     pub const C_ENABLE_MITIGATION: u32 = 3;
@@ -723,13 +778,7 @@ impl Params {
 
     /// One filterbank stage in frames.
     pub fn filterbank_frames(&self) -> usize {
-        let f = self.filterbank_latency_ms as f64 * 1e-3 * self.sample_rate as f64;
-        let vector = 2 * SUBSTEPS * rate_family(self.sample_rate);
-        if self.sample_rate == 32_000 {
-            libm::floor(f / vector as f64) as usize * vector
-        } else {
-            libm::round(f / vector as f64) as usize * vector
-        }
+        filterbank_stage_frames(self.filterbank_latency_ms, self.sample_rate)
     }
 
     /// The speaker-response look-ahead in frames.
@@ -3340,6 +3389,68 @@ mod fault_tests {
         }
         unit.reset();
         assert!(unit.is_failsafe());
+    }
+
+    /// The reference unit's delay, measured offline on macOS 25G83 with an
+    /// impulse while only `Latency`, the look-ahead or the rate changed
+    /// (speakerguardd#182): the engine's latency from the derived
+    /// `FilterbankLatency` equals it in every case.
+    #[test]
+    fn effective_filterbank_latency_reproduces_the_reference_delay() {
+        let la = 2.0 / 3.0;
+        let cases: [(u32, f32, f32, usize); 22] = [
+            (48_000, 4.0, la, 192),
+            (48_000, 5.0, la, 224),
+            (48_000, 6.0, la, 288),
+            (48_000, 22.0 / 3.0, la, 352),
+            // a total stored to three decimals still rounds to 352 frames
+            (48_000, 7.333, la, 352),
+            (48_000, 7.325, la, 352),
+            (48_000, 7.320_833, la, 320),
+            (48_000, 8.0, la, 384),
+            (48_000, 8.2, la, 384),
+            (48_000, 8.5, la, 384),
+            (48_000, 9.0, la, 416),
+            (48_000, 22.0 / 3.0, 0.0, 352),
+            (48_000, 22.0 / 3.0, 4.0 / 3.0, 352),
+            (48_000, 22.0 / 3.0, 2.0, 352),
+            (32_000, 22.0 / 3.0, la, 216),
+            (44_100, 22.0 / 3.0, la, 320),
+            (44_100, 7.0, la, 288),
+            (88_200, 22.0 / 3.0, la, 640),
+            (96_000, 22.0 / 3.0, la, 704),
+            (96_000, 8.5, la, 768),
+            // not measured: the rate families' own grids
+            (176_400, 22.0 / 3.0, la, 1280),
+            (192_000, 22.0 / 3.0, la, 1408),
+        ];
+        for (rate, latency, lookahead, delay) in cases {
+            let mut p = params();
+            p.sample_rate = rate;
+            p.speaker_response_lookahead_ms = lookahead;
+            p.filterbank_latency_ms = effective_filterbank_latency_ms(latency, lookahead, rate).unwrap();
+            assert_eq!(p.latency_frames(), delay, "{rate} Hz, Latency {latency} ms, look-ahead {lookahead} ms");
+        }
+    }
+
+    #[test]
+    fn effective_filterbank_latency_replaces_a_published_value_the_unit_does_not_run() {
+        // The issue's case: 2 ms published, a 160-frame stage run.
+        let mut p = params();
+        p.filterbank_latency_ms = 2.0;
+        p.speaker_response_lookahead_ms = 2.0 / 3.0;
+        assert_eq!(p.validate(), Err(InitError::Invalid("latency below the controller cadence")));
+        p.filterbank_latency_ms = effective_filterbank_latency_ms(22.0 / 3.0, 2.0 / 3.0, 48_000).unwrap();
+        assert_eq!((p.filterbank_frames(), p.latency_frames()), (160, 352));
+        assert_eq!(p.filterbank_latency_ms, 10.0 / 3.0, "a full preset's own value, to the bit");
+        assert!(Unit::init_error(&p).is_none());
+        // 32 kHz floors its stage: the value must not fall a float step short.
+        let ms = effective_filterbank_latency_ms(22.0 / 3.0, 2.0 / 3.0, 32_000).unwrap();
+        assert_eq!(filterbank_stage_frames(ms, 32_000), 96);
+        for bad in [(f32::NAN, 0.5), (-1.0, 0.5), (7.0, f32::INFINITY), (0.1, 2.0), (1e30, 0.5)] {
+            assert_eq!(effective_filterbank_latency_ms(bad.0, bad.1, 48_000), None, "{bad:?}");
+        }
+        assert_eq!(effective_filterbank_latency_ms(7.0, 0.5, 0), None);
     }
 
     #[test]

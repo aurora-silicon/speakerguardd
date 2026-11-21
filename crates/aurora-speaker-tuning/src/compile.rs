@@ -767,6 +767,23 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     let model_only =
         (guarded || (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0)) as u32;
 
+    // The FIR bank's stage is the one the unit builds from its total Latency
+    // and look-ahead, never its FilterbankLatency record: the unit runs the
+    // same stage whatever that record says (a short preset leaves it out and
+    // the unit publishes a value it does not run), so the derived stage is
+    // used even where the published one would pass the cadence check. See
+    // `lsm2::effective_filterbank_latency_ms` for the evidence.
+    let speaker_response_lookahead_ms = get(id::controller(id::C_LOOKAHEAD))?;
+    let filterbank_latency_ms =
+        lsm2::effective_filterbank_latency_ms(get(id::controller(id::C_LATENCY))?, speaker_response_lookahead_ms, rate)
+            .ok_or_else(|| bad("lsm2 Latency and look-ahead give no filterbank stage"))?;
+    if g.get(id::controller(id::C_FILTERBANK_LATENCY)) != Some(filterbank_latency_ms) {
+        diags.info(
+            "lsm2-filterbank-latency-derived",
+            "compile",
+            "FilterbankLatency is not the stage the unit runs: compiled the stage its total Latency and look-ahead give",
+        );
+    }
     let mut p = lsm2::Params {
         channels: n as u32,
         sample_rate: rate,
@@ -783,11 +800,8 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         fast_release_time_ms: get(id::controller(id::C_FAST_RELEASE))?,
         slow_release_time_ms: get(id::controller(id::C_SLOW_RELEASE))?,
         low_band_release_time_ms: get(id::controller(id::C_LOW_BAND_RELEASE))?,
-        // This sizes the FIR bank. The engine derives its delay from that
-        // structure plus look-ahead and cadence, never controller(0)'s
-        // reported total Latency (which a short-preset AU can misreport).
-        filterbank_latency_ms: get(id::controller(id::C_FILTERBANK_LATENCY))?,
-        speaker_response_lookahead_ms: get(id::controller(id::C_LOOKAHEAD))?,
+        filterbank_latency_ms,
+        speaker_response_lookahead_ms,
         power_time_scale_s: [0.0; 4],
         power_hard_limit_w: [0.0; 4],
         power_soft_limit_pct: [0.0; 4],
