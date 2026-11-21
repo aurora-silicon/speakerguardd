@@ -95,9 +95,11 @@ has no model, belong to the speaker, not the board. They stay as tuning
 keyed by what the bundle names (its speaker identity), never as a code
 gate, and never as a value that admits a Mac on its own:
 
-- `gate.json` `voicing_pre_bound_db` (all lanes 0 dB today) and
-  `voicing_pre_lowpass` (empty) are no-ops on main and go in a follow-up;
-  any new interim entry is keyed by the bundle's speaker identity.
+- `gate.json` `voicing_pre_bound_db` (0 dB on every lane except the
+  J413's woofers, -0.043 dB) and `voicing_pre_lowpass` (empty) are
+  re-keyed by the bundle's speaker identity in a follow-up. Entries that
+  have no effect (0 dB, empty) are dropped, and any new interim entry is
+  keyed the same way.
 - `voicing_pre` overrides equal the runtime default (generated voicing) on
   every board they name; they keep the offline fixtures' recorded mode and
   are re-keyed with the fixtures.
