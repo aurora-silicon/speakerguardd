@@ -985,7 +985,7 @@ class NoHandMap(unittest.TestCase):
         finally:
             wiring.read_dt, wiring.tuning_dump = saved
         self.assertEqual((w["method"], errs), ("derived", []))
-        self.assertEqual(c, gen.machine("j616")[0])
+        self.assertEqual(dict(c, aid=w["aid"]), gen.machine("j616")[0])
 
     def test_the_blob_header_names_its_rate(self):
         import tempfile

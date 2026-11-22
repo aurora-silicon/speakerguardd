@@ -43,9 +43,11 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Units that may run without sense | wiring | `tuning:` unit kind (spp3 needs sense) | capability |
 | Volume step and dB level | supervisor operating point | `alsa:` control TLV | capability |
 | Applied sense geometry (format, channels, period) | self-check | `alsa:` applied hw params | capability |
-| Speaker identity (`spid`) | tuning selection | bundle manifest; `dt:` `/chosen` export when present | provider gap (below) |
+| Speaker ID (`spid`, the straps' vendor ID) | vendor chain selection in the tuning reader | bundle manifest `speaker_id` and `dt:` `/chosen/asahi,speaker-id` (the loader, from the ADT straps): either alone is used, and the two must agree | capability where the loader exports it (below) |
 | Fixed volume ceiling under the lease | supervisor grant check | not read: the supervisor expects 0 dB and latches on anything else | provider gap (below) |
-| Interim voicing trims, low-pass, deployment overrides | voicing graph | `gate.json` tables keyed by board | policy, to re-key (below) |
+| Bundle speaker identity (`aid`) | voicing trim keys (below) | `tuning:` the bundle's `aid` (`AID<n>`), carried by the record and checked against the provisioned bundle at generation; no loader exports it | tuning |
+| Interim voicing trims and low-pass | voicing graph | `gate.json` tables keyed by the bundle's speaker identity (`aid`) | tuning (below) |
+| Voicing deployment overrides | offline fixtures' recorded mode | `gate.json` `voicing_pre` keyed by board | policy, to re-key with the fixtures (below) |
 | High-pass in front of protection for a speaker without a model | protect graph | not on main | read from the Mac's own tuning bundle; absent = refused (below) |
 | Board identity | record, blob, thermal state | `dt:` root compatible | identity binding, stays |
 
@@ -106,9 +108,16 @@ fallback is refusal.
    protects against, so "it only lowers the volume" does not make a guessed
    one safe.
 2. **Speaker identity.** Linux has no passive reader of the speaker-ID
-   straps. Provider: the loader exports the ID under `/chosen`. Reader:
-   `aurora-speaker-tuning` already reads it when present. Fallback: the
-   bundle manifest's `speaker_id`.
+   straps. Provider: the loader reads the straps the ADT names
+   (`find-speaker-id`, `function-speaker-id0/1`, `valid-speaker-ids`) and
+   exports the ID as `/chosen/asahi,speaker-id`; aura does this
+   (`kboot_audio.c`). Reader: `aurora-speaker-tuning`
+   (`tuning.rs`, `resolve_speaker_id`) takes an explicit override first,
+   then the manifest's `speaker_id` and the device tree's export: either
+   alone is used, and when both are present they must agree or the bundle
+   is refused as not this Mac's. This is the strap `spid`, which chooses
+   the vendor chain; it is not the bundle's `aid` the voicing tables key
+   on, which no loader exports.
 3. **Sense presence on a new transport.** Provider: the back-end node's
    `dma-names` (sense channel named or not), already used for the T6041
    and T8132 AOP. A new driver entry names its `speaker_dma` and
@@ -123,17 +132,19 @@ Two kinds of per-model data, with opposite rules:
   which is harmless. They belong to the speaker, not the board, so they
   stay as tuning keyed by what the bundle names (its speaker identity),
   never as a code gate.
-  - `gate.json` `voicing_pre_bound_db`: 0 dB on every lane except the
-    J413's woofers, -0.043 dB. The value is ours, not Apple's: the bound
-    `bound.py` computes from our full-chain safety scan of v2's voicing
-    against the macOS chain's own render (VirtBass/Tone onset precision
-    puts v2 a few hundredths of a dB over on woofer bursts). It is a voicing
-    trim, not a protection level: it is validated as never positive and
+  - `gate.json` `voicing_pre_bound_db` and `voicing_pre_lowpass` are keyed
+    by the bundle's speaker identity (`AID<n>`, the `aid` the wiring
+    carries from the tuning). The one entry with an effect is `AID13`, the
+    J413's speakers (woofers -0.043 dB); the 0 dB entries were dropped. A
+    key that is not a speaker identity refuses the table, and an `aid`
+    that is missing or not of the form `AID<n>` refuses the voicing, so no
+    Mac loses its bound without a word.
+  - The -0.043 dB value is ours, not Apple's: the bound `bound.py` computes
+    from our full-chain safety scan of v2's voicing against the macOS
+    chain's own render (VirtBass/Tone onset precision puts v2 a few
+    hundredths of a dB over on woofer bursts). It is a voicing trim, not a
+    protection level: each value is checked to lie in [-12, 0] dB and it
     sits before protection, which is unchanged by it.
-  - `voicing_pre_lowpass` (empty).
-  Both are re-keyed by the bundle's speaker identity in a follow-up.
-  Entries that have no effect (0 dB, empty) are dropped, and any new
-  interim entry is keyed the same way.
 - `voicing_pre` overrides equal the runtime default (generated voicing) on
   every board they name; they keep the offline fixtures' recorded mode and
   are re-keyed with the fixtures.

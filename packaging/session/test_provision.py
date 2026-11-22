@@ -46,7 +46,7 @@ with open(log, "a") as f:
 if cmd == "identify":
     if ctl.get("no_bundle"):
         print(json.dumps({"error": "no speaker tuning bundle found"})); sys.exit(1)
-    print(json.dumps({"source": "/lib/firmware/vendor/apple/audio-tuning", "verified": True, "aid": "AID9",
+    print(json.dumps({"source": "/lib/firmware/vendor/apple/audio-tuning", "verified": True, "aid": ctl.get("aid", "AID9"),
                       "macos_build": ctl.get("build", "25G83"), "digest": ctl.get("digest", "d1"), "reader": "1.0.0",
                       "kind": ctl.get("kind", "Installer"), "board": ctl.get("board", "j316s"),
                       "unit_bound": ctl.get("unit_bound", True),
@@ -1374,7 +1374,7 @@ class Gate(Base):
         from unittest import mock
         sc = load("sc", "speakerguardd-selfcheck")
         self.board("j999")
-        self.ctl({"board": "j999", "unit": "lsm2"})
+        self.ctl({"board": "j999", "unit": "lsm2", "aid": "AID44"})
         self.assertEqual(self.run_(), 0)
         fx = gen.fixture("j700")
         hw = fx["hw"]
@@ -1400,6 +1400,41 @@ class Gate(Base):
                 self.assertIn("sgv2#voicing", f.read())
             with open(os.path.join(args.wireplumber_dir, "60-sgv2-j999.conf")) as f:
                 self.assertIn("node.software-dsp.rules = []", f.read())
+            # The speaker tables are read by the speaker identity the record's
+            # wiring carries (the bundle's AID): a 4-lane AID13 bound on this
+            # 2-amp Mac refuses its voicing, and a record without one cannot
+            # generate the voicing at all.
+            record = os.path.join(self.p.state, "selfcheck.json")
+            with open(record) as f:
+                saved = f.read()
+            with open(self.p.report) as f:
+                prov_saved = f.read()
+            for aid in ("AID13", None):
+                report = json.loads(saved)
+                report["wiring"]["aid"] = aid
+                with open(record, "w") as f:
+                    json.dump(report, f)
+                # the provisioned bundle names the same identity, so the
+                # speaker table itself decides
+                with open(self.p.report, "w") as f:
+                    json.dump(dict(json.loads(prov_saved), aid=aid), f)
+                with self.assertRaises(ValueError, msg=aid):
+                    sc.cmd_generate(args)
+            with open(self.p.report, "w") as f:
+                f.write(prov_saved)
+            # The record's identity must be the provisioned bundle's: one
+            # that differs (a record and a bundle that drifted apart) refuses
+            # generation, before any speaker table is read.
+            report = json.loads(saved)
+            report["wiring"]["aid"] = "AID9"
+            with open(record, "w") as f:
+                json.dump(report, f)
+            with self.assertRaises(SystemExit) as e:
+                sc.cmd_generate(args)
+            self.assertIn("provisioned bundle 'AID44'", str(e.exception))
+            with open(record, "w") as f:
+                f.write(saved)
+            self.assertEqual(sc.cmd_generate(args), 0)
             # Kernel and blob changes re-run the silent check. Until it
             # passes again, the stale graph record cannot admit the board.
             self.checked(kernel="old-kernel")
