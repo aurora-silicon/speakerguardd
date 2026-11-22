@@ -21,7 +21,7 @@
 
 use crate::bundle::{Bundle, DSP_DATABASE};
 use crate::error::{Diagnostics, Error, Result};
-use crate::manifest::aid_dsp_database;
+use crate::manifest::{aid_dsp_database, Source};
 use crate::plist::{self, Dict, Value};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -56,6 +56,12 @@ pub struct Selection {
     pub all: Vec<Configuration>,
 }
 
+/// A Mac's own bundle as the installer wrote it (the only kind provisioning
+/// accepts), as opposed to a development collector bundle or a raw tree.
+fn installer(b: &Bundle) -> bool {
+    b.verified && b.manifest.source == Source::Installer
+}
+
 /// The DSP database the manifest names; without one (collector bundles,
 /// folders read in place), the shared one, else the per-AID one.
 fn database(b: &Bundle, diags: &mut Diagnostics) -> Result<Option<Dict>> {
@@ -76,6 +82,13 @@ fn database(b: &Bundle, diags: &mut Diagnostics) -> Result<Option<Dict>> {
     match root.get(&b.manifest.aid) {
         Some(Value::Dict(d)) => Ok(Some(d.clone())),
         Some(_) => Err(Error::format(&path, format!("{} is not a dictionary", b.manifest.aid))),
+        // Without its entry the reader cannot tell whether this AID selects
+        // by speaker vendor, so a Mac's own (installer) bundle refuses; a
+        // development collector bundle keeps the warned convention.
+        None if installer(b) => Err(Error::format(
+            &path,
+            format!("the DSP database has no {} entry: the speaker chain cannot be selected", b.manifest.aid),
+        )),
         None => {
             diags.warn("select-db-no-aid", &path, format!("no {} entry", b.manifest.aid));
             Ok(None)
@@ -147,11 +160,24 @@ fn configuration(name: &str, d: &Dict, aid: &str, ctx: &str) -> Result<Configura
 }
 
 /// Chooses the speaker protection chain.  `speaker_id` is the machine's
-/// `spid`, if the bundle or device tree supplies it.
-pub fn speaker_chain(b: &Bundle, speaker_id: Option<i128>, diags: &mut Diagnostics) -> Result<Selection> {
+/// `spid`, if the bundle or device tree supplies it; `explicit` when it is
+/// an override (tests, rigs) rather than the machine's own value.
+pub fn speaker_chain(
+    b: &Bundle,
+    speaker_id: Option<i128>,
+    explicit: bool,
+    diags: &mut Diagnostics,
+) -> Result<Selection> {
     let aid = b.manifest.aid.clone();
     let ctx = "DSP database";
     let Some(db) = database(b, diags)? else {
+        if installer(b) {
+            return Err(Error::format(
+                ctx,
+                "no DSP database in the bundle: whether this Mac's speaker chain depends on its speaker vendor is \
+                 unknown, so none is selected",
+            ));
+        }
         diags.warn(
             "select-no-database",
             ctx,
@@ -195,7 +221,15 @@ pub fn speaker_chain(b: &Bundle, speaker_id: Option<i128>, diags: &mut Diagnosti
     // M2's, the J700's) has one chain for every vendor: the speaker ID
     // selects nothing there, so it is neither needed nor checked.
     let by_vendor = candidates.iter().any(|c| !neutral(c));
-    let pick: Vec<&Configuration> = match speaker_id {
+    // The loader exports 65535 when the sampled straps are not one of the
+    // model's valid speaker IDs: from the machine, that is no established
+    // speaker assembly, the same as no ID.  An explicit override may still
+    // ask for the vendor-neutral chain.
+    let established = match speaker_id {
+        Some(SPID_GENERIC) if by_vendor && !explicit => None,
+        id => id,
+    };
+    let pick: Vec<&Configuration> = match established {
         _ if !by_vendor => {
             if let Some(id) = speaker_id {
                 diags.info(
@@ -207,13 +241,37 @@ pub fn speaker_chain(b: &Bundle, speaker_id: Option<i128>, diags: &mut Diagnosti
             candidates.iter().copied().filter(neutral).collect()
         }
         Some(id) => candidates.iter().copied().filter(|c| c.speaker_id == Some(id)).collect(),
-        None => {
+        // A raw macOS Tunings tree read offline (attestation, rigs; never a
+        // Mac's own bundle, which is always verified) implies no speaker
+        // assembly: its vendor-neutral chain is listed, with a warning, so
+        // the tools can enumerate every configuration.
+        None if !b.verified => {
             diags.warn(
                 "select-speaker-id-unknown",
                 ctx,
-                format!("speaker ID unknown: using the vendor-neutral (spid {SPID_GENERIC} or none) configuration"),
+                format!("speaker ID unknown: using the vendor-neutral (spid {SPID_GENERIC} or none) configuration of a raw tuning tree"),
             );
             candidates.iter().copied().filter(neutral).collect()
+        }
+        // A Mac's bundle whose database has one chain per speaker vendor,
+        // and this Mac's speaker assembly is not established (no manifest
+        // `speaker_id`, no loader export): the vendor-neutral chain may
+        // carry another vendor's protection, so nothing is selected and the
+        // speakers stay muted until the ID is known.
+        None => {
+            let looked = match speaker_id {
+                Some(id) => {
+                    format!("the machine reports {id}, the loader's value for straps that are not a valid speaker ID")
+                }
+                None => "no speaker_id in the bundle manifest and no /chosen/asahi,speaker-id".to_string(),
+            };
+            return Err(Error::format(
+                ctx,
+                format!(
+                    "speaker ID unknown ({looked}): the database has one configuration per speaker vendor, \
+                     and selecting one needs this Mac's speaker ID"
+                ),
+            ));
         }
     };
     let c = match pick.as_slice() {

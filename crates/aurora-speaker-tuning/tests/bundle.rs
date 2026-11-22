@@ -137,8 +137,10 @@ fn selection_by_speaker_id() {
     assert!(t.selection.strip.ends_with("_7.austrip"));
     assert!(!d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
     assert_eq!(t.selection.all.len(), 3);
-    let (t, _) = load(&b, None);
-    assert!(t.unwrap().selection.strip.ends_with("general.austrip"));
+    // No speaker ID for a database with one chain per vendor: refused,
+    // never the vendor-neutral chain (it may carry another vendor's
+    // protection).
+    assert!(load(&b, None).0.is_err());
     // An ID the database does not know is an error, not a fallback.
     assert!(load(&b, Some(3)).0.is_err());
 }
@@ -170,9 +172,11 @@ fn speaker_id_comes_from_the_manifest_then_the_device_tree() {
     let t = load_with(&b, Options::default()).unwrap();
     assert!(t.selection.strip.ends_with("_7.austrip"));
     assert_eq!((t.speaker_id, t.speaker_id_source), (Some(7), Some("manifest")));
-    // 65535 (invalid strap) takes the general route.
-    let t = load_with(&spid_bundle("e2e-spid-65535", Some(65535)), Options::default()).unwrap();
-    assert!(t.selection.strip.ends_with("general.austrip"));
+    // 65535 from the manifest (the loader's value for straps that are not a
+    // valid speaker ID) is no established assembly: refused like no ID.
+    let e = load_with(&spid_bundle("e2e-spid-65535", Some(65535)), Options::default())
+        .expect_err("65535 from the machine refuses on a by-vendor database");
+    assert!(e.to_string().contains("speaker ID unknown (the machine reports 65535"), "{e}");
     // An ID the database lacks is an error, not another vendor's strip.
     assert!(load_with(&spid_bundle("e2e-spid-3", Some(3)), Options::default()).is_err());
     // Without a manifest value, the device tree's export.
@@ -180,18 +184,57 @@ fn speaker_id_comes_from_the_manifest_then_the_device_tree() {
     let t = load_with(&b, Options { device_tree_speaker_id: Some(7), ..Options::default() }).unwrap();
     assert!(t.selection.strip.ends_with("_7.austrip"));
     assert_eq!(t.speaker_id_source, Some("device-tree"));
-    // Neither: the vendor-neutral fallback, with a warning.
+    // Neither: refused (no vendor-neutral fallback), so the Mac stays muted.
+    let e = load_with(&b, Options::default()).expect_err("an unknown speaker ID refuses");
+    assert!(e.to_string().contains("no speaker_id in the bundle manifest and no /chosen/asahi,speaker-id"), "{e}");
+    // The loader's 65535 in the device tree: refused the same way.
+    let e = load_with(&b, Options { device_tree_speaker_id: Some(65535), ..Options::default() })
+        .expect_err("65535 from the device tree refuses on a by-vendor database");
+    assert!(e.to_string().contains("speaker ID unknown (the machine reports 65535"), "{e}");
+    // An explicit override may still ask for the vendor-neutral chain (rigs).
+    let t = load_with(&b, Options { speaker_id: Some(65535), ..Options::default() }).unwrap();
+    assert!(t.selection.strip.ends_with("general.austrip"));
+    assert_eq!(t.speaker_id_source, Some("override"));
+    // The same database read as a raw macOS Tunings tree (offline tools; no
+    // manifest, never a Mac's bundle) still lists its vendor-neutral chain,
+    // with the warning, so attestation can enumerate every configuration.
+    let raw = Bundle::from_tunings_root(&b.source, ACOUSTIC_ID).unwrap();
+    assert!(!raw.verified);
     let mut d = Diagnostics::default();
-    let t = Tuning::load(&b, &Options::default(), &mut d).unwrap();
+    let t = Tuning::load(&raw, &Options::default(), &mut d).unwrap();
     assert!(t.selection.strip.ends_with("general.austrip"));
     assert!(d.items.iter().any(|x| x.code == "select-speaker-id-unknown"));
-    assert_eq!(t.speaker_id, None);
     // The manifest and the device tree disagree: not this Mac's bundle.
     let b = spid_bundle("e2e-spid-clash", Some(7));
     assert!(load_with(&b, Options { device_tree_speaker_id: Some(3), ..Options::default() }).is_err());
     // An explicit override wins.
     let t = load_with(&b, Options { speaker_id: Some(65535), device_tree_speaker_id: Some(3) }).unwrap();
     assert_eq!(t.speaker_id_source, Some("override"));
+}
+
+#[test]
+fn installer_bundle_without_its_database_entry_refuses() {
+    // Without the AID's entry the reader cannot tell whether the chain
+    // depends on the speaker vendor: a Mac's own bundle selects nothing.
+    let mut files = spp3_files(2);
+    files.insert(
+        "DeviceDSPDatabase.plist".into(),
+        aurora_speaker_tuning::plist::binary::write(&dict(vec![("AID999", dict(vec![]))])),
+    );
+    let dir = scratch("e2e-db-no-aid");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    let (t, _) = load(&Bundle::open(&dir).unwrap(), None);
+    let e = t.expect_err("an installer bundle without its AID entry refuses");
+    assert!(e.to_string().contains(&format!("has no {AID} entry")), "{e}");
+    // The same database in a development collector bundle keeps the
+    // warned file-name convention.
+    let dir = scratch("e2e-db-no-aid-collector");
+    write_dir(&dir, &files, "{}");
+    std::fs::remove_file(dir.join("manifest.json")).unwrap();
+    std::fs::write(dir.join("metadata.json"), collector_json(&files)).unwrap();
+    let (t, d) = load(&Bundle::open(&dir).unwrap(), None);
+    assert!(t.unwrap().selection.configuration.is_none());
+    assert!(d.items.iter().any(|x| x.code == "select-db-no-aid"));
 }
 
 #[test]

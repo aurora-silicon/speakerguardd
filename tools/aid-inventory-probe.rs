@@ -11,7 +11,7 @@ use sgv2_core::voicing::chain::{Chain, GraphParam, Kind};
 
 fn graph_boxes(b: &Bundle) -> aurora_speaker_tuning::error::Result<Vec<Value>> {
     use aurora_speaker_tuning::{dspg, select, strip::AuStrip};
-    let selected = select::speaker_chain(b, b.manifest.speaker_id.map(i128::from), &mut Diagnostics::default())?;
+    let selected = select::speaker_chain(b, b.manifest.speaker_id.map(i128::from), false, &mut Diagnostics::default())?;
     let bytes =
         b.file(&selected.graph).ok_or_else(|| aurora_speaker_tuning::Error::missing("inventory", "selected graph"))?;
     let text =

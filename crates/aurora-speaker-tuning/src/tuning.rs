@@ -282,7 +282,7 @@ impl Tuning {
         }
         versions::check(b.manifest.macos_build.as_deref(), diags);
         let (speaker_id, speaker_id_source) = resolve_speaker_id(b, opts)?;
-        let sel = select::speaker_chain(b, speaker_id, diags)?;
+        let sel = select::speaker_chain(b, speaker_id, speaker_id_source == Some("override"), diags)?;
 
         let gtext = std::str::from_utf8(need(b, &sel.graph, "graph")?)
             .map_err(|_| Error::format(&sel.graph, "graph is not UTF-8 text"))?;
