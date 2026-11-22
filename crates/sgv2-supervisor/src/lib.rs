@@ -14,3 +14,10 @@ pub mod pace;
 pub mod selfcheck;
 pub mod supervise;
 pub mod thermal;
+
+// In the library, not under tests/: an integration test would also build
+// the `speakerguardd` binary, and in release that binary (panic = "abort")
+// and the test harness (unwinding) each need their own build of the
+// sgv2-lv2 cdylib, whose two outputs share one file name.
+#[cfg(test)]
+mod operating_point_tests;
