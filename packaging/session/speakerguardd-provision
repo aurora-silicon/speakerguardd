@@ -889,15 +889,25 @@ def publish_voicing_parameters(p, previous_voicing=False):
     write_atomic(p.published, data)
 
 
-def selfcheck_current(p):
-    """The self-check's record is a pass for this kernel and this blob (the
-    switch test after login has passed; `generate` checks the rest)."""
+def deferral_satisfied(p):
+    """With the switch test pending, whether the self-check's record now
+    binds exactly what the pending file says it must. speakerguardd-selfcheck
+    writes that file from its own currency rule (the record version, every
+    bound field: board, kernel, blob, wiring, audio stack, and the card id
+    the graph opens) when it finds no
+    current pass, and the run after login rewrites it with what that run
+    binds; provisioning compares and never re-derives. A file without a
+    version (an older self-check's) is never satisfied, so the test runs."""
+    want = read_kv(p.deferred)
+    if not want.get("version"):
+        return False
     b = read_kv(os.path.join(p.state, "selfcheck.bind"))
     try:
         digest = sha256_file(p.params)
     except OSError:
         return False
-    return b.get("result") == "pass" and b.get("kernel") == os.uname().release and b.get("params_sha256") == digest
+    return (b.get("result") == "pass" and b.get("kernel") == os.uname().release and b.get("params_sha256") == digest
+            and all(b.get(k) == v for k, v in want.items()))
 
 
 def cmd_activate(args, p):
@@ -909,7 +919,7 @@ def cmd_activate(args, p):
         return 1
     os.makedirs(p.graph, mode=0o755, exist_ok=True)
     os.chmod(p.graph, 0o755)  # the seat user's session reads it, whatever the caller's umask
-    if os.path.exists(p.deferred) and not selfcheck_current(p):
+    if os.path.exists(p.deferred) and not deferral_satisfied(p):
         # Before login, with the switch test still to run: no graph (and
         # none left from earlier in this boot). speakerguardd-switchtest
         # runs the test after login and activates again; until it ends no
