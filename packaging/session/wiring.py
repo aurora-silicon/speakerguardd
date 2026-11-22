@@ -209,14 +209,18 @@ def _read(path):
         return f.read()
 
 
-def read_user_file(path, cap):
+def read_user_file(path, cap, follow=False):
     """A file in a directory a user owns, read as root with the supervisor's
     rules for the helper report (read_report): opened without following a
-    final link and without blocking, a regular file only, at most `cap`
-    bytes. None for anything else (missing, a link, a FIFO, a device, a
-    directory, longer than `cap`): the caller treats it as not readable."""
+    final link (unless `follow`) and without blocking, a regular file only,
+    at most `cap` bytes. None for anything else (missing, a link, a FIFO, a
+    device, a directory, longer than `cap`): the caller treats it as not
+    readable. `follow` still takes only a regular file the link names."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+    if not follow:
+        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        fd = os.open(path, flags)
     except OSError:
         return None
     try:
