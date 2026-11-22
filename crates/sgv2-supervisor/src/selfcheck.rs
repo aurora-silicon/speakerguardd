@@ -101,10 +101,13 @@ pub fn covers(bind: &Bind, board: &str, kernel: &str, params_sha256: &str) -> Re
         return Err(format!("the self-check ran on kernel {}, this is {kernel}: run it again", bind.kernel));
     }
     if bind.params_sha256 != params_sha256 {
+        // the first 12 characters: the record is text from a file, not
+        // necessarily the hex it should be
+        let short = |s: &str| s.chars().take(12).collect::<String>();
         return Err(format!(
             "the self-check ran with parameters {}, these are {}: run it again",
-            &bind.params_sha256[..bind.params_sha256.len().min(12)],
-            &params_sha256[..params_sha256.len().min(12)]
+            short(&bind.params_sha256),
+            short(params_sha256)
         ));
     }
     Ok(())
@@ -168,6 +171,17 @@ mod tests {
         assert!(covers(&b, "j316c", "7.3.0-aurora-sgv2k5", "aa11").unwrap_err().contains("this Mac is j316c"));
         assert!(covers(&b, "j316s", "7.3.0-aurora-sgv2k6", "aa11").unwrap_err().contains("run it again"));
         assert!(covers(&b, "j316s", "7.3.0-aurora-sgv2k5", "bb22").unwrap_err().contains("parameters"));
+    }
+
+    #[test]
+    fn a_parameter_hash_that_is_not_hex_is_refused_without_a_panic() {
+        // a multi-byte character across the 12 bytes the message quotes
+        let t = GOOD.replace("params_sha256=aa11", "params_sha256=0123456789a\u{e9}f");
+        let b = parse(&t).unwrap();
+        let e = covers(&b, "j316s", "7.3.0-aurora-sgv2k5", "aa11").unwrap_err();
+        assert!(e.contains("0123456789a\u{e9}") && e.contains("aa11"), "{e}");
+        let e = covers(&parse(GOOD).unwrap(), "j316s", "7.3.0-aurora-sgv2k5", "0123456789a\u{e9}f").unwrap_err();
+        assert!(e.contains("parameters aa11"), "{e}");
     }
 
     #[test]
