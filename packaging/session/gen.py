@@ -91,10 +91,12 @@ def playback_rows(aid, gate=None):
     gate = load_gate() if gate is None else gate
     covers = gate.get("playback_covers")
     record = gate.get("playback_rows")
-    if not isinstance(covers, list) or not covers or not isinstance(record, dict):
+    if not isinstance(covers, list) or not covers or not all(isinstance(c, str) for c in covers) \
+            or not isinstance(record, dict):
         return []
     rows = record.get(aid) if isinstance(aid, str) else None
-    rows = [r for r in rows if isinstance(r, dict) and r.get("evidence") and isinstance(r.get("covers"), list)] \
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("evidence"), str) and r["evidence"].strip()
+            and isinstance(r.get("covers"), list) and all(isinstance(c, str) for c in r["covers"])] \
         if isinstance(rows, list) else []
     return rows if {c for r in rows for c in r["covers"]} >= set(covers) else []
 

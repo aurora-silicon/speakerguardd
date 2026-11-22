@@ -793,6 +793,9 @@ class BootMigrationNeedsPlaybackRows(unittest.TestCase):
             ({"AID7": [self.row(["loud-step"])]}, []),
             ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence="")]}, []),
             ({"AID8": [both]}, []),
+            ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence=" ")]}, []),
+            ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence={"x": 1})]}, []),
+            ({"AID7": [self.row([{"a": 1}, "loud-step", "thermal-ramp"])]}, []),
             ({"AID7": "yes"}, []),
             (["AID7"], []),
             ("{not json", []),
@@ -804,14 +807,16 @@ class BootMigrationNeedsPlaybackRows(unittest.TestCase):
             else:
                 self.assertEqual(got, want, record)
         self.assertEqual(up.playback_proof(7, paths=(self.gate_file({"AID7": [both]}, covers=()),)), [])
+        self.assertEqual(up.playback_proof(7, paths=(self.gate_file({"AID7": [both]}, covers=(["x"],)),)), [])
         self.assertEqual(up.playback_proof(7, paths=(os.path.join(self.dir, "missing.json"),)), [])
 
-    def run_with(self, at_boot, proven, switched=False):
+    def run_with(self, at_boot, proven, switched=False, bundle_unit=None):
         import contextlib, io
         from unittest import mock
         up, types = self.up, self.types
+        bundle = {up.audio_tuning.MANIFEST: json.dumps({"unit_id": bundle_unit, "aid": "AID37"})} if bundle_unit else None
         store = types.SimpleNamespace(state=lambda: {"switched": switched}, interface="/x/interface",
-                                      read_bundle=lambda: None)
+                                      read_bundle=lambda: bundle)
         acquired = []
         ident = types.SimpleNamespace(unit="U1", acoustic=37, matches_dt=lambda: True)
         with mock.patch.object(up, "Store", return_value=store), \
@@ -832,6 +837,12 @@ class BootMigrationNeedsPlaybackRows(unittest.TestCase):
         rc, acquired, err = self.run_with(True, False)
         self.assertEqual((rc, acquired), (self.up.EXIT_OK, []))
         self.assertIn("AID37: no protected playback row", err)
+
+    def test_a_switched_record_of_another_unit_does_not_skip_the_rule(self):
+        # A root file system moved from a switched Mac onto another one.
+        rc, acquired, err = self.run_with(True, False, switched=True, bundle_unit="OTHER")
+        self.assertEqual((rc, acquired), (self.up.EXIT_OK, []))
+        self.assertIn("no protected playback row", err)
 
     def test_boot_moves_a_proven_speaker(self):
         self.assertEqual(self.run_with(True, True)[:2], ("switching", [1]))
