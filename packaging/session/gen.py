@@ -84,6 +84,42 @@ def qualification_policy(board, units, gate=None):
         raise wiring.Refused(f"protection types not at parity: {', '.join(u for u in units if u not in parity)}")
 
 
+def playback_rows(aid, gate=None):
+    """The recorded protected playback rows for speaker `aid` ("AID<n>"),
+    or [] unless those with evidence together cover gate.json's
+    playback_covers. A malformed record proves nothing."""
+    gate = load_gate() if gate is None else gate
+    covers = gate.get("playback_covers")
+    record = gate.get("playback_rows")
+    if not isinstance(covers, list) or not covers or not isinstance(record, dict):
+        return []
+    rows = record.get(aid) if isinstance(aid, str) else None
+    rows = [r for r in rows if isinstance(r, dict) and r.get("evidence") and isinstance(r.get("covers"), list)] \
+        if isinstance(rows, list) else []
+    return rows if {c for r in rows for c in r["covers"]} >= set(covers) else []
+
+
+def held_for_playback_rows(units, gate=None):
+    """The graph's protection types the build releases only on a speaker
+    with protected playback rows on record (units_need_playback_rows)."""
+    gate = load_gate() if gate is None else gate
+    need = gate.get("units_need_playback_rows", [])
+    if not isinstance(need, list) or any(u not in wiring.PROTECTION_UNITS for u in need):
+        raise wiring.Refused("malformed playback row policy")
+    return [u for u in units if u in need]
+
+
+def playback_policy(aid, units, gate=None):
+    """A protection type the build releases without playback evidence yet
+    (units_need_playback_rows, e.g. LSID's static release) runs only on a
+    speaker whose protected playback rows are on record."""
+    gate = load_gate() if gate is None else gate
+    held = held_for_playback_rows(units, gate)
+    if held and not playback_rows(aid, gate):
+        raise wiring.Refused(f"{', '.join(held)} on {aid}: no protected playback row (loud step, thermal ramp) "
+                             "is on record for this speaker yet, so it stays muted")
+
+
 def voicing_enabled(board, gate=None):
     """Per-board deployment gate. Missing keys/boards keep the interim graph.
     Values must be literal JSON booleans; strings never enable a board.

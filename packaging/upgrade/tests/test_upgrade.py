@@ -758,6 +758,108 @@ class RunRechecksTheLiveState(unittest.TestCase):
         self.assertEqual(self.run_with(True, False), (self.up.EXIT_OK, []))
 
 
+
+class BootMigrationNeedsPlaybackRows(unittest.TestCase):
+    """The boot unit moves a speaker to v2 only when protected playback rows
+    (loud step and thermal ramp) are on record for its AID; a silent
+    self-check pass alone does not move it. By hand, `run` still switches."""
+
+    def setUp(self):
+        import tempfile, types
+        from aurora_speaker_upgrade import upgrade as up
+        self.up, self.types = up, types
+        self.dir = tempfile.mkdtemp(prefix="sgup-rows-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def gate_file(self, record, covers=("loud-step", "thermal-ramp")):
+        p = os.path.join(self.dir, "gate.json")
+        with open(p, "w") as f:
+            f.write(record if isinstance(record, str) else
+                    json.dumps({"playback_covers": list(covers), "playback_rows": record}))
+        return p
+
+    def row(self, covers, evidence="lab row"):
+        return {"date": "2026-11-23", "board": "j000", "what": "w", "covers": covers, "evidence": evidence}
+
+    def test_proof_needs_every_cover_and_evidence(self):
+        up = self.up
+        both = self.row(["loud-step", "thermal-ramp"])
+        cases = [
+            ({"AID7": [both]}, [both]),
+            ({"AID7": [self.row(["loud-step"]), self.row(["thermal-ramp"])]}, 2),
+            ({"AID7": [self.row(["loud-step"])]}, []),
+            ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence="")]}, []),
+            ({"AID8": [both]}, []),
+            ({"AID7": "yes"}, []),
+            (["AID7"], []),
+            ("{not json", []),
+        ]
+        for record, want in cases:
+            got = up.playback_proof(7, paths=(self.gate_file(record),))
+            if isinstance(want, int):
+                self.assertEqual(len(got), want, record)
+            else:
+                self.assertEqual(got, want, record)
+        self.assertEqual(up.playback_proof(7, paths=(self.gate_file({"AID7": [both]}, covers=()),)), [])
+        self.assertEqual(up.playback_proof(7, paths=(os.path.join(self.dir, "missing.json"),)), [])
+
+    def run_with(self, at_boot, proven, switched=False):
+        import contextlib, io
+        from unittest import mock
+        up, types = self.up, self.types
+        store = types.SimpleNamespace(state=lambda: {"switched": switched}, interface="/x/interface",
+                                      read_bundle=lambda: None)
+        acquired = []
+        ident = types.SimpleNamespace(unit="U1", acoustic=37, matches_dt=lambda: True)
+        with mock.patch.object(up, "Store", return_value=store), \
+                mock.patch.object(up.collect, "Identity", return_value=ident), \
+                mock.patch.object(up, "interface_mode", return_value=("v2-only", "AppleJ713")), \
+                mock.patch.object(up, "playback_proof", return_value=[{"evidence": "x"}] if proven else []), \
+                mock.patch.object(up, "acquire", side_effect=lambda *x: acquired.append(1) or (_ for _ in ()).throw(up.Retry("stop here"))):
+            a = types.SimpleNamespace(store="/x", adt=None, at_boot=at_boot)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                try:
+                    rc = up._cmd_run(a)
+                except up.Retry:
+                    rc = "switching"
+        return rc, acquired, err.getvalue()
+
+    def test_boot_leaves_an_unproven_speaker_alone(self):
+        rc, acquired, err = self.run_with(True, False)
+        self.assertEqual((rc, acquired), (self.up.EXIT_OK, []))
+        self.assertIn("AID37: no protected playback row", err)
+
+    def test_boot_moves_a_proven_speaker(self):
+        self.assertEqual(self.run_with(True, True)[:2], ("switching", [1]))
+
+    def test_by_hand_is_not_limited(self):
+        self.assertEqual(self.run_with(False, False)[:2], ("switching", [1]))
+
+    def test_a_new_playback_row_retries_a_refusal(self):
+        import types
+        from unittest import mock
+        up, g = self.up, os.path.join(self.dir, "gate.json")
+        ident = types.SimpleNamespace(unit="u1")
+        with mock.patch.object(up, "GATE", g):
+            self.gate_file({})
+            k1 = up.refusal_key(ident)
+            self.gate_file({"AID37": [self.row(["loud-step", "thermal-ramp"])]})
+            self.assertNotEqual(k1, up.refusal_key(ident))
+
+    def test_reads_the_shipped_gate_data(self):
+        # The source tree's gate.json (installed by speakerguardd-v2 as
+        # /usr/share/speakerguardd/gate.json): AID44 is proven, AID37 not.
+        up = self.up
+        paths = up.gate_paths()[1:]
+        self.assertTrue(os.path.isfile(paths[0]), paths)
+        self.assertTrue(up.playback_proof(44, paths=paths))
+        self.assertEqual(up.playback_proof(37, paths=paths), [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

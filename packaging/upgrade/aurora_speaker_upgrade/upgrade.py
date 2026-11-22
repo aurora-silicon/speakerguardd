@@ -79,6 +79,13 @@ SESSION_STOP_LIMIT_S = 15 + 10 + 15 + 30
 # the graph unit (TimeoutStartSec=180) and the units' start wait (30 s)
 SESSION_START_LIMIT_S = 180 + 30 + 30
 PARITY = ("/usr/share/speakerguardd/parity.json",)
+# speakerguardd v2's gate data: its playback_rows record the protected
+# playback rows, by speaker (the tuning's AID): sound played through v2's
+# protection on that speaker, measured with V/I sense and the Mac's own
+# microphone. The boot unit moves a speaker to v2 only when its rows cover
+# every item of the record's playback_covers; a silent self-check alone is not
+# playback evidence. `run` by hand is not limited by it.
+GATE = "/usr/share/speakerguardd/gate.json"
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
 EXIT_OK, EXIT_REFUSED, EXIT_RETRY, EXIT_ERROR = 0, 1, 2, 3
@@ -371,6 +378,37 @@ def read_text(path):
             return f.read()
     except FileNotFoundError:
         return None
+
+
+def gate_paths():
+    """The installed gate data, then the source tree's (tests, a checkout)."""
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return (GATE, os.path.join(here, "session", "gate.json"))
+
+
+def playback_proof(acoustic, paths=None):
+    """The recorded protected playback rows for speaker AID<acoustic>, or []
+    unless those with evidence together cover the record's playback_covers
+    (speakerguardd's gen.playback_rows). A record that cannot be read
+    proves nothing."""
+    for p in paths or gate_paths():
+        try:
+            with open(p) as f:
+                gate = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return []
+        if not isinstance(gate, dict):
+            return []
+        covers, record = gate.get("playback_covers"), gate.get("playback_rows")
+        if not isinstance(covers, list) or not covers or not isinstance(record, dict):
+            return []
+        rows = record.get(f"AID{acoustic}")
+        rows = [r for r in rows if isinstance(r, dict) and r.get("evidence") and isinstance(r.get("covers"), list)] \
+            if isinstance(rows, list) else []
+        return rows if {c for r in rows for c in r["covers"]} >= set(covers) else []
+    return []
 
 
 def provision(store, a):
@@ -837,6 +875,14 @@ def _cmd_run(a):
             # since the boot, so its provisioning is gone until it runs
             # again): switch again instead of leaving them at the floor.
             say("switched on record, but speakerguardd v2 does not hold the speakers in this boot: switching again")
+    if getattr(a, "at_boot", False) and not state.get("switched") and not playback_proof(identity.acoustic):
+        # The boot unit moves a speaker only once protected playback on it
+        # is on record; until then the speakers stay as they are (the legacy
+        # protection, or what the installer set up) and nothing is collected.
+        say(f"AID{identity.acoustic}: no protected playback row (loud step, thermal ramp) is on record "
+            "for this speaker yet, so the boot unit leaves the speakers as they are "
+            "('aurora-speaker-upgrade run' switches by hand)")
+        return EXIT_OK
     b, prov = acquire(identity, a)
     store.ensure()
     if not have or digest(have) != digest(b):
@@ -891,11 +937,12 @@ def _cmd_run(a):
 def refusal_key(identity):
     """What a refusal depends on: this unit, the running kernel, and the code
     and data that judged it (this tool, v2's provisioning and self-check, the
-    parity attestation). A new kernel, a v2 update or a new attestation makes
-    the boot unit try again; nothing else does."""
+    parity attestation, the gate data with its playback rows). A new kernel,
+    a v2 update, a new attestation or a new playback row makes the boot unit
+    try again; nothing else does."""
     h = hashlib.sha256()
     h.update(f"{identity.unit}\0{os.uname().release}\0".encode())
-    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY]:
+    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY, GATE]:
         try:
             with open(p or "", "rb") as f:
                 h.update(hashlib.sha256(f.read()).digest())
@@ -1022,8 +1069,19 @@ def cmd_status(a):
                       "kernel_interface": mode, "switched": bool(st.get("switched")),
                       "setting": (read_text(store.interface) or "").strip() or None,
                       "route": st.get("route"), "aid": m.get("aid"), "macos_build": m.get("macos_build"),
-                      "speaker_id": m.get("speaker_id"), "bundle_digest": st.get("digest")}, indent=2))
+                      "speaker_id": m.get("speaker_id"), "bundle_digest": st.get("digest"),
+                      "boot_migration": boot_migration(a)}, indent=2))
     return EXIT_OK
+
+
+def boot_migration(a):
+    """status: whether the boot unit would move this speaker (its playback
+    rows are on record) or leaves it to a run by hand."""
+    try:
+        acoustic = collect.Identity(getattr(a, "adt", None)).acoustic
+    except collect.CollectError:
+        return None
+    return "playback rows on record" if playback_proof(acoustic) else "by hand only (no playback rows on record)"
 
 
 def cmd_interface_apply(a):

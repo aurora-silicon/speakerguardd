@@ -542,6 +542,7 @@ def cmd_run(args, p):
             raise Failed("tuning provenance must name this board and this Mac's unit, extracted from its own macOS")
         units = wiring.protection_units(wiring.tuning_dump(sargs, cli, strict=True))
         gen.qualification_policy(rec["board"], units)
+        gen.playback_policy(ident.get("aid"), units)
         rec.update(protection_units=",".join(units), compile_refusals=0, provenance="own-macos")
         rec.update(bundle_digest=ident["digest"], macos_build=ident.get("macos_build") or "-", aid=ident.get("aid", "-"),
                    source=ident.get("source", src), compiler=f"{ident.get('reader')}:{sha256_file(cli)[:16]}")
