@@ -81,8 +81,12 @@ fn run(u: &mut Unstructured) -> Result<()> {
     }
     if let Ok(p) = lsm2::Params::from_blob(&bytes) {
         let mut un = lsm2::Unit::new(p);
-        let (g, l) = if un.is_failsafe() { (FAILSAFE_GAIN, 0) } else { (1.0, un.latency_frames() as usize) };
-        probe(&mut un, p.channels as usize, l, g, &x, "lsm2 from_blob");
+        let (g, l, boost) = if un.is_failsafe() {
+            (FAILSAFE_GAIN, 0, 0.0)
+        } else {
+            (1.0, un.latency_frames() as usize, LSM2_ALLOWANCE)
+        };
+        probe_p(&mut un, p.channels as usize, l, g, boost, &x, "lsm2 from_blob");
     }
     if let Ok(p) = atsp::Params::from_blob(&bytes) {
         let mut un = atsp::Unit::new(p);
@@ -106,6 +110,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
     };
     let pilot = match &unit {
         AnyUnit::Spp3(u) => spp3_pilot(u.params()),
+        AnyUnit::Lsm2(_) => LSM2_ALLOWANCE,
         _ => 0.0,
     };
     if err.is_some() {

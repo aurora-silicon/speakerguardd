@@ -39,11 +39,12 @@ fn run(u: &mut Unstructured) -> Result<()> {
     let gain = if real { 1.0 } else { FAILSAFE_GAIN };
     let mut ua = Unit::new(p);
     let lat = if real { ua.latency_frames() as usize } else { 0 };
+    let boost = if real { LSM2_ALLOWANCE } else { 0.0 };
 
     let a = render(&mut ua, &x, &[], &[256], &[], &mut nothing);
-    check_bound(&x, &a.out, lat, gain, "lsm2 A");
+    check_bound_pilot(&x, &a.out, lat, gain, boost, "lsm2 A");
     let b = render(&mut Unit::new(p), &x, &[], &cuts, &[], &mut nothing);
-    check_bound(&x, &b.out, lat, gain, "lsm2 B");
+    check_bound_pilot(&x, &b.out, lat, gain, boost, "lsm2 B");
     // lsm2 sanitizes per sample, so invariance holds on any input
     if real {
         assert!(bits(&a.out) == bits(&b.out), "lsm2: audio depends on host slicing");

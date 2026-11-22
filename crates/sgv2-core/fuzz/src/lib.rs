@@ -5,7 +5,10 @@
 //!
 //! Targets: `blob` (property 5, through every `from_blob` and
 //! `sgv2_lv2::load_unit`), `spp3`, `atsp` and `lsm2` (properties 1-4, 6, 7
-//! under fuzzed parameter words, audio, host slicing and sense). Run from
+//! under fuzzed parameter words, audio, host slicing and sense), `handoff`
+//! (a thermal hand-off record from outside the process into
+//! `sgv2_lv2::start_stream`) and `voicing` (the blob's pre-stage and voicing
+//! artifact, through both plugins' loaders and their processing). Run from
 //! `crates/sgv2-core` with cargo-fuzz; a stable toolchain works with
 //! `RUSTC_BOOTSTRAP=1` (cargo-fuzz passes `-Zsanitizer`):
 //!
@@ -317,6 +320,14 @@ pub fn spp3_pilot(p: &sgv2_core::spp3::Params) -> f32 {
     }
 }
 
+/// The allowance over property 1 an lsm2 unit takes: it is a five-band
+/// limiter (an output sample mixes hundreds of input samples with per-band
+/// gains, and its resonator compensation runs ahead of the limiter), so it
+/// is bounded by digital full scale, not by the one input sample at its
+/// delay, as in `tests/adversarial.rs`. Passed as a pilot allowance of full
+/// scale to [`check_bound_pilot`].
+pub const LSM2_ALLOWANCE: f32 = 1.0;
+
 /// Property 6: `y` is nowhere louder than `reference`.
 pub fn check_not_louder(y: &[Vec<f32>], reference: &[Vec<f32>], what: &str) {
     for (c, (a, b)) in y.iter().zip(reference).enumerate() {
@@ -543,6 +554,7 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
         attack_time_ms: 2.0,
         fast_release_time_ms: 150.0,
         slow_release_time_ms: 10_000.0,
+        low_band_release_time_ms: 150.0,
         filterbank_latency_ms: 2.0,
         speaker_response_lookahead_ms: 4.0 / 3.0,
         power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
@@ -563,10 +575,16 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
             mms_kg: 0.0002,
             rms: 0.2,
             kms: 1500.0,
+            disp_rdc: 4.0,
             disp_bl: 0.8,
             disp_mms_kg: 0.00022,
             disp_rms: 0.25,
             disp_kms: 1600.0,
+            vel_rdc: 4.0,
+            vel_bl: 0.8,
+            vel_mms_kg: 0.0002,
+            vel_rms: 0.2,
+            vel_kms: 1500.0,
             rth_vc: 30.0,
             tau_vc: 2.0,
             rth_mag: 20.0,
@@ -574,12 +592,22 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
             ambient: 40.0,
             amplitude_limit: 1.0,
             displacement_limit: 0.0005,
-            velocity_limit0: 0.5,
+            velocity_limit: [0.5, 0.6, 0.9],
+            mask_energy_db: [0.0, 10.0, 20.0, 30.0],
+            mask_band_hz: [8000.0, 12000.0],
+            mask_attack_s: 0.01,
+            mask_release_s: 0.1,
+            mask_attack_fast_s: 0.005,
+            mask_attack_range_db: 70.0,
             max_velocity_attenuation_db: 18.0,
+            velocity_ignore_low_band: 1,
+            velocity_ignore_high_band: 1,
             temperature_soft_limit: 110.0,
             temperature_hard_limit: 125.0,
             temperature_headroom: 4.0,
             max_temperature_attenuation_db: 10.0,
+            band_center_hz: [60.0, 300.0, 650.0, 1600.0, 5000.0],
+            ..ChannelParams::default()
         };
     }
     p
@@ -1052,6 +1080,48 @@ impl Spp3HardOracle {
         }
         for (ci, c) in self.ch.iter().enumerate() {
             self.unit_sel_prev[c.group] = unit_cs[ci][1];
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/voicing_fixture/mod.rs"]
+mod voicing_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `voicing` target's bases load: every variant's artifact on the
+    /// voicing plugin, and an identity pre-stage on the protect plugin.
+    #[test]
+    fn every_voicing_base_loads() {
+        for lanes in [1usize, 2, 4, 6] {
+            let base = voicing_fixture::unit("j413", lanes);
+            let spec = voicing_fixture::spec(lanes);
+            let joined = sgv2_core::blob::with_voicing(&base, &spec).unwrap_or_else(|e| panic!("{lanes}: {e:?}"));
+            assert!(sgv2_lv2::voicing::Voicing::load(Some(&joined), "j413", 48_000.0, lanes).ready(), "{lanes}");
+        }
+    }
+
+    /// The mutation bases must start valid, or every mutation explores only
+    /// the refusal path (the lsm2 base drifted out of step with the unit's
+    /// parameters once already).
+    #[test]
+    fn every_base_is_a_valid_unit() {
+        for n in 1..=8 {
+            for rate in [44_100, 48_000, 96_000] {
+                if rate == 48_000 {
+                    // lsm2's controller cadence fixes its latency per rate:
+                    // the base is made for 48 kHz, as the unit's own tests
+                    assert_eq!(sgv2_core::lsm2::Unit::init_error(&lsm2_base(n, rate)), None, "lsm2 {n} ch");
+                }
+                assert_eq!(sgv2_core::atsp::Unit::init_error(&atsp_base(n, 512, rate)), None, "atsp {n} ch {rate} Hz");
+                for cl in [false, true] {
+                    let p = spp3_base(n, 512, rate, cl);
+                    assert_eq!(sgv2_core::spp3::Unit::init_error(&p), None, "spp3 {n} ch {rate} Hz cl {cl}");
+                }
+            }
         }
     }
 }
