@@ -198,6 +198,7 @@ class Provision(Base):
             os.makedirs(of, exist_ok=True)
             os.makedirs(os.path.join(sysfs, f"card{n}", "device"))
             os.symlink(of, os.path.join(sysfs, f"card{n}", "device", "of_node"))
+            open(os.path.join(sysfs, f"card{n}", f"controlC{n}"), "w").close()
             os.makedirs(os.path.join(proc, f"card{n}"))
             with open(os.path.join(proc, f"card{n}", "id"), "w") as f:
                 f.write(ident + "\n")
@@ -1195,11 +1196,11 @@ class Deactivate(Base):
 
 
 class Gate(Base):
-    def decide(self, iface="v2", gate_data=None, cmd="v2"):
+    def decide(self, iface="v2", gate_data=None, cmd="v2", card=None):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
             json.dump(GATE if gate_data is None else gate_data, f)
-        self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, None))
+        self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, card))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
         # the gate runs as root on a Mac (ExecCondition=+...); no waits here
         self.patch(gate, "privileged", lambda: True)
@@ -1243,6 +1244,45 @@ class Gate(Base):
         with open(self.p.params, "ab") as f:
             f.write(b"new-blob")
         self.assertEqual(self.decide(), (False, False))
+
+    def test_unreadable_controls_on_a_registered_card_start_neither(self):
+        # the speaker card is there but its controls could not be read in
+        # the wait: no answer, so neither stack starts (never the older
+        # daemons beside v2); no speaker card at all keeps today's answer
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        for cmd in ("v2", "legacy", "prepare"):
+            self.assertEqual(self.decide(None, cmd=cmd, card="AppleX"), (False, False), cmd)
+            self.assertIn("could not be read", self.why)
+        self.assertEqual(self.decide(None), (False, True))
+
+    def test_has_control_tells_a_missing_control_from_a_failed_open(self):
+        # only "the card opened and has no such control" is a "no": amixer
+        # failing to find or open the card (still registering, gone, no
+        # access) says nothing about the kernel's controls
+        out = {}
+        self.patch(gate.subprocess, "run", lambda cmd, **kw: types.SimpleNamespace(**out))
+        self.patch(gate, "log", lambda *a: None)
+        for rc, err, want in (
+                (0, "", True),
+                (1, "amixer: Cannot find the given element from control sysdefault:1\n\n", False),
+                (1, "Invalid card number 'AppleJ700'.\n", None),
+                (1, "amixer: Control sysdefault:1 open error: No such device\n\n", None),
+                (1, "amixer: Control sysdefault:1 open error: Permission denied\n\n", None)):
+            out.update(returncode=rc, stdout="", stderr=err)
+            self.assertIs(gate.has_control("AppleJ700", "Speaker Protection"), want, err)
+
+    def test_kernel_interface_asks_again_within_the_wait(self):
+        # the card was found but amixer could not read it yet: asked again
+        # until the wait ends, then the real answer counts
+        self.patch(gate, "speaker_card", lambda sysfs=None: "AppleX")
+        answers = [None, None, True]
+        self.patch(gate, "has_control", lambda card, name: answers.pop(0) if answers else True)
+        self.patch(gate.time, "sleep", lambda s: None)
+        self.assertEqual(gate.kernel_interface(10), ("dual", "AppleX"))
+        self.assertEqual(answers, [])
+        answers[:] = [False, None, False, False]
+        self.assertEqual(gate.kernel_interface(10), ("legacy", "AppleX"))
 
     def test_kernel_interface_reads_the_selector(self):
         self.patch(gate, "speaker_card", lambda sysfs=None: "AppleX")
@@ -1635,19 +1675,50 @@ class SpeakerRouting(Base):
         self.assertEqual((self.reads, self.writes), (0, []))
 
 
+def gate_proc(case):
+    """A private /proc/asound for the gate's card lookup in `case`."""
+    proc = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, proc, True)
+    orig = gate.PROC
+    gate.PROC = proc
+    case.addCleanup(setattr, gate, "PROC", orig)
+    return proc
+
+
+def alsa_card(sysfs, n, ident, compat, link, registered=True):
+    """Card n in a test /sys/class/sound (its device tree node behind
+    device/of_node), registered in full by ALSA (controlCN, the proc id in
+    gate.PROC) unless `registered` is False: then it is mid-registration,
+    with only its device, id and of_node link."""
+    node = os.path.join(sysfs, f"card{n}", "device", "of_node")
+    os.makedirs(os.path.join(node, "dai-link@0"))
+    with open(os.path.join(sysfs, f"card{n}", "id"), "w") as f:
+        f.write(ident + "\n")
+    with open(os.path.join(node, "compatible"), "wb") as f:
+        f.write(compat)
+    with open(os.path.join(node, "dai-link@0", "link-name"), "wb") as f:
+        f.write(link + b"\0")
+    if registered:
+        register(sysfs, n, ident)
+
+
+def register(sysfs, n, ident):
+    """ALSA finishes registering card n: controlCN, then its proc entries."""
+    open(os.path.join(sysfs, f"card{n}", f"controlC{n}"), "w").close()
+    os.makedirs(os.path.join(gate.PROC, f"card{n}"), exist_ok=True)
+    with open(os.path.join(gate.PROC, f"card{n}", "id"), "w") as f:
+        f.write(ident + "\n")
+
+
 class SpeakerCard(unittest.TestCase):
     """The gate's speaker card is the macaudio card with the speaker link,
     whichever card number the jack-only card took."""
 
-    def card(self, sysfs, n, ident, compat, link):
-        node = os.path.join(sysfs, f"card{n}", "device", "of_node")
-        os.makedirs(os.path.join(node, "dai-link@0"))
-        with open(os.path.join(sysfs, f"card{n}", "id"), "w") as f:
-            f.write(ident + "\n")
-        with open(os.path.join(node, "compatible"), "wb") as f:
-            f.write(compat)
-        with open(os.path.join(node, "dai-link@0", "link-name"), "wb") as f:
-            f.write(link + b"\0")
+    def setUp(self):
+        gate_proc(self)
+
+    def card(self, sysfs, n, ident, compat, link, registered=True):
+        alsa_card(sysfs, n, ident, compat, link, registered)
 
     def test_the_jack_card_first_is_skipped(self):
         with tempfile.TemporaryDirectory() as sysfs:
@@ -1663,6 +1734,7 @@ class SpeakerCard(unittest.TestCase):
                 os.makedirs(os.path.join(dt, node))
                 os.makedirs(os.path.join(sysfs, f"card{n}", "device"))
                 os.symlink(os.path.join(dt, node), os.path.join(sysfs, f"card{n}", "device", "of_node"))
+                open(os.path.join(sysfs, f"card{n}", f"controlC{n}"), "w").close()
                 os.makedirs(os.path.join(proc, f"card{n}"))
                 with open(os.path.join(proc, f"card{n}", "id"), "w") as f:
                     f.write(ident + "\n")
@@ -1678,6 +1750,18 @@ class SpeakerCard(unittest.TestCase):
             with self.assertRaises(prov.Failed) as e:
                 prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc)
             self.assertIn("no ALSA card bound", str(e.exception))
+            # the same before its control device: the bounded wait covers it
+            with open(os.path.join(proc, "card2", "id"), "w") as f:
+                f.write("AppleJ616\n")
+            os.unlink(os.path.join(sysfs, "card2", "controlC2"))
+            with self.assertRaises(prov.Failed) as e:
+                prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc)
+            self.assertIn("no ALSA card bound", str(e.exception))
+            import threading
+            t = threading.Timer(0.6, lambda: open(os.path.join(sysfs, "card2", "controlC2"), "w").close())
+            t.start()
+            self.addCleanup(t.cancel)
+            self.assertEqual(prov.find_card(hw, "AppleJ616", 10, dt, sysfs, proc), (2, "AppleJ616"))
 
     def test_no_speaker_link_is_no_speaker_card(self):
         with tempfile.TemporaryDirectory() as sysfs:
@@ -1696,6 +1780,7 @@ class CardOrder(unittest.TestCase):
     def setUp(self):
         self.sysfs = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.sysfs, True)
+        gate_proc(self)
         self.asked = []
         # the jack card has no speaker controls; the speaker card has both
         controls = {"AppleJ616": {"Speaker Protection Interface", "Speaker Protection"}}
@@ -1706,14 +1791,14 @@ class CardOrder(unittest.TestCase):
         gate.log = lambda *a: None
         self.addCleanup(setattr, gate, "log", orig_log)
 
-    def card(self, n, ident, compat, link):
-        SpeakerCard.card(None, self.sysfs, n, ident, compat, link)
+    def card(self, n, ident, compat, link, registered=True):
+        alsa_card(self.sysfs, n, ident, compat, link, registered)
 
     def jack(self, n):
         self.card(n, "AppleJack", JACK, b"Headphone Jack")
 
-    def speaker(self, n):
-        self.card(n, "AppleJ616", self.SPEAKER, b"Speakers")
+    def speaker(self, n, registered=True):
+        self.card(n, "AppleJ616", self.SPEAKER, b"Speakers", registered)
 
     def test_jack_first(self):
         self.card(0, "AppleJ616HPAI", b"apple,aop-audio\0", b"Speakers")
@@ -1738,6 +1823,42 @@ class CardOrder(unittest.TestCase):
         self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
         self.assertGreaterEqual(time.monotonic() - t0, 0.5)
         self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_a_card_still_registering_is_waited_for(self):
+        # the Neo race (speakerguardd#235): the card's directory, id and
+        # of_node link exist before ALSA registered its control device and
+        # proc entries. amixer cannot open it then; the gate used to take
+        # that for "no Speaker Protection control" = a definite legacy
+        # answer. A card counts only once it is registered in full.
+        def amixer(card, name):
+            self.asked.append(card)
+            if not os.path.exists(os.path.join(self.sysfs, "card1", "controlC1")):
+                return False  # the old reading of a failed open
+            return name in {"Speaker Protection Interface", "Speaker Protection"}
+        gate.has_control = amixer
+        self.speaker(1, registered=False)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), (None, None))
+        self.assertEqual(self.asked, [])
+        # controlC1 is there, the proc entries are not yet: still registering
+        open(os.path.join(self.sysfs, "card1", "controlC1"), "w").close()
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), (None, None))
+        self.assertEqual(self.asked, [])
+        os.unlink(os.path.join(self.sysfs, "card1", "controlC1"))
+        import threading
+        t = threading.Timer(0.6, register, (self.sysfs, 1, "AppleJ616"))
+        t.start()
+        self.addCleanup(t.cancel)
+        t0 = time.monotonic()
+        self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+
+    def test_without_alsa_proc_the_control_device_decides(self):
+        # a kernel without ALSA's proc interface: controlCN alone
+        gate.PROC = os.path.join(self.sysfs, "no-proc")
+        self.speaker(1, registered=False)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), (None, None))
+        open(os.path.join(self.sysfs, "card1", "controlC1"), "w").close()
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), ("dual", "AppleJ616"))
 
     def test_jack_only_is_no_speaker_card(self):
         # the bounded wait ends without a speaker card: the caller keeps
