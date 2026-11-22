@@ -80,5 +80,20 @@ again until the kernel, speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
 outcome, not a failure. `run` by hand always tries again.
 
+The boot unit also moves a speaker only once protected playback on it is on
+record. speakerguardd v2's gate data (`packaging/session/gate.json`,
+installed as `/usr/share/speakerguardd/gate.json`) lists in `playback_rows`,
+by the tuning's speaker identity (`AID<n>`), the rows where sound was played
+through v2's protection on that speaker and measured with V/I sense and the
+Mac's own microphone. A speaker counts once its rows cover every item of
+`playback_covers` (a loud step and a thermal ramp). Without that,
+`run --at-boot` leaves the speakers as they are (the legacy protection, or
+what the installer set up), collects nothing and records no refusal; a
+silent self-check pass alone is not playback evidence. `run` by hand is not
+limited by the record (v2's provisioning still refuses a protection type
+the gate data holds for playback rows, LSID's static release), and `status`
+shows `boot_migration`. A new playback row makes the boot unit try a
+refused Mac again.
+
 Requirements: python3, python3-cryptography, liblzfse, util-linux
 (lsblk), alsa-utils, systemd, and speakerguardd v2 for the switch.

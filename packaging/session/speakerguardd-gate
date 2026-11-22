@@ -12,7 +12,10 @@ both, so exactly one of them runs on a board, chosen at boot:
 - v2 runs (`v2` exits 0) only with current successful compilation, own-Mac
   extraction provenance, a silent wiring self-check bound to this board,
   kernel and blob, and every protection type (including LSID) at parity.
-  Board policy may deny, but an allow never bypasses those proofs.
+  Board policy may deny, but an allow never bypasses those proofs. A
+  protection type gate.json releases only with protected playback rows
+  (units_need_playback_rows: LSID's static release) also needs those rows
+  on record for this speaker (its AID).
 - `prepare` admits provisioning and the silent check before those records
   exist, when the graph's protection types are at parity and not denied.
 - the older daemons run (`legacy` exits 0) when v2 does not and the kernel
@@ -97,6 +100,18 @@ def tuning_units(cli, conf=None):
     """The complete protection type set from provisioning's own source."""
     bundle = bundle_override(conf or PROVISION_CONF)
     return wiring.protection_units(wiring.tuning_dump([bundle] if bundle else [], cli, strict=True))
+
+
+def tuning_aid(cli, conf=None):
+    """The speaker identity (AID<n>) of provisioning's own source, as the
+    tuning reader's identify names it."""
+    bundle = bundle_override(conf or PROVISION_CONF)
+    r = subprocess.run([cli, "identify", "--json", *([bundle] if bundle else [])], capture_output=True, text=True,
+                       timeout=120)
+    v = json.loads(r.stdout)
+    if r.returncode != 0 or not isinstance(v, dict) or "error" in v or not isinstance(v.get("aid"), str):
+        raise wiring.Refused(f"the tuning reader could not identify the speaker (exit {r.returncode})")
+    return v["aid"]
 
 
 SYSFS = "/sys/class/sound"
@@ -332,6 +347,8 @@ def _decide(args):
     try:
         units = tuning_units(args.tuning_cli)
         gen.qualification_policy(board, units, gate)
+        if gen.held_for_playback_rows(units, gate):
+            gen.playback_policy(tuning_aid(args.tuning_cli), units, gate)
         policy_ok = True
         if getattr(args, "cmd", "v2") != "prepare":
             wiring.qualification(getattr(args, "state", "/var/lib/speakerguardd"), board,

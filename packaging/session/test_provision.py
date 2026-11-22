@@ -1678,6 +1678,50 @@ class Gate(Base):
                     self.checked()
                 self.assertEqual(self.decide(gate_data=policy), (ok, False))
 
+    def test_lsid_static_release_needs_playback_rows_for_its_speaker(self):
+        import gen
+        released = "warning[lsid-static-release] compile: the LSID estimator is not run"
+        # Keyed by the speaker identity the bundle names, not the board: the
+        # same board compiles for a proven speaker and fails for one without
+        # rows. A graph without LSID needs no row (AID21 has none).
+        for aid, lsid, ok in (("AID37", True, False), ("AID42", True, False), ("AID44", True, True),
+                              ("AID21", False, True)):
+            with self.subTest(aid=aid):
+                self.board("j713")
+                self.ctl({"board": "j713", "unit": "lsm2", "lsid": lsid, "aid": aid, "warnings": [released] if lsid else []})
+                # The gate does not even start provisioning for it (no failed unit).
+                self.assertEqual(self.decide(gate_data=gen.load_gate(), cmd="prepare"), (ok, False))
+                self.assertEqual(self.run_(), 0 if ok else 1)
+                if ok:
+                    self.checked()
+                else:
+                    self.assertIn(f"lsid on {aid}: no protected playback row", " ".join(self.record()["reasons"]))
+                    self.assertFalse(os.path.exists(self.p.params))
+                self.assertEqual(self.decide(gate_data=gen.load_gate()), (ok, False))
+
+    def test_playback_rows_need_every_cover_with_evidence(self):
+        import gen
+        row = lambda covers, evidence="lab row": {"date": "2026-11-23", "board": "j000", "what": "w",
+                                                  "covers": covers, "evidence": evidence}
+        base = {"playback_covers": ["loud-step", "thermal-ramp"], "units_need_playback_rows": ["lsid"]}
+        for record, proven in (({"AID7": [row(["loud-step", "thermal-ramp"])]}, True),
+                               ({"AID7": [row(["loud-step"]), row(["thermal-ramp"])]}, True),
+                               ({"AID7": [row(["loud-step"])]}, False),
+                               ({"AID7": [row(["loud-step", "thermal-ramp"], evidence="")]}, False),
+                               ({"AID8": [row(["loud-step", "thermal-ramp"])]}, False),
+                               ({"AID7": "yes"}, False), (["AID7"], False)):
+            g = dict(base, playback_rows=record)
+            self.assertEqual(bool(gen.playback_rows("AID7", g)), proven, record)
+            if proven:
+                gen.playback_policy("AID7", ["lsm2", "lsid"], g)
+            else:
+                with self.assertRaises(gen.wiring.Refused):
+                    gen.playback_policy("AID7", ["lsm2", "lsid"], g)
+            gen.playback_policy("AID7", ["lsm2"], g)
+        self.assertEqual(gen.playback_rows("AID7", dict(base, playback_covers=[], playback_rows={"AID7": [row([])]})), [])
+        with self.assertRaises(gen.wiring.Refused):
+            gen.playback_policy("AID7", ["spp3"], dict(base, units_need_playback_rows=["nope"]))
+
     def test_four_reference_boards_qualify_without_a_board_list(self):
         import gen
         for board, kind in (("j316s", "spp3"), ("j413", "spp3"), ("j616s", "spp3"), ("j700", "lsm2")):
@@ -1705,6 +1749,20 @@ class Gate(Base):
         self.assertEqual(g["board_overrides"], {})
         self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
+        # Every recorded speaker is proven by its own rows, each with evidence.
+        import gen
+        self.assertEqual(g["playback_covers"], ["loud-step", "thermal-ramp"])
+        self.assertEqual(g["units_need_playback_rows"], ["lsid"])
+        for aid, rows in g["playback_rows"].items():
+            self.assertRegex(aid, r"^AID[1-9][0-9]*$")
+            for r in rows:
+                self.assertRegex(r["date"], r"^2[0-9]{3}-[0-9]{2}-[0-9]{2}$", aid)
+                self.assertTrue(r["board"] and r["what"] and r["evidence"], aid)
+                self.assertLessEqual(set(r["covers"]), set(g["playback_covers"]), aid)
+            self.assertTrue(gen.playback_rows(aid, g), aid)
+        # The four-lane LSID speakers have no loud row yet.
+        self.assertNotIn("AID37", g["playback_rows"])
+        self.assertNotIn("AID42", g["playback_rows"])
 
 
 JACK = b"apple,j616-macaudio-jack\0apple,macaudio\0"
