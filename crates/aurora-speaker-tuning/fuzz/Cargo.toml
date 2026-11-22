@@ -1,0 +1,63 @@
+[package]
+name = "aurora-speaker-tuning-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+description = "cargo-fuzz targets for the tuning-bundle readers and the blob compiler"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+serde_json = "1"
+aurora-speaker-tuning = { path = ".." }
+sgv2-core = { path = "../../sgv2-core", features = ["std"] }
+sgv2-lv2 = { path = "../../sgv2-lv2" }
+sgv2-supervisor = { path = "../../sgv2-supervisor" }
+
+# Not a member of the repository workspace: cargo-fuzz builds it on its own
+# (it needs `-Zsanitizer`, so RUSTC_BOOTSTRAP=1 on a stable toolchain).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "plist"
+path = "fuzz_targets/plist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aupreset"
+path = "fuzz_targets/aupreset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dspg"
+path = "fuzz_targets/dspg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "formats"
+path = "fuzz_targets/formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tuning"
+path = "fuzz_targets/tuning.rs"
+test = false
+doc = false
+bench = false
