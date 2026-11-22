@@ -87,4 +87,76 @@ mod tests {
         assert!((o0[0] - 0.1).abs() < 1e-7 && (o0[1] + 0.05).abs() < 1e-7);
         assert_eq!(o1, [0.0; 3]);
     }
+
+    /// `fill_from` on one input/output pair, returning the output.
+    fn fill(input: &[f32], out_len: usize, frames: usize, from: usize, gain: f32) -> std::vec::Vec<f32> {
+        let mut o = std::vec![9.0f32; out_len];
+        {
+            let inputs: [&[f32]; 1] = [input];
+            let mut outputs: [&mut [f32]; 1] = [&mut o];
+            fill_from(&mut Io { frames, input: &inputs, sense: &[], output: &mut outputs }, from, gain);
+        }
+        o
+    }
+
+    #[test]
+    fn the_gain_is_held_to_zero_to_one_and_a_nonfinite_gain_mutes() {
+        let x = [0.5f32, -0.5, 1.0];
+        assert_eq!(fill(&x, 3, 3, 0, 4.0), x, "above unity is unity");
+        assert_eq!(fill(&x, 3, 3, 0, -0.5), [0.0; 3], "negative is silence");
+        for g in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(fill(&x, 3, 3, 0, g), [0.0; 3], "gain {g}");
+        }
+        assert_eq!(fill(&x, 3, 3, 0, 0.5), [0.25, -0.25, 0.5]);
+    }
+
+    #[test]
+    fn any_input_gives_a_finite_output_bounded_by_the_gain() {
+        let x = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 3.0, -1e30, f32::MAX, 0.05];
+        let o = fill(&x, x.len(), x.len(), 0, FAILSAFE_GAIN);
+        assert_eq!(&o[..3], &[0.0; 3], "a non-finite sample is muted, not clamped");
+        assert_eq!(o[3], FAILSAFE_GAIN);
+        assert_eq!(o[4], -FAILSAFE_GAIN);
+        assert_eq!(o[5], FAILSAFE_GAIN);
+        assert!((o[6] - 0.05 * FAILSAFE_GAIN).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_frames_from_the_offset_to_the_quantum_end_are_written() {
+        let x = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        // frames before `from` keep what the unit already wrote
+        let o = fill(&x, 6, 6, 4, 1.0);
+        assert_eq!(o, [9.0, 9.0, 9.0, 9.0, 0.5, 0.6]);
+        // an offset at or past the end writes nothing
+        assert_eq!(fill(&x, 6, 6, 6, 1.0), [9.0; 6]);
+        assert_eq!(fill(&x, 6, 6, 100, 1.0), [9.0; 6]);
+        // an output longer than the quantum is written only up to `frames`
+        assert_eq!(fill(&x, 6, 3, 0, 1.0), [0.1, 0.2, 0.3, 9.0, 9.0, 9.0]);
+    }
+
+    #[test]
+    fn short_buffers_never_index_out_of_range_and_the_unfed_tail_is_silent() {
+        // input shorter than the quantum: the rest of the output is zero
+        assert_eq!(fill(&[0.5, 0.5], 5, 5, 0, 1.0), [0.5, 0.5, 0.0, 0.0, 0.0]);
+        // ... also when the offset is past the input's end
+        assert_eq!(fill(&[0.5, 0.5], 5, 5, 3, 1.0), [9.0, 9.0, 9.0, 0.0, 0.0]);
+        // output shorter than the quantum: written to its own end only
+        assert_eq!(fill(&[0.5; 8], 3, 8, 0, 1.0), [0.5; 3]);
+        // nothing at all
+        assert_eq!(fill(&[], 0, 4, 0, 1.0), std::vec::Vec::<f32>::new());
+        assert_eq!(fill(&[], 2, 2, 0, 1.0), [0.0; 2]);
+    }
+
+    #[test]
+    fn telemetry_reports_the_fail_safe_and_its_reason() {
+        let unit = FailSafe::new(UnitKind::Lsm2, Health::CHANNEL_MISMATCH);
+        assert_eq!(unit.kind(), UnitKind::Lsm2);
+        assert_eq!(unit.latency_frames(), 0);
+        let mut t = Telemetry::new();
+        t.channels[0].coil_temp_c = 50.0;
+        unit.telemetry(&mut t);
+        assert_eq!(t.health.0, Health::FAILSAFE | Health::CHANNEL_MISMATCH);
+        assert!(t.channels.iter().all(|c| c.gain == FAILSAFE_GAIN));
+        assert!(t.channels[0].coil_temp_c.is_nan(), "stale state is cleared");
+    }
 }
