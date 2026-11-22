@@ -848,6 +848,45 @@ class Sleep(Base):
         self.assertIsNone(prov.helper_amps({}, 0))
         self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
 
+    def _helper_report(self):
+        d = os.path.join(self.root, "run", "1000", "helper")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "session")
+
+    def _helper_amps(self):
+        return prov.helper_amps({"SGV2_UID": "1000"}, 5, run=os.path.join(self.root, "run"))
+
+    def test_helper_amps_reads_a_regular_report(self):
+        with open(self._helper_report(), "w") as f:
+            f.write("mono_ns=10 amps=0\n")
+        self.assertIs(self._helper_amps(), False)
+
+    def test_helper_amps_read_with_the_supervisors_limits(self):
+        """Not following a link, not blocking on a FIFO, at most 255 bytes."""
+        import threading
+        path = self._helper_report()
+        good = os.path.join(self.root, "report")
+        with open(good, "w") as f:
+            f.write("mono_ns=10 amps=1\n")
+        os.symlink(good, path)
+        self.assertIsNone(self._helper_amps())
+        os.unlink(path)
+        with open(path, "w") as f:
+            f.write("mono_ns=10 amps=1" + " " * 300 + "\n")
+        self.assertIsNone(self._helper_amps())
+        os.unlink(path)
+        os.mkfifo(path)
+        out = []
+        t = threading.Thread(target=lambda: out.append(self._helper_amps()), daemon=True)
+        t.start()
+        t.join(5)
+        blocked = t.is_alive()
+        if blocked:
+            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(5)
+        self.assertFalse(blocked, "blocked opening a FIFO report")
+        self.assertEqual(out, [None])
+
     def _pcm(self, card, name, first):
         d = os.path.join(self.p.proc_asound, card, name, "sub0")
         os.makedirs(d, exist_ok=True)
@@ -1194,6 +1233,84 @@ class LV2Shadow(unittest.TestCase):
 
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
+
+    def test_only_the_seat_users_home_is_looked_at(self):
+        """Root runs this before logins: another user's home is not read, and
+        with no seat user provisioned no home is."""
+        from unittest import mock
+        other = os.path.join(self.root, "home", "o")
+        self.bundle(os.path.join(other, ".lv2", "sgv2.lv2"))
+        pw = lambda name, home, uid: types.SimpleNamespace(pw_name=name, pw_dir=home, pw_uid=uid)
+        accounts = {1000: pw("u", self.home, 1000), 1001: pw("o", other, 1001)}
+
+        def getpwuid(uid):
+            if uid not in accounts:
+                raise KeyError(uid)
+            return accounts[uid]
+
+        for conf, want in (({"SGV2_UID": "1000"}, 0), ({}, 0), ({"SGV2_UID": "1001"}, 1)):
+            with mock.patch.object(self.sc, "read_conf", return_value=conf), \
+                    mock.patch.object(pwd, "getpwall", return_value=list(accounts.values())), \
+                    mock.patch.object(pwd, "getpwuid", side_effect=getpwuid):
+                self.assertEqual(len(self.sc.lv2_shadows(etc=self.etc, environ={})), want, conf)
+
+    def _no_block(self, fifo, call):
+        """`call()` returns at once although `fifo` has no writer."""
+        import threading
+        out = []
+        t = threading.Thread(target=lambda: out.append(call()), daemon=True)
+        t.start()
+        t.join(5)
+        blocked = t.is_alive()
+        if blocked:  # let the reader go
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(5)
+        self.assertFalse(blocked, f"blocked opening {fifo}")
+        return out[0]
+
+    def test_a_fifo_in_the_users_files_does_not_block(self):
+        envd = os.path.join(self.home, ".config", "environment.d")
+        os.makedirs(envd)
+        os.mkfifo(os.path.join(envd, "50-lv2.conf"))
+        self.assertEqual(self._no_block(os.path.join(envd, "50-lv2.conf"), self.scan), [])
+        os.makedirs(os.path.join(self.home, ".lv2", "x.lv2"))
+        man = os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl")
+        os.mkfifo(man)
+        self.assertEqual(self._no_block(man, self.scan), [])
+
+    def test_links_reach_only_regular_files_and_reads_are_bounded(self):
+        # A linked manifest (dotfile managers, per-file profiles) still counts
+        target = os.path.join(self.root, "elsewhere")
+        self.bundle(target)
+        os.makedirs(os.path.join(self.home, ".lv2", "x.lv2"))
+        os.symlink(os.path.join(target, "manifest.ttl"), os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl"))
+        self.assertEqual(len(self.scan()), 1)
+        os.unlink(os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl"))
+        # A link to a FIFO is not opened for a blocking read
+        fifo = os.path.join(self.root, "fifo")
+        os.mkfifo(fifo)
+        os.symlink(fifo, os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl"))
+        self.assertEqual(self.scan(), [])
+        big = os.path.join(self.home, ".lv2", "big.lv2")
+        os.makedirs(big)
+        with open(os.path.join(big, "manifest.ttl"), "w") as f:
+            f.write(" " * self.sc.USER_FILE_MAX + f"<{self.sc.PLUGIN_URI}x> a lv2:Plugin .\n")
+        self.assertEqual(self.scan(), [])
+
+    def test_a_link_to_a_device_is_never_opened_for_reading(self):
+        from unittest import mock
+        os.makedirs(os.path.join(self.home, ".lv2", "d.lv2"))
+        os.symlink("/dev/null", os.path.join(self.home, ".lv2", "d.lv2", "manifest.ttl"))
+        real, opened = os.open, []
+
+        def spy(path, flags, *a, **k):
+            fd = real(path, flags, *a, **k)
+            if not flags & os.O_PATH:
+                opened.append(os.path.realpath(f"/proc/self/fd/{fd}"))
+            return fd
+        with mock.patch.object(os, "open", spy):
+            self.assertEqual(self.scan(), [])
+        self.assertNotIn("/dev/null", opened)
 
 class Umask(Base):
     def test_graph_dirs_are_readable_whatever_the_callers_umask(self):
