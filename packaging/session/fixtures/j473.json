@@ -58,7 +58,7 @@
  },
  "tuning": {
   "tuning": {
-   "aid": "synthetic",
+   "aid": "-",
    "selection": {
     "sample_rate": 48000,
     "substitutions": {

@@ -251,43 +251,38 @@ def speaker_id_raw(dt=DT):
 
 
 def machine_of(dt):
-    """(machine key, the card id macaudio gives it), from this Mac's device
-    tree (wiring.machine_key, wiring.card_id)."""
+    """(machine key, the card id macaudio gives it, the hardware
+    description), from this Mac's device tree (wiring.read_dt,
+    wiring.machine_key, wiring.card_id)."""
     import wiring
 
     try:
         hw = wiring.read_dt(dt)
-        return wiring.machine_key(hw), wiring.card_id(hw)
+        return wiring.machine_key(hw), wiring.card_id(hw), hw
     except (wiring.Refused, OSError) as e:
         raise Failed(f"the device tree: {e}")
 
 
-def find_card(want, wait, sysfs="/sys/class/sound"):
-    """(index, id) of the speaker card: the macaudio card with the speaker
-    link, by its device tree node (the jack-only card of a J614s/J616s/J713
-    may come first). Its id must be `want`, the one macaudio derives from
-    the device tree's model."""
+def find_card(hw, want, wait, dt=DT, sysfs="/sys/class/sound", proc="/proc/asound"):
+    """(index, id) of the speaker card: the card bound to the device tree's
+    sound node (wiring.live_card), the same lookup as the self-check's, so
+    both write the same hw:CARD=. Its id is the running card's own: one
+    that differs from `want`, the name macaudio derives from the model, is
+    logged, not refused (the jack-only card of a J614s/J616s/J713 is on
+    another node, whichever card number it took)."""
     deadline = time.monotonic() + wait
     while True:
-        for d in sorted(os.listdir(sysfs)) if os.path.isdir(sysfs) else []:
-            if not re.fullmatch(r"card\d+", d):
-                continue
-            node = f"{sysfs}/{d}/device/of_node"
-            try:
-                with open(f"{node}/compatible", "rb") as f:
-                    if b"apple,macaudio" not in f.read().split(b"\0"):
-                        continue
-                if not wiring.has_speaker_link(node):
-                    continue
-                with open(f"{sysfs}/{d}/id") as f:
-                    cid = f.read().strip()
-            except OSError:
-                continue
-            if want and want != cid:
-                raise Failed(f"the speaker card is {cid}, but the device tree's model names {want}")
-            return int(d[4:]), cid
+        try:
+            live = wiring.live_card(hw, dt, sysfs, proc)
+        except wiring.Refused as e:
+            raise Failed(str(e)) from None
+        if live is not None:
+            if want and want != live[1]:
+                log(f"the speaker card is {live[1]} (bound to {hw['sound']}); the device tree's model suggests {want}")
+            return live
         if time.monotonic() >= deadline:
-            raise Failed(f"no speaker card (apple,macaudio) after {wait:.0f} s: is the kernel's macaudio driver loaded?")
+            raise Failed(f"no ALSA card bound to the device tree's {hw['sound']} node after {wait:.0f} s: "
+                         "is the kernel's macaudio driver loaded?")
         time.sleep(0.25)
 
 
@@ -534,7 +529,7 @@ def cmd_run(args, p):
         ensure_dir(p.etc, 0o755, live)
         override = read_kv(p.override)
         rec["board"] = board_of(args.dt)
-        key, want_card = machine_of(args.dt)
+        key, want_card, hw = machine_of(args.dt)
         import gen
         rec["voicing_pre"] = str(gen.runtime_voicing_enabled(rec["board"])).lower()
         src, sargs = source_args(args, override)
@@ -570,7 +565,7 @@ def cmd_run(args, p):
         user, how = resolve_seat_user(p, override, etc=args.etc)
         pw = pwd.getpwnam(user)
         rec.update(seat_user=user, seat_how=how)
-        idx, card = find_card(want_card, args.card_wait)
+        idx, card = find_card(hw, want_card, args.card_wait, dt=args.dt)
         pcm = speaker_pcm(idx)
         if live:
             speaker_route(card)

@@ -17,7 +17,7 @@ hand-written template and with nobody at the machine.
 | Fleet gate | derived | `gate.json` supplies build-wide `units_at_parity` and deny/override policy; current compilation, own-Mac provenance and silent self-check records qualify the board automatically. |
 | Channel map and V/I order | yes | Derived from the device tree and the tuning, then checked by the self-check (MCA and AOP paths; the J700 is derived but cannot be proven silently). |
 | PipeWire and WirePlumber files | yes | Generated from the self-check's record. |
-| Machine description | yes | Derived from the device tree (`wiring.describe`): the machine key, card id, model, amp and sense counts, plugin variant, speaker format and buffering (per transport driver); the self-check confirms the card id and the format against ALSA. There is no `machines.json`. |
+| Machine description | yes | Built from the speaker path's capabilities (`wiring.probe`, [CAPABILITIES.md](CAPABILITIES.md)): the machine key, model, amp and sense counts, plugin variant, speaker format and buffering (per transport driver) from the device tree, and the card id from the running card bound to the device tree's sound node; the self-check checks the format against ALSA. Every value carries its source (`wiring.py caps`). There is no `machines.json`. |
 | Supervisor | yes, for SN012776 and MAX98360A amps | Takes its machine description from the self-check's record; there is no table of boards. |
 | LV2 plugin variant | 2, 4 or 6 amps | Any other amp count needs a new variant. |
 | Voicing (the stages before protection) | yes | A new board compiles its own full chain; an unsupported graph fails closed. |
