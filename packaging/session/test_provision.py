@@ -1826,6 +1826,9 @@ class Gate(Base):
                                ({"AID7": [row(["loud-step"])]}, False),
                                ({"AID7": [row(["loud-step", "thermal-ramp"], evidence="")]}, False),
                                ({"AID8": [row(["loud-step", "thermal-ramp"])]}, False),
+                               ({"AID7": [row(["loud-step", "thermal-ramp"], evidence="  ")]}, False),
+                               ({"AID7": [row(["loud-step", "thermal-ramp"], evidence=["x"])]}, False),
+                               ({"AID7": [row([["loud-step"], "thermal-ramp"])]}, False),
                                ({"AID7": "yes"}, False), (["AID7"], False)):
             g = dict(base, playback_rows=record)
             self.assertEqual(bool(gen.playback_rows("AID7", g)), proven, record)
@@ -1836,6 +1839,8 @@ class Gate(Base):
                     gen.playback_policy("AID7", ["lsm2", "lsid"], g)
             gen.playback_policy("AID7", ["lsm2"], g)
         self.assertEqual(gen.playback_rows("AID7", dict(base, playback_covers=[], playback_rows={"AID7": [row([])]})), [])
+        self.assertEqual(gen.playback_rows("AID7", dict(base, playback_covers=[["loud-step"]],
+                                                        playback_rows={"AID7": [row(["loud-step"])]})), [])
         with self.assertRaises(gen.wiring.Refused):
             gen.playback_policy("AID7", ["spp3"], dict(base, units_need_playback_rows=["nope"]))
 

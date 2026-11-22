@@ -108,7 +108,10 @@ def tuning_aid(cli, conf=None):
     bundle = bundle_override(conf or PROVISION_CONF)
     r = subprocess.run([cli, "identify", "--json", *([bundle] if bundle else [])], capture_output=True, text=True,
                        timeout=120)
-    v = json.loads(r.stdout)
+    try:
+        v = json.loads(r.stdout)
+    except ValueError:
+        raise wiring.Refused(f"the tuning reader's identify gave no JSON (exit {r.returncode})") from None
     if r.returncode != 0 or not isinstance(v, dict) or "error" in v or not isinstance(v.get("aid"), str):
         raise wiring.Refused(f"the tuning reader could not identify the speaker (exit {r.returncode})")
     return v["aid"]

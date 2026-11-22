@@ -405,7 +405,10 @@ def playback_proof(acoustic, paths=None):
         if not isinstance(covers, list) or not covers or not isinstance(record, dict):
             return []
         rows = record.get(f"AID{acoustic}")
-        rows = [r for r in rows if isinstance(r, dict) and r.get("evidence") and isinstance(r.get("covers"), list)] \
+        if not all(isinstance(c, str) for c in covers):
+            return []
+        rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("evidence"), str) and r["evidence"].strip()
+                and isinstance(r.get("covers"), list) and all(isinstance(c, str) for c in r["covers"])] \
             if isinstance(rows, list) else []
         return rows if {c for r in rows for c in r["covers"]} >= set(covers) else []
     return []
@@ -863,7 +866,8 @@ def _cmd_run(a):
     state = store.state()
     have = store.read_bundle()
     m = json.loads(have[audio_tuning.MANIFEST]) if have else {}
-    if state.get("switched") and have and m.get("unit_id") == identity.unit:
+    switched_here = bool(state.get("switched") and have and m.get("unit_id") == identity.unit)
+    if switched_here:
         if (mode != "dual" or read_text(store.interface) == "v2\n") \
                 and (getattr(a, "at_boot", False) or v2_owns_speakers(mode, card)):
             say(f"nothing to do: speakerguardd v2 owns the speakers with {m.get('aid')} from macOS "
@@ -875,7 +879,7 @@ def _cmd_run(a):
             # since the boot, so its provisioning is gone until it runs
             # again): switch again instead of leaving them at the floor.
             say("switched on record, but speakerguardd v2 does not hold the speakers in this boot: switching again")
-    if getattr(a, "at_boot", False) and not state.get("switched") and not playback_proof(identity.acoustic):
+    if getattr(a, "at_boot", False) and not switched_here and not playback_proof(identity.acoustic):
         # The boot unit moves a speaker only once protected playback on it
         # is on record; until then the speakers stay as they are (the legacy
         # protection, or what the installer set up) and nothing is collected.
