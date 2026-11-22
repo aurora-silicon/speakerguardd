@@ -266,11 +266,12 @@ def find_card(want, wait, sysfs="/sys/class/sound"):
     """(index, id) of the speaker card: the macaudio card with the speaker
     link, by its device tree node (the jack-only card of a J614s/J616s/J713
     may come first). Its id must be `want`, the one macaudio derives from
-    the device tree's model."""
+    the device tree's model. A card counts once ALSA has registered it in
+    full (wiring.card_registered), as in the gate."""
     deadline = time.monotonic() + wait
     while True:
         for d in sorted(os.listdir(sysfs)) if os.path.isdir(sysfs) else []:
-            if not re.fullmatch(r"card\d+", d):
+            if not re.fullmatch(r"card\d+", d) or not wiring.card_registered(f"{sysfs}/{d}"):
                 continue
             node = f"{sysfs}/{d}/device/of_node"
             try:

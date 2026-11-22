@@ -33,6 +33,7 @@ def load(name, file):
 
 prov = load("provision", "speakerguardd-provision")
 gate = load("gate", "speakerguardd-gate")
+wiring = gate.wiring
 
 # A stand-in for aurora-speaker-tuning: `identify` and `compile`, steered by
 # a JSON file beside it.
@@ -1572,7 +1573,7 @@ class SpeakerCard(unittest.TestCase):
     """The gate's speaker card is the macaudio card with the speaker link,
     whichever card number the jack-only card took."""
 
-    def card(self, sysfs, n, ident, compat, link):
+    def card(self, sysfs, n, ident, compat, link, registered=True):
         node = os.path.join(sysfs, f"card{n}", "device", "of_node")
         os.makedirs(os.path.join(node, "dai-link@0"))
         with open(os.path.join(sysfs, f"card{n}", "id"), "w") as f:
@@ -1581,6 +1582,14 @@ class SpeakerCard(unittest.TestCase):
             f.write(compat)
         with open(os.path.join(node, "dai-link@0", "link-name"), "wb") as f:
             f.write(link + b"\0")
+        if registered:
+            SpeakerCard.register(sysfs, n)
+
+    @staticmethod
+    def register(sysfs, n):
+        # ALSA registers the control device last, after the card's
+        # directory, id and PCMs (snd_card_register)
+        os.makedirs(os.path.join(sysfs, f"card{n}", f"controlC{n}"))
 
     def test_the_jack_card_first_is_skipped(self):
         with tempfile.TemporaryDirectory() as sysfs:
@@ -1601,6 +1610,31 @@ class SpeakerCard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as sysfs:
             self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
             self.assertIsNone(gate.speaker_card(sysfs))
+
+    def test_a_card_counts_once_alsa_registered_it(self):
+        # the card's directory and id exist before its control device:
+        # neither the gate nor provisioning may take it in that window
+        with tempfile.TemporaryDirectory() as sysfs:
+            self.card(sysfs, 2, "AppleJ700", b"apple,j700-macaudio\0apple,macaudio\0", b"Speakers",
+                      registered=False)
+            self.assertIsNone(gate.speaker_card(sysfs))
+            with self.assertRaises(prov.Failed):
+                prov.find_card("AppleJ700", 0, sysfs)
+            self.register(sysfs, 2)
+            self.assertEqual(gate.speaker_card(sysfs), "AppleJ700")
+            self.assertEqual(prov.find_card("AppleJ700", 0, sysfs), (2, "AppleJ700"))
+
+    def test_card_registered(self):
+        with tempfile.TemporaryDirectory() as sysfs:
+            d = os.path.join(sysfs, "card3")
+            os.makedirs(d)
+            self.assertFalse(wiring.card_registered(d))
+            os.makedirs(os.path.join(d, "controlC1"))
+            self.assertFalse(wiring.card_registered(d))
+            os.makedirs(os.path.join(d, "controlC3"))
+            self.assertTrue(wiring.card_registered(d))
+            self.assertTrue(wiring.card_registered(d + "/"))
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "controlC3")))
 
 
 class CardOrder(unittest.TestCase):
@@ -1624,8 +1658,8 @@ class CardOrder(unittest.TestCase):
         gate.log = lambda *a: None
         self.addCleanup(setattr, gate, "log", orig_log)
 
-    def card(self, n, ident, compat, link):
-        SpeakerCard.card(None, self.sysfs, n, ident, compat, link)
+    def card(self, n, ident, compat, link, registered=True):
+        SpeakerCard.card(None, self.sysfs, n, ident, compat, link, registered)
 
     def jack(self, n):
         self.card(n, "AppleJack", JACK, b"Headphone Jack")
@@ -1656,6 +1690,34 @@ class CardOrder(unittest.TestCase):
         self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
         self.assertGreaterEqual(time.monotonic() - t0, 0.5)
         self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_speaker_card_before_its_controls(self):
+        # Neo (J700) 11-23, fleet79: the gate found the card but its
+        # controls were not readable yet, took it for a kernel without the
+        # v2 interface and skipped provisioning; the self-check a second
+        # later ran on the previous kernel's record and failed. The gate
+        # waits for the card's registration and asks its controls only then.
+        import threading
+        # as amixer: a card without its control device cannot be opened,
+        # which reads the same as a card without the control
+        ctl = os.path.join(self.sysfs, "card2", "controlC2")
+        has = gate.has_control
+        gate.has_control = lambda card, name: os.path.exists(ctl) and has(card, name)
+        self.jack(1)
+        self.card(2, "AppleJ616", self.SPEAKER, b"Speakers", registered=False)
+        t = threading.Timer(0.6, SpeakerCard.register, (self.sysfs, 2))
+        t.start()
+        self.addCleanup(t.cancel)
+        t0 = time.monotonic()
+        self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+        self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_a_card_never_registered_is_no_answer(self):
+        # not "legacy": the bounded wait ends with no speaker card
+        self.card(2, "AppleJ616", self.SPEAKER, b"Speakers", registered=False)
+        self.assertEqual(gate.kernel_interface(0.3, self.sysfs), (None, None))
+        self.assertEqual(self.asked, [])
 
     def test_jack_only_is_no_speaker_card(self):
         # the bounded wait ends without a speaker card: the caller keeps

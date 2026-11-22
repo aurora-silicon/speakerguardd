@@ -368,6 +368,18 @@ def has_speaker_link(node):
     return False
 
 
+def card_registered(card_dir):
+    """Whether ALSA has finished registering the card at `card_dir`
+    (/sys/class/sound/cardN): its control device controlCN exists. ALSA
+    adds the card's sysfs directory, with its id and device link, first and
+    registers the control device after all the card's other devices, so in
+    between the card can be found but not opened: amixer then fails as if
+    the card had no such control."""
+    d = os.path.basename(os.path.normpath(card_dir))
+    m = re.fullmatch(r"card(\d+)", d)
+    return bool(m) and os.path.exists(os.path.join(card_dir, f"controlC{m.group(1)}"))
+
+
 def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
     """The hardware description of the running Mac, from its device tree:
     the apple,macaudio card that has the speaker link (the J614s/J616s/J713

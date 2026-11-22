@@ -106,13 +106,15 @@ def speaker_card(sysfs=SYSFS):
     """The speaker card's ALSA id: the card whose device tree node is a
     macaudio sound node with the speaker link, looked for among all cards
     (the J614s/J616s/J713 also have a jack-only macaudio card, and either may
-    probe first)."""
+    probe first). A card counts once ALSA has registered it in full
+    (wiring.card_registered): until then its controls cannot be read, and
+    the gate would take the card for one without the v2 controls."""
     try:
         names = sorted(os.listdir(sysfs))
     except OSError:
         return None
     for d in names:
-        if not re.fullmatch(r"card\d+", d):
+        if not re.fullmatch(r"card\d+", d) or not wiring.card_registered(f"{sysfs}/{d}"):
             continue
         node = f"{sysfs}/{d}/device/of_node"
         try:
