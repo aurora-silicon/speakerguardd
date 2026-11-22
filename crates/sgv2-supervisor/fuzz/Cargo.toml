@@ -1,0 +1,60 @@
+[package]
+name = "sgv2-supervisor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+description = "cargo-fuzz targets for the supervisor's parsers of what it reads from outside the process"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+sgv2-core = { path = "../../sgv2-core", features = ["std"] }
+sgv2-supervisor = { path = ".." }
+
+# Not a member of the repository workspace: cargo-fuzz builds it on its own
+# (it needs `-Zsanitizer`, so RUSTC_BOOTSTRAP=1 on a stable toolchain).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "selfcheck"
+path = "fuzz_targets/selfcheck.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thermal"
+path = "fuzz_targets/thermal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "procfs"
+path = "fuzz_targets/procfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blobcheck"
+path = "fuzz_targets/blobcheck.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observe"
+path = "fuzz_targets/observe.rs"
+test = false
+doc = false
+bench = false
