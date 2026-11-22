@@ -1297,6 +1297,21 @@ class LV2Shadow(unittest.TestCase):
             f.write(" " * self.sc.USER_FILE_MAX + f"<{self.sc.PLUGIN_URI}x> a lv2:Plugin .\n")
         self.assertEqual(self.scan(), [])
 
+    def test_a_link_to_a_device_is_never_opened_for_reading(self):
+        from unittest import mock
+        os.makedirs(os.path.join(self.home, ".lv2", "d.lv2"))
+        os.symlink("/dev/null", os.path.join(self.home, ".lv2", "d.lv2", "manifest.ttl"))
+        real, opened = os.open, []
+
+        def spy(path, flags, *a, **k):
+            fd = real(path, flags, *a, **k)
+            if not flags & os.O_PATH:
+                opened.append(os.path.realpath(f"/proc/self/fd/{fd}"))
+            return fd
+        with mock.patch.object(os, "open", spy):
+            self.assertEqual(self.scan(), [])
+        self.assertNotIn("/dev/null", opened)
+
 class Umask(Base):
     def test_graph_dirs_are_readable_whatever_the_callers_umask(self):
         """RC8 E2E B4: aurora-speaker-upgrade runs with umask 077; the graph

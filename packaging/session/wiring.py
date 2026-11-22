@@ -211,21 +211,29 @@ def _read(path):
 
 def read_user_file(path, cap, follow=False):
     """A file in a directory a user owns, read as root with the supervisor's
-    rules for the helper report (read_report): opened without following a
-    final link (unless `follow`) and without blocking, a regular file only,
-    at most `cap` bytes. None for anything else (missing, a link, a FIFO, a
-    device, a directory, longer than `cap`): the caller treats it as not
-    readable. `follow` still takes only a regular file the link names."""
-    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+    rules for the helper report (read_report): no final link followed
+    (unless `follow`), a regular file only, opened without blocking, at most
+    `cap` bytes. None for anything else (missing, a link, a FIFO, a device,
+    a directory, longer than `cap`): the caller treats it as not readable.
+    The type is checked on an O_PATH reference before anything is opened
+    for reading, so no device or FIFO is ever opened; the read reopens that
+    same inode, so a link swapped in between changes nothing."""
+    flags = os.O_PATH | os.O_CLOEXEC
     if not follow:
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags)
+        ref = os.open(path, flags)
     except OSError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        if not stat.S_ISREG(os.fstat(ref).st_mode):
             return None
+        fd = os.open(f"/proc/self/fd/{ref}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    finally:
+        os.close(ref)
+    try:
         data = b""
         while len(data) <= cap:
             chunk = os.read(fd, cap + 1 - len(data))
