@@ -120,7 +120,7 @@ class Base(unittest.TestCase):
         self.p = prov.Paths(self.root)
         self.saved = {}
         # The live machine's card, seat and users are stand-ins.
-        self.patch(prov, "find_card", lambda want, wait: (0, want))
+        self.patch(prov, "find_card", lambda hw, want, wait, **kw: (0, want))
         self.patch(prov, "speaker_pcm", lambda idx: 1)
         self.patch(prov, "seat0_user", lambda rng: None)
         self.patch(prov, "autologin_user", lambda etc: None)
@@ -184,6 +184,38 @@ class Provision(Base):
         self.assertTrue(self.record()["compiled"])
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
 
+
+    def test_the_running_cards_own_id_names_the_card_for_both_writers(self):
+        # The card bound to the sound node has an id other than the one
+        # macaudio derives from the model: provisioning passes with the
+        # running card's id, and the self-check's lookup (and so its
+        # generated graph) names the same card.
+        import gen
+        import wiring
+        sc = load("sc", "speakerguardd-selfcheck")
+        sysfs, proc = os.path.join(self.t, "sys"), os.path.join(self.t, "proc")
+        for n, of, ident in ((1, os.path.join(self.t, "jack"), "AppleJack"), (2, os.path.join(self.dt, "sound"), "AppleJ316Live")):
+            os.makedirs(of, exist_ok=True)
+            os.makedirs(os.path.join(sysfs, f"card{n}", "device"))
+            os.symlink(of, os.path.join(sysfs, f"card{n}", "device", "of_node"))
+            os.makedirs(os.path.join(proc, f"card{n}"))
+            with open(os.path.join(proc, f"card{n}", "id"), "w") as f:
+                f.write(ident + "\n")
+        self.patch(prov, "find_card", self.saved.get((prov, "find_card"), prov.find_card))
+        real = wiring.live_card
+        self.patch(wiring, "live_card", lambda hw, dt="/proc/device-tree", *a, **kw: real(hw, dt, sysfs, proc))
+        self.assertEqual(self.run_(), 0)
+        conf = prov.read_kv(self.p.conf)
+        self.assertTrue(conf["SGV2_ARGS"].startswith("--card AppleJ316Live --pcm 1 "), conf["SGV2_ARGS"])
+        hw = wiring.read_dt(self.dt)
+        self.assertNotEqual(wiring.card_id(hw), "AppleJ316Live")
+        live = sc.find_card(hw, self.dt)
+        self.assertEqual(live, (2, "AppleJ316Live"))
+        fx = gen.fixture("j316")
+        w = wiring.derive(fx["hw"], fx["tuning"])
+        text = gen.pipewire_conf(w["key"], dict(wiring.describe(fx["hw"], w, live), board="j316s"),
+                                 (w["unit_channels"], w["sense_ports"], w["hash"]), "test", voicing_pre=False)
+        self.assertIn("hw:CARD=AppleJ316Live,", text)
 
     def test_compiles_binds_and_configures(self):
         self.assertEqual(self.run_(), 0)
@@ -301,11 +333,11 @@ class Provision(Base):
         self.assert_closed("no seat user: 2 regular users (alice, bob)")
 
     def test_fails_closed_without_a_card(self):
-        def nocard(want, wait):
-            raise prov.Failed("no speaker card (apple,macaudio) after 0 s")
+        def nocard(hw, want, wait, **kw):
+            raise prov.Failed("no ALSA card bound to the device tree's sound node after 0 s")
         self.patch(prov, "find_card", nocard)
         self.assertEqual(self.run_(), 1)
-        self.assert_closed("no speaker card")
+        self.assert_closed("no ALSA card bound")
 
     def test_a_hand_written_conf_is_kept_aside(self):
         os.makedirs(self.p.etc)
@@ -1590,12 +1622,27 @@ class SpeakerCard(unittest.TestCase):
             self.assertEqual(gate.speaker_card(sysfs), "AppleJ616")
 
     def test_the_provisioner_skips_the_jack_card(self):
-        with tempfile.TemporaryDirectory() as sysfs:
-            self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
-            self.card(sysfs, 2, "AppleJ616", b"apple,j616-macaudio\0apple,macaudio\0", b"Speakers")
-            self.assertEqual(prov.find_card("AppleJ616", 0, sysfs), (2, "AppleJ616"))
+        with tempfile.TemporaryDirectory() as d:
+            sysfs, proc, dt = os.path.join(d, "sys"), os.path.join(d, "proc"), os.path.join(d, "dt")
+            for n, node, ident in ((1, "sound-jack", "AppleJack"), (2, "sound", "AppleJ616")):
+                os.makedirs(os.path.join(dt, node))
+                os.makedirs(os.path.join(sysfs, f"card{n}", "device"))
+                os.symlink(os.path.join(dt, node), os.path.join(sysfs, f"card{n}", "device", "of_node"))
+                os.makedirs(os.path.join(proc, f"card{n}"))
+                with open(os.path.join(proc, f"card{n}", "id"), "w") as f:
+                    f.write(ident + "\n")
+            hw = {"sound": "sound"}
+            self.assertEqual(prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc), (2, "AppleJ616"))
+            # another model-derived name is logged, not refused: the id is the card's own
+            self.assertEqual(prov.find_card(hw, "AppleJ614", 0, dt, sysfs, proc), (2, "AppleJ616"))
             with self.assertRaises(prov.Failed):
-                prov.find_card("AppleJ614", 0, sysfs)
+                prov.find_card({"sound": "sound-missing"}, "AppleJ616", 0, dt, sysfs, proc)
+            # a card still registering (of_node link, no id yet) is waited
+            # for, not refused: the wait runs out with "no card bound"
+            os.unlink(os.path.join(proc, "card2", "id"))
+            with self.assertRaises(prov.Failed) as e:
+                prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc)
+            self.assertIn("no ALSA card bound", str(e.exception))
 
     def test_no_speaker_link_is_no_speaker_card(self):
         with tempfile.TemporaryDirectory() as sysfs:
