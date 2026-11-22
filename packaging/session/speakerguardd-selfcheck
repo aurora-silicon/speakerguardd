@@ -960,11 +960,13 @@ def deferral_text(rec, kernel):
     """What a deferred switch test must bind before any graph starts, in the
     pending file: this self-check's own currency rule, the record version and
     every BOUND field, as the run that defers (or the run after login that
-    tests) computed them. speakerguardd-provision's activate compares a
-    record against these values; it never re-derives them."""
+    tests) computed them, and the id of the card the graph will open (a pass
+    is reused only while that card keeps its id, so a record naming another
+    card is not current either). speakerguardd-provision's activate compares
+    a record against these values; it never re-derives them."""
     vals = {"version": str(VERSION), "board": rec["board"], "kernel": kernel, "params_sha256": rec["params_sha256"],
-            "wiring": rec["wiring"], "audio": rec.get("audio", "-")}
-    return "".join(f"{k}={vals[k]}\n" for k in ("version", *BOUND))
+            "wiring": rec["wiring"], "audio": rec.get("audio", "-"), "card": rec["card"]}
+    return "".join(f"{k}={vals[k]}\n" for k in ("version", *BOUND, "card"))
 
 
 def set_deferred(path, text=None):

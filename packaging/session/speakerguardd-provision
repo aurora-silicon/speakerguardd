@@ -892,8 +892,9 @@ def publish_voicing_parameters(p, previous_voicing=False):
 def deferral_satisfied(p):
     """With the switch test pending, whether the self-check's record now
     binds exactly what the pending file says it must. speakerguardd-selfcheck
-    writes that file from its own currency rule (the record version and every
-    bound field: board, kernel, blob, wiring, audio stack) when it finds no
+    writes that file from its own currency rule (the record version, every
+    bound field: board, kernel, blob, wiring, audio stack, and the card id
+    the graph opens) when it finds no
     current pass, and the run after login rewrites it with what that run
     binds; provisioning compares and never re-derives. A file without a
     version (an older self-check's) is never satisfied, so the test runs."""

@@ -163,9 +163,10 @@ class Base(unittest.TestCase):
 
     def targets(self, **kw):
         """What a deferred switch test must bind, as speakerguardd-selfcheck's
-        deferral_text() writes it: the record version and every BOUND field."""
-        rec = dict(board="j316", wiring="w1", audio="a1", params_sha256=prov.sha256_file(self.p.params))
-        rec.update({k: v for k, v in kw.items() if k in ("board", "wiring", "audio", "params_sha256")})
+        deferral_text() writes it: the record version, every BOUND field and
+        the card id."""
+        rec = dict(board="j316", wiring="w1", audio="a1", card="AppleJ316", params_sha256=prov.sha256_file(self.p.params))
+        rec.update({k: v for k, v in kw.items() if k in ("board", "wiring", "audio", "card", "params_sha256")})
         sc = load("sc", "speakerguardd-selfcheck")
         text = sc.deferral_text(rec, kw.get("kernel", os.uname().release))
         if "version" in kw:
@@ -722,7 +723,9 @@ class Graph(Base):
         """speakerguardd-selfcheck.service's ExecStartPost activate, after a
         `run --defer` that found no current pass: the pending file names what
         the next pass must bind, and a record that differs in any of it (the
-        audio stack, the wiring derivation, the record version, the board) or
+        audio stack, the wiring derivation, the record version, the board, the
+        card id: a card that came up under another id makes the deferring run
+        name the new id while the old record still names the old one) or
         lacks a field (a 0.48 record has no "audio") is not current. No
         graph, and the file stays, so speakerguardd-switchtest runs the test.
         A pending file from an older self-check (no version) is never
@@ -731,7 +734,8 @@ class Graph(Base):
         t = self.targets()
         from unittest import mock
         for name, kw in (("audio", dict(audio="a0")), ("no audio", dict(audio=None)), ("wiring", dict(wiring="w0")),
-                         ("version", dict(version="2")), ("board", dict(board="j999")), ("failed", dict(result="fail"))):
+                         ("version", dict(version="2")), ("board", dict(board="j999")), ("card", dict(card="AppleJ316old")),
+                         ("failed", dict(result="fail"))):
             with self.subTest(stale=name):
                 self.pending(t)
                 self.bound(t, **kw)
@@ -1540,7 +1544,8 @@ class Gate(Base):
                 mock.patch.object(sc, "active", side_effect=tested):
             self.assertEqual(sc.cmd_run(args), 0)
             want = prov.read_kv(self.p.deferred)
-            self.assertEqual(set(want), {"version", *sc.BOUND})
+            self.assertEqual(set(want), {"version", *sc.BOUND, "card"})
+            self.assertEqual(want["card"], desc["card"])
             self.assertEqual((want["version"], want["board"], want["kernel"], want["wiring"], want["audio"]),
                              (str(sc.VERSION), "j999", os.uname().release, w["hash"], "a-before-login"))
             self.assertEqual(want["params_sha256"], prov.sha256_file(self.p.params))
