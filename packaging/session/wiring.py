@@ -372,6 +372,22 @@ def has_speaker_link(node):
     return False
 
 
+def card_registered(card_dir, proc="/proc/asound"):
+    """Whether ALSA has finished registering the card at `card_dir`
+    (/sys/class/sound/cardN). snd_card_register() adds the card device
+    first (the sysfs directory with its id and of_node link), then the
+    card's devices with the control device controlCN last, then publishes
+    the card for lookup by number and id, and adds the card's proc entries
+    (/proc/asound/cardN) at the very end. In between the card can be found
+    but not opened: amixer then fails as if the card had no such control,
+    and the proc PCM list is missing. Registered = controlCN in sysfs and,
+    where ALSA's proc interface exists (`proc`), /proc/asound/cardN/id."""
+    m = re.fullmatch(r"card(\d+)", os.path.basename(os.path.normpath(card_dir)))
+    if not m or not os.path.exists(os.path.join(card_dir, f"controlC{m.group(1)}")):
+        return False
+    return not os.path.isdir(proc) or os.path.exists(os.path.join(proc, f"card{m.group(1)}", "id"))
+
+
 def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
     """The hardware description of the running Mac, from its device tree:
     the apple,macaudio card that has the speaker link (the J614s/J616s/J713
@@ -750,7 +766,8 @@ def cap_amps(hw):
 def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/asound"):
     """(index, id) of the ALSA card whose device is the device tree's sound
     node: the running card's own id. None when no card is bound to it, or
-    when the bound card has no id yet (still registering)."""
+    when the bound card is still registering (card_registered): the caller
+    waits, or keeps its record."""
     want = os.path.realpath(os.path.join(dt, hw["sound"]))
     try:
         names = sorted(os.listdir(sysfs))
@@ -761,6 +778,8 @@ def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/
             continue
         of = os.path.join(sysfs, d, "device", "of_node")
         if os.path.exists(of) and os.path.realpath(of) == want:
+            if not card_registered(os.path.join(sysfs, d), proc):
+                return None
             idx = int(d[4:])
             # The id from sysfs: the attribute exists as soon as the card
             # device does. snd_card_register() adds the device (and its

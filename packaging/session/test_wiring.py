@@ -1786,6 +1786,7 @@ class Capabilities(unittest.TestCase):
         sysfs, proc = os.path.join(d, "sys"), os.path.join(d, "proc")
         os.makedirs(os.path.join(sysfs, f"card{idx}", "device"))
         os.symlink(os.path.join(dt, card_of), os.path.join(sysfs, f"card{idx}", "device", "of_node"))
+        open(os.path.join(sysfs, f"card{idx}", f"controlC{idx}"), "w").close()
         os.makedirs(os.path.join(proc, f"card{idx}"))
         with open(os.path.join(proc, f"card{idx}", "id"), "w") as fh:
             fh.write(cid + "\n")
@@ -1805,6 +1806,7 @@ class Capabilities(unittest.TestCase):
             self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
             os.makedirs(os.path.join(sysfs, "card1", "device"))
             os.symlink(os.path.join(dt, "sound"), os.path.join(sysfs, "card1", "device", "of_node"))
+            open(os.path.join(sysfs, "card1", "controlC1"), "w").close()
             os.makedirs(os.path.join(proc, "card1"))
             with open(os.path.join(proc, "card1", "id"), "w") as fh:
                 fh.write("AppleJ413Real\n")
@@ -1821,11 +1823,12 @@ class Capabilities(unittest.TestCase):
         self.assertIsNone(wiring.live_card(hw, "/nonexistent", "/nonexistent"))
 
     def test_a_card_still_registering_is_not_bound_yet(self):
-        # snd_card_register() adds the card device and its of_node link
-        # before the card's proc entries: no id yet is "not bound yet"
-        # (None), so provisioning keeps waiting and the self-check keeps its
-        # record. The sysfs id is read first; an id that exists but cannot be
-        # read refuses with its path.
+        # snd_card_register() adds the card device (its id and of_node link)
+        # first, the control device controlCN after the card's other
+        # devices, and the card's proc entries last. Until both are there
+        # the card is "not bound yet" (None): provisioning keeps waiting and
+        # the self-check keeps its record. The sysfs id is read first; an id
+        # that exists but cannot be read refuses with its path.
         import tempfile
 
         f = fx("j413")
@@ -1835,10 +1838,23 @@ class Capabilities(unittest.TestCase):
             fake_dt(dt, f["hw"])
             hw = wiring.read_dt(dt, sysfs=os.path.join(d, "none"))
             sysfs, proc = self._sysfs(d, dt, "sound", idx=1)
-            os.unlink(os.path.join(proc, "card1", "id"))
-            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
             with open(os.path.join(sysfs, "card1", "id"), "w") as fh:
                 fh.write("AppleJ413Sys\n")
+            self.assertEqual(wiring.live_card(hw, dt, sysfs, proc), (1, "AppleJ413Sys"))
+            self.assertTrue(wiring.card_registered(os.path.join(sysfs, "card1"), proc))
+            # no proc entries yet (the id in sysfs is already there)
+            os.rename(os.path.join(proc, "card1", "id"), os.path.join(d, "proc-id"))
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "card1"), proc))
+            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
+            # nor the control device: the Neo's window (speakerguardd#235)
+            os.unlink(os.path.join(sysfs, "card1", "controlC1"))
+            os.rename(os.path.join(d, "proc-id"), os.path.join(proc, "card1", "id"))
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "card1"), proc))
+            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
+            # a kernel without ALSA's proc interface: the control device decides
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "card1"), os.path.join(d, "no-proc")))
+            open(os.path.join(sysfs, "card1", "controlC1"), "w").close()
+            self.assertTrue(wiring.card_registered(os.path.join(sysfs, "card1"), os.path.join(d, "no-proc")))
             self.assertEqual(wiring.live_card(hw, dt, sysfs, proc), (1, "AppleJ413Sys"))
             os.unlink(os.path.join(sysfs, "card1", "id"))
             os.makedirs(os.path.join(sysfs, "card1", "id"))
