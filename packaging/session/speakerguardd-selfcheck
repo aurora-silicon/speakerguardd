@@ -209,16 +209,10 @@ def sha256(path):
 
 def find_card(hw, dt="/proc/device-tree"):
     """(index, id) of the ALSA card whose device is the DT sound node."""
-    want = os.path.realpath(os.path.join(dt, hw["sound"]))
-    for d in sorted(os.listdir("/sys/class/sound")):
-        if not re.fullmatch(r"card\d+", d):
-            continue
-        of = f"/sys/class/sound/{d}/device/of_node"
-        if os.path.exists(of) and os.path.realpath(of) == want:
-            idx = int(d[4:])
-            with open(f"/proc/asound/card{idx}/id") as f:
-                return idx, f.read().strip()
-    raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+    live = wiring.live_card(hw, dt)
+    if live is None:
+        raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+    return live
 
 
 def pcm_ids(idx):
@@ -1014,10 +1008,20 @@ def run_locked(args):
                    family=w["family"], key=w["key"], method=w["method"], audio=audio_of(hw))
         report["wiring"] = w
         old = read_bind(bind_path)
+        # The graph opens the card by its id (hw:CARD=): a bound pass is
+        # reused only while the card bound to the sound node still has the
+        # recorded id. A card that is not there yet (an AOP card can bind
+        # after this unit) cannot contradict it; the graph then opens the
+        # recorded id, and a card that comes up under another id is not
+        # opened (fail closed) until the next boot checks again.
+        live = wiring.live_card(hw)
+        if live is not None and old.get("card") not in (None, live[1]):
+            log(f"the speaker card is {live[1]} now, the passing record names {old.get('card')}: checking again")
         if (
             not args.force and not errs
             and old.get("result") == "pass" and old.get("version") == str(VERSION)
             and all(old.get(k) == str(rec[k]) for k in BOUND)
+            and (live is None or old.get("card") == live[1])
             # the graph is generated from the record: a bind without its
             # record (lost or removed) is checked again, not reused
             and report_matches(report_path, old)
@@ -1028,8 +1032,15 @@ def run_locked(args):
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
+        # The card is the one bound to the device tree's sound node, and its
+        # id is the card's own (wiring.cap_card): the graph opens that card,
+        # whatever name the device tree's model would suggest.
         if card != desc["card"]:
-            errs.append(f"the speaker card is {card}; macaudio names it {desc['card']} from the device tree's model")
+            log(f"the speaker card is {card} (bound to {hw['sound']}); the device tree's model suggests {desc['card']}")
+        desc = wiring.describe(hw, w, (idx, card))
+        report["machine"] = desc
+        # every capability the description rests on, with its source
+        report["caps"] = wiring.caps_report(wiring.probe(hw, (idx, card), w))
         if args.defer and w["method"] == "derived":
             if not errs:
                 # No record is written: the previous one stays (stale for
@@ -1492,7 +1503,7 @@ def cmd_generate(args):
     units = wiring.qualification(args.state, rec["board"], os.uname().release)
     gen.qualification_policy(rec["board"], units)
     m = rec["key"]
-    c = dict(c, board=rec["board"])
+    c = dict(c, board=rec["board"], aid=w.get("aid"))
     enabled = gen.runtime_voicing_enabled(rec["board"])
     bind_path = os.path.join(args.state, "provision.bind")
     bound_mode = False
@@ -1501,6 +1512,17 @@ def cmd_generate(args):
             bound_mode = any(line.strip() == "voicing_pre=true" for line in f)
     if enabled != bound_mode:
         raise SystemExit("voicing gate changed since compilation: run speakerguardd-provision again")
+    if enabled:
+        # The speaker identity selects the voicing trims: the record's must
+        # be the one of the bundle provisioning compiled the blob from.
+        try:
+            with open(os.path.join(args.state, "provision.json")) as f:
+                provisioned = json.load(f).get("aid")
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"the provisioning record cannot be read ({e}): run speakerguardd-provision again")
+        if provisioned != c["aid"]:
+            raise SystemExit(f"the self-check record names speaker identity {c['aid']!r}, the provisioned bundle "
+                             f"{provisioned!r}: run speakerguardd-provision and the self-check again")
     src = f"the self-check of {rec['board']} ({rec['kernel']})"
     for d, name, text in (
         (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src, voicing_pre=enabled)),

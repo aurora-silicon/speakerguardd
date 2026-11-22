@@ -25,10 +25,14 @@
 //! GPIO 52/53 on the J616s).  The installer records it in the bundle
 //! manifest (`speaker_id`).  Linux has no passive reader of the straps:
 //! requesting the GPIO lines could change their ownership.  The independent
-//! route is a boot-time export by m1n1 as `/chosen/asahi,speaker-id` (one
-//! big-endian u32), designed but not implemented yet; [`speaker_id`] reads
-//! it when present.  Selection order: an explicit override, the manifest,
-//! then the device tree ([`crate::tuning::Tuning::load`]).
+//! route is a boot-time export by the loader as `/chosen/asahi,speaker-id`
+//! (one big-endian u32): aura reads the straps the ADT names and exports it
+//! (`kboot_audio.c`); [`speaker_id`] reads it when present.  An explicit
+//! override wins; otherwise the manifest's and the device tree's IDs are
+//! used, either alone, and when both are present they must agree or the
+//! bundle is refused ([`crate::tuning::Tuning::load`]).  This is the strap
+//! ID, which chooses the vendor chain; the bundle's `aid` (`AID<n>`) is a
+//! different identity, and no loader exports it.
 //!
 //! The unit: SpTS is one unit's factory calibration, so a bundle copied
 //! from another Mac of the same model would pass every other check and seed
