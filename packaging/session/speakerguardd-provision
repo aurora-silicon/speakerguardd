@@ -1146,18 +1146,23 @@ def cmd_seat(args, p):
     return 0
 
 
-def helper_amps(conf, since_ns):
+# The most of the helper's report read, as the supervisor's read_report.
+HELPER_REPORT_MAX = 255
+
+
+def helper_amps(conf, since_ns, run="/run/speakerguardd"):
     """The seat user's session helper report written after `since_ns`:
     True while it says the amps are linked, False once they are not, None
-    without a fresh report (no session, or the helper is not running)."""
+    without a fresh report (no session, or the helper is not running). The
+    report is in the user's directory: read with the supervisor's rules
+    (wiring.read_user_file, at most HELPER_REPORT_MAX bytes)."""
     uid = conf.get("SGV2_UID")
     if not uid or not uid.isdigit():
         return None
-    try:
-        with open(f"/run/speakerguardd/{uid}/helper/session") as f:
-            rep = dict(w.split("=", 1) for w in f.read().split() if "=" in w)
-    except OSError:
+    text = wiring.read_user_file(os.path.join(run, uid, "helper", "session"), HELPER_REPORT_MAX)
+    if not text:
         return None
+    rep = dict(w.split("=", 1) for w in text.split() if "=" in w)
     try:
         mono = int(rep.get("mono_ns", "0"))
     except ValueError:

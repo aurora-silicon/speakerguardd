@@ -848,6 +848,45 @@ class Sleep(Base):
         self.assertIsNone(prov.helper_amps({}, 0))
         self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
 
+    def _helper_report(self):
+        d = os.path.join(self.root, "run", "1000", "helper")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "session")
+
+    def _helper_amps(self):
+        return prov.helper_amps({"SGV2_UID": "1000"}, 5, run=os.path.join(self.root, "run"))
+
+    def test_helper_amps_reads_a_regular_report(self):
+        with open(self._helper_report(), "w") as f:
+            f.write("mono_ns=10 amps=0\n")
+        self.assertIs(self._helper_amps(), False)
+
+    def test_helper_amps_read_with_the_supervisors_limits(self):
+        """Not following a link, not blocking on a FIFO, at most 255 bytes."""
+        import threading
+        path = self._helper_report()
+        good = os.path.join(self.root, "report")
+        with open(good, "w") as f:
+            f.write("mono_ns=10 amps=1\n")
+        os.symlink(good, path)
+        self.assertIsNone(self._helper_amps())
+        os.unlink(path)
+        with open(path, "w") as f:
+            f.write("mono_ns=10 amps=1" + " " * 300 + "\n")
+        self.assertIsNone(self._helper_amps())
+        os.unlink(path)
+        os.mkfifo(path)
+        out = []
+        t = threading.Thread(target=lambda: out.append(self._helper_amps()), daemon=True)
+        t.start()
+        t.join(5)
+        blocked = t.is_alive()
+        if blocked:
+            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(5)
+        self.assertFalse(blocked, "blocked opening a FIFO report")
+        self.assertEqual(out, [None])
+
     def _pcm(self, card, name, first):
         d = os.path.join(self.p.proc_asound, card, name, "sub0")
         os.makedirs(d, exist_ok=True)
@@ -1194,6 +1233,8 @@ class LV2Shadow(unittest.TestCase):
 
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
+
+
 
 class Umask(Base):
     def test_graph_dirs_are_readable_whatever_the_callers_umask(self):

@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -206,6 +207,34 @@ def _strs(raw):
 def _read(path):
     with open(path, "rb") as f:
         return f.read()
+
+
+def read_user_file(path, cap):
+    """A file in a directory a user owns, read as root with the supervisor's
+    rules for the helper report (read_report): opened without following a
+    final link and without blocking, a regular file only, at most `cap`
+    bytes. None for anything else (missing, a link, a FIFO, a device, a
+    directory, longer than `cap`): the caller treats it as not readable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = b""
+        while len(data) <= cap:
+            chunk = os.read(fd, cap + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > cap:
+        return None
+    return data.decode(errors="replace")
 
 
 def _phandles(root):
