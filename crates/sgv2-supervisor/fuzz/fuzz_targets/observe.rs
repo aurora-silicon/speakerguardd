@@ -46,16 +46,22 @@ fn run(u: &mut Unstructured) -> Result<()> {
     let mut lease = Lease::default();
     let mut regrant = Regrant::default();
     let mut now = u.int_in_range(1..=u64::from(u32::MAX))?;
+    const CLOCK_MAX: u64 = 1 << 62;
     let mut e =
         EngineState { valid: true, pid: PID, params_crc: CRC, min_gain_bits: 1f32.to_bits(), ..Default::default() };
     let mut clean_run = 0u32;
     for _ in 0..u.int_in_range(1..=64u8)? {
-        now = now.saturating_add(match u.int_in_range(0..=7u8)? {
-            0 => 0,
-            1 => u.int_in_range(0..=1_000_000_000u64)?,
-            2 => u64::MAX / 2,
-            _ => tick,
-        });
+        now = now
+            .saturating_add(match u.int_in_range(0..=7u8)? {
+                0 => 0,
+                1 => u.int_in_range(0..=1_000_000_000u64)?,
+                // a long gap (a monotonic clock in ns runs for centuries, so
+                // the model keeps it below 2^62: the observer may add its
+                // bounds to it)
+                2 => 1 << 40,
+                _ => tick,
+            })
+            .min(CLOCK_MAX);
         // the page: mostly a steady plugin, now and then anything
         if u.ratio(1, 8)? {
             e = EngineState {

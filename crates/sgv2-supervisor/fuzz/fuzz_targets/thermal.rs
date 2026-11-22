@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use sgv2_core::blob::{self, Header};
-use sgv2_core::UnitKind;
+use sgv2_core::{UnitKind, MAX_CHANNELS};
 use sgv2_supervisor::thermal::{parse_boot_id, trusted, Persisted, FILE_LEN, MAX_AGE_NS};
 
 fn header(unit: u32, channels: u32, rate: u32, crc: u32) -> Header {
@@ -36,7 +36,12 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(p.encode(), file, "decode is not the inverse of encode");
     let kinds = [UnitKind::Spp3 as u32, UnitKind::Lsm2 as u32, UnitKind::Atsp as u32, p.record.kind];
     let kind = kinds[(mode >> 1) as usize % kinds.len()];
-    let channels = if mode & 0x10 != 0 { p.record.channels } else { 1 + (mode as u32 >> 5) };
+    // a header `Header::parse` admits: 1 to MAX_CHANNELS channels
+    let channels = if mode & 0x10 != 0 && (1..=MAX_CHANNELS as u32).contains(&p.record.channels) {
+        p.record.channels
+    } else {
+        1 + (mode as u32 >> 5)
+    };
     let h = header(kind, channels, p.record.sample_rate, p.params_crc);
     let now = p.stamp_boottime_ns.saturating_add(u64::from(mode) * MAX_AGE_NS / 128);
     if p.refusal(&p.boot_id, &p.board, &h, now).is_none() {
