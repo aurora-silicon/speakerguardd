@@ -69,6 +69,7 @@ struct Args {
     prestage: compile::PreStageMode,
     attestations: Option<PathBuf>,
     key_only: bool,
+    buzzkill_matrix: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -79,7 +80,8 @@ fn usage() -> ! {
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
          aurora-speaker-tuning voicing-check [--json] [--key-only] [--attestations FILE] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
-         aurora-speaker-tuning units [--json]\n       aurora-speaker-tuning plist FILE"
+         aurora-speaker-tuning units [--json]\n       \
+         (with --tunings-root, --buzzkill-matrix FILE supplies the BuzzKill matrix a raw tree lacks; a bundle carries its own)\n       aurora-speaker-tuning plist FILE"
     );
     exit(2)
 }
@@ -115,12 +117,14 @@ fn parse_args() -> Args {
         prestage: compile::PreStageMode::default(),
         attestations: None,
         key_only: false,
+        buzzkill_matrix: None,
     };
     while let Some(x) = it.next() {
         match x.as_str() {
             "--json" => a.json = true,
             "--speaker-id" => a.speaker_id = Some(it.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--tunings-root" => a.tunings_root = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
+            "--buzzkill-matrix" => a.buzzkill_matrix = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             "--aid" => {
                 a.aid =
                     Some(it.next().and_then(|v| v.trim_start_matches("AID").parse().ok()).unwrap_or_else(|| usage()))
@@ -448,6 +452,21 @@ fn identify(bundle: aurora_speaker_tuning::Result<Bundle>, json: bool) {
     }
 }
 
+/// The BuzzKill matrix for a raw tuning tree, which has no installer
+/// record: only from an explicit `--buzzkill-matrix FILE`. A bundle is
+/// compiled from its own record alone.
+fn buzzkill_override(a: &Args) -> Option<aurora_speaker_tuning::buzzmatrix::Matrix> {
+    let path = a.buzzkill_matrix.as_ref()?;
+    if a.tunings_root.is_none() {
+        eprintln!("--buzzkill-matrix is for raw tuning trees (--tunings-root); a bundle carries its own matrix");
+        exit(2)
+    }
+    aurora_speaker_tuning::buzzmatrix::read(path).map(Some).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        exit(1)
+    })
+}
+
 fn main() {
     let a = parse_args();
     match a.cmd.as_str() {
@@ -527,7 +546,7 @@ fn main() {
     } else {
         None
     };
-    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id };
+    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id, buzzkill_matrix: buzzkill_override(&a) };
     let result = bundle.and_then(|b| Tuning::load(&b, &opts, &mut diags));
     match result {
         Ok(t) => {
@@ -616,7 +635,7 @@ fn voicing_check(bundle: aurora_speaker_tuning::Result<Bundle>, a: &Args) -> ! {
     } else {
         None
     };
-    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id };
+    let opts = Options { speaker_id: a.speaker_id, device_tree_speaker_id, buzzkill_matrix: buzzkill_override(a) };
     let mut t = match bundle.and_then(|b| Tuning::load(&b, &opts, &mut diags)) {
         Ok(t) => t,
         Err(e) => {

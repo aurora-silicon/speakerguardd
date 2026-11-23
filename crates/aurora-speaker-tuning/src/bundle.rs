@@ -284,6 +284,7 @@ impl Bundle {
             mask_lattice: None,
             param_fill: None,
             param_fill_unit_versions: Vec::new(),
+            buzzkill_quadrature: None,
         };
         Ok(Bundle { manifest, files, source: root.to_owned(), verified: false, unlisted: Vec::new() })
     }
@@ -344,5 +345,10 @@ impl Bundle {
     /// The lsm2 masker lattice's bytes, when the manifest lists it.
     pub fn mask_lattice(&self) -> Option<&[u8]> {
         self.manifest.mask_lattice.as_ref().and_then(|r| self.file(&r.path))
+    }
+
+    /// The BuzzKill quadrature matrix's bytes, when the manifest lists it.
+    pub fn buzzkill_quadrature(&self) -> Option<&[u8]> {
+        self.manifest.buzzkill_quadrature.as_ref().and_then(|r| self.file(&r.path))
     }
 }

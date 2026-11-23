@@ -99,6 +99,10 @@ def tool(bin_dir, name):
 
 
 BUILD_ENV = {}
+# Raw tuning trees carry no BuzzKill matrix record: the rig supplies one
+# (SGV2_BUZZKILL_MATRIX) to the examples by environment and to the tuning
+# tool by its explicit developer option.
+MATRIX = ["--buzzkill-matrix", os.environ["SGV2_BUZZKILL_MATRIX"]] if os.environ.get("SGV2_BUZZKILL_MATRIX") else []
 
 
 def run_json(cmd):
@@ -121,7 +125,7 @@ def variants(a):
     for aid in aids:
         tree = next(t for t in trees if os.path.isdir(os.path.join(t, f"AID{aid}")))
         base = ["--tunings-root", tree, "--aid", str(aid)]
-        rc, dump = run_json([tool(a.bin, "aurora-speaker-tuning"), "dump", "--json"] + base)
+        rc, dump = run_json([tool(a.bin, "aurora-speaker-tuning"), "dump", "--json"] + MATRIX + base)
         sel = (dump.get("tuning") or {}).get("selection") or {}
         # the speaker IDs the database's general configurations name, and the default
         spids = [None] + sorted({c.get("speaker_id") for c in sel.get("all", [])
@@ -129,7 +133,7 @@ def variants(a):
         seen = {}
         for spid in spids:
             extra = [] if spid is None else ["--speaker-id", str(spid)]
-            rc, k = run_json([tool(a.bin, "aurora-speaker-tuning"), "voicing-check", "--key-only"] + base + extra)
+            rc, k = run_json([tool(a.bin, "aurora-speaker-tuning"), "voicing-check", "--key-only"] + MATRIX + base + extra)
             if rc or "key" not in k:
                 out.append({"aid": aid, "speaker_id": spid, "tree": tree, "key": None,
                             "error": k.get("error", "no key")})
@@ -138,7 +142,7 @@ def variants(a):
             if k["key"] in seen:
                 seen[k["key"]]["also_speaker_ids"].append(spid)
                 continue
-            rc, d = run_json([tool(a.bin, "aurora-speaker-tuning"), "dump", "--json"] + base + extra)
+            rc, d = run_json([tool(a.bin, "aurora-speaker-tuning"), "dump", "--json"] + MATRIX + base + extra)
             s = (d.get("tuning") or {}).get("selection") or {}
             v = {"aid": aid, "speaker_id": spid, "also_speaker_ids": [], "tree": tree, "key": k["key"],
                  "strip": os.path.basename(s.get("strip") or ""),
@@ -374,7 +378,7 @@ def gate_one(a, v, segs, np):
         return e, None
     extra = [] if v["speaker_id"] is None else ["--speaker-id", str(v["speaker_id"])]
     root = ["--tunings-root", v["tree"], "--aid", str(v["aid"])]
-    rc, chk = run_json([tool(a.bin, "aurora-speaker-tuning"), "voicing-check", "--json"] + root + extra)
+    rc, chk = run_json([tool(a.bin, "aurora-speaker-tuning"), "voicing-check", "--json"] + MATRIX + root + extra)
     if chk.get("key") != v["key"]:
         e["reason"] = "the tuning key changed between steps"
         return e, None

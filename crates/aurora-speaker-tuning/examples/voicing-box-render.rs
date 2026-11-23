@@ -82,6 +82,12 @@ pub(crate) fn tone_spec(
     })
 }
 
+/// The rig's BuzzKill matrix (`SGV2_BUZZKILL_MATRIX`): raw tuning trees have
+/// no installer bundle to carry it.
+fn buzzkill_override() -> Option<aurora_speaker_tuning::buzzmatrix::Matrix> {
+    aurora_speaker_tuning::buzzmatrix::from_env().unwrap_or_else(|e| die(e))
+}
+
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("voicing-box-render: {msg}");
     exit(1)
@@ -224,7 +230,8 @@ fn main() {
     } else {
         let (Some(root), Some(aid)) = (root, aid) else { die("give --strip FILE or --tunings-root DIR --aid N") };
         let bundle = Bundle::from_tunings_root(&root, aid).unwrap_or_else(|e| die(format!("{e:?}")));
-        let t = Tuning::load(&bundle, &Options::default(), &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
+        let opts = Options { buzzkill_matrix: buzzkill_override(), ..Options::default() };
+        let t = Tuning::load(&bundle, &opts, &mut diags).unwrap_or_else(|e| die(format!("{e:?}")));
         let stage = t.chain.iter().find(|s| s.name == name).cloned().unwrap_or_else(|| die(format!("no box {name}")));
         if stage.channels.is_some_and(|width| width as usize != ch) {
             die("--ch does not match the graph box width")
@@ -423,7 +430,11 @@ fn main() {
                 "ldnm" => kind!(norm, Norm),
                 "pchr" => kind!(pchr, Pchr),
                 "volt" => kind!(volt, Volt),
-                "buzk" => kind!(buzz, Buzz),
+                "buzk" => match voicing::buzz::compile(stage, buzzkill_override().as_ref(), fs, &mut diags) {
+                    Ok(Some(p)) => Kind::Buzz(Box::new(p)),
+                    Ok(None) => Kind::Bypass,
+                    Err(e) => die(e),
+                },
                 _ => unreachable!(),
             };
             let spec = Spec {
