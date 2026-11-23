@@ -273,8 +273,10 @@ fn via_reference(macos_build: Option<&str>, block: &str) -> String {
     }
 }
 
+/// The first 12 characters, for a message: a law or a key from the
+/// attestation file is text, not necessarily the hex it should be.
 fn short(s: &str) -> &str {
-    &s[..s.len().min(12)]
+    s.char_indices().nth(12).map_or(s, |(i, _)| &s[..i])
 }
 
 // ---------------------------------------------------------------- invariants
@@ -654,6 +656,18 @@ mod tests {
         assert!(attested(&att(LAW, "refused"), b, "k1").unwrap_err().contains("+4.35 dB louder"));
         // stale: the rendering code changed after the gate ran
         assert!(attested(&att("0000", "pass"), b, "k1").unwrap_err().contains("other rendering code"));
+    }
+
+    #[test]
+    fn a_law_or_key_that_is_not_hex_is_refused_without_a_panic() {
+        // a multi-byte character across the 12 bytes the message quotes
+        let odd = "0123456789a\u{e9}f";
+        let e = attested(&att(odd, "pass"), Some("25G83"), "k1").unwrap_err();
+        assert!(e.contains("other rendering code") && e.contains("law 0123456789a\u{e9} vs"), "{e}");
+        let e = attested(&att(LAW, "pass"), Some("25G83"), odd).unwrap_err();
+        assert!(e.contains("(key 0123456789a\u{e9})"), "{e}");
+        assert_eq!(short("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short("k1"), "k1");
     }
 
     #[test]
