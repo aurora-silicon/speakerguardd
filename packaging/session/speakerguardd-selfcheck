@@ -706,7 +706,10 @@ def check_sense(ctl, idx, card, devs, w, runs, widths=None):
     names = {}
     for a in amps:
         for kind in ("V", "I"):
-            names[(a["prefix"], kind)] = f"{a['prefix']} {kind}SENSE Switch"
+            # The amp's own control prefix: none on a lone desktop amp
+            # (wiring.derive labels it "Speaker", ALSA does not).
+            ctl_prefix = a.get("control_prefix", a["prefix"])
+            names[(a["prefix"], kind)] = f"{ctl_prefix} {kind}SENSE Switch".lstrip()
     saved = {}
     for nm in names.values():
         v = switch_get(card, nm)
