@@ -41,6 +41,16 @@ struct Candidate {
 // gain of two puts lines in the amplitude domain the saved thresholds use.
 const ANALYSIS_GAIN: f32 = 2.0;
 
+/// The transform cells a decision reads: counting cell k as the band from
+/// k to k+1 cell widths, those that end at or below the operation limit.
+/// (Matches the installed unit on the parity gate: a 2500 Hz line in the
+/// 2500 Hz band moves no track there, while the cell rounded to the nearest
+/// centre would read it, a little low, through the first-difference
+/// refinement.)
+fn analysed_cells(maximum_hz: f64) -> usize {
+    (libm::floor(maximum_hz * FFT as f64 / ANALYSIS_RATE) as usize).min(FFT / 2)
+}
+
 fn analysis_lowpass(frequency_hz: f64, fs: f64) -> Section {
     let k = libm::tan(core::f64::consts::PI * frequency_hz / fs);
     let norm = 1.0 / (1.0 + core::f64::consts::SQRT_2 * k + k * k);
@@ -447,9 +457,9 @@ impl Run {
             self.tracks[i].gain += self.release * (1.0 - self.tracks[i].gain);
             self.redesign(i);
         }
-        // The transformed program uses integer DFT cells. Keep the upper edge
-        // strict and retain one extra cell for candidate neighbour work.
-        let bin_count = (libm::ceil(self.maximum_hz * FFT as f64 / ANALYSIS_RATE - 0.5) as usize).min(FFT / 2);
+        // The transformed program uses integer DFT cells; retain one extra
+        // cell for candidate neighbour work.
+        let bin_count = analysed_cells(self.maximum_hz);
         let max_bin = bin_count.saturating_sub(1);
         let mut amplitudes = [0.0; FFT / 2 + 1];
         let mut frequencies = [0.0; FFT / 2 + 1];
@@ -653,6 +663,20 @@ mod tests {
         r.process(&mut [&mut x], 96_000);
         let deep = r.tracks.iter().filter(|t| t.gain < 0.5 && (t.frequency_hz - 996.09375).abs() < 50.0).count();
         assert_eq!(deep, 1);
+    }
+
+    #[test]
+    fn only_cells_that_end_below_the_operation_limit_are_analysed() {
+        let width = ANALYSIS_RATE / FFT as f64;
+        for limit in MAX_HZ {
+            let n = analysed_cells(limit.min(0.49 * 48_000.0));
+            // Cell k spans k..k+1 widths: every analysed cell ends at or
+            // below the limit, and the next one would not.
+            assert!((n as f64) * width <= limit);
+            assert!(n == FFT / 2 || ((n + 1) as f64) * width > limit);
+        }
+        // 2500 Hz is 106.7 widths: cells 0..=105.
+        assert_eq!(analysed_cells(MAX_HZ[0]), 106);
     }
 
     #[test]
