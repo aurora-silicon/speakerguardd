@@ -464,7 +464,14 @@ mod tests {
         put("formats", "5-config-xml", &[&[5u8][..], cfg.as_bytes()].concat());
         put("formats", "3-lattice", &[&[3u8][..], &lattice_bytes(&synthetic_lattice_ends())[..]].concat());
         put("formats", "6-compatible", b"\x06apple,j413\0apple,t8103\0");
-        put("formats", "7-build", b"\x0725G83");
+        put("formats", "8-build", b"\x0825G83");
+        let law = aurora_speaker_tuning::voicing::parity::LAW;
+        let parity = format!(
+            "\x0725G83\0k1\0{{\"format\":2,\"law\":\"{law}\",\"tolerance\":{{\"louder_db\":0.25,\"quieter_db\":1.0}},\
+             \"releases\":[{{\"build\":\"25G83\",\"reference\":\"r\",\"sliders\":[0.5],\"entries\":[{{\"key\":\"k1\",\
+             \"verdict\":\"pass\",\"sliders\":[{{\"slider\":0.5,\"verdict\":\"pass\"}}]}}]}}]}}"
+        );
+        put("formats", "7-parity", parity.as_bytes());
         // the pipeline: empty input is the unmutated bundle of each family
         for k in 0..3u8 {
             put("tuning", &format!("family-{k}"), &[k]);

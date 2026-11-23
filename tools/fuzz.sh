@@ -18,11 +18,13 @@ shift 2
 root=$(git rev-parse --show-toplevel)
 export RUSTC_BOOTSTRAP=1
 args=${FUZZ_ARGS:--rss_limit_mb=1024}
-# crate, the cargo-fuzz build flags, and its targets. The tuning pipeline
-# and the parsers have no unsafe code of their own, so they run without a
-# sanitizer (several times faster); `observe` checks arithmetic overflow.
+# crate, the cargo-fuzz build flags, and its targets. The tuning pipeline,
+# its parsers, spp3 and atsp have no unsafe code of their own, so they run
+# without a sanitizer (several times faster); `observe` checks arithmetic
+# overflow.
 plan=(
-  "sgv2-core|-O|blob spp3 atsp lsm2 handoff"
+  "sgv2-core|-O|blob lsm2 handoff voicing"
+  "sgv2-core|-O -s none|spp3 atsp"
   "sgv2-supervisor|-O|selfcheck thermal procfs blobcheck"
   "sgv2-supervisor|-O -a|observe"
   "aurora-speaker-tuning|-O -s none|tuning plist aupreset dspg formats"

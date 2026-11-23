@@ -1,23 +1,27 @@
 //! The bundle's smaller formats: the SpTS factory calibration, the
 //! installer's and the collector's manifests, the lsm2 masker lattice,
-//! `.austrip`/`.propstrip`, the spp3 sidecar, the device configuration's speaker volume range
-//! and the machine identity readers. Nothing may panic; a calibration
-//! record that decodes is physical (finite, a positive resistance), a
-//! manifest names only admissible paths inside the bundle, and a volume
-//! range that yields a curve never adds drive.
+//! `.austrip`/`.propstrip`, the spp3 sidecar, the device configuration's speaker volume range,
+//! the machine identity readers and the macOS parity attestations. Nothing
+//! may panic; a calibration record that decodes is physical (finite, a
+//! positive resistance), a manifest names only admissible paths inside the
+//! bundle, a volume range that yields a curve never adds drive, and an
+//! attestation only answers for this code's law, the build and the key
+//! asked for, with a passing verdict at every slider its release was gated
+//! at.
 #![no_main]
 
 use aurora_speaker_tuning::hal_volume::{range_from_config, VolumeRange};
 use aurora_speaker_tuning::manifest::{admitted, Manifest};
 use aurora_speaker_tuning::spp3::Sidecar;
 use aurora_speaker_tuning::strip::{AuStrip, PropStrip};
+use aurora_speaker_tuning::voicing::parity::{attested, Attestations, LAW};
 use aurora_speaker_tuning::{lattice, machine, spts, versions, Diagnostics};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else { return };
     let mut d = Diagnostics::default();
-    match sel % 8 {
+    match sel % 9 {
         0 => {
             if let Ok(s) = spts::decode(rest, "fuzz", &mut d) {
                 for r in &s.records {
@@ -28,7 +32,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         1 | 2 => {
-            let m = if sel % 8 == 1 { Manifest::parse(rest) } else { Manifest::parse_collector(rest) };
+            let m = if sel % 9 == 1 { Manifest::parse(rest) } else { Manifest::parse_collector(rest) };
             if let Ok(m) = m {
                 for r in m.records() {
                     assert!(admitted(&r.path), "inadmissible path {:?}", r.path);
@@ -70,6 +74,22 @@ fuzz_target!(|data: &[u8]| {
             }
             if let Some(b) = machine::board_from_target_type(&String::from_utf8_lossy(rest)) {
                 assert!(machine::valid_board(&b), "{b:?}");
+            }
+        }
+        7 => {
+            // a build and a key (NUL-terminated), then the attestation file
+            let mut parts = rest.splitn(3, |&b| b == 0);
+            let build = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+            let key = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+            if let Ok(a) = Attestations::parse(parts.next().unwrap_or_default()) {
+                let _ = attested(&a, None, &key);
+                if let Ok((r, e)) = attested(&a, Some(&build), &key) {
+                    assert!(a.law == LAW && r.build == build && e.key == key && e.verdict == "pass");
+                    for s in &r.sliders {
+                        let pass = e.sliders.iter().any(|v| (v.slider - s).abs() < 1e-9 && v.verdict == "pass");
+                        assert!(pass, "attested without a pass at slider {s}");
+                    }
+                }
             }
         }
         _ => {
