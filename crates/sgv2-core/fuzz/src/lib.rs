@@ -5,7 +5,10 @@
 //!
 //! Targets: `blob` (property 5, through every `from_blob` and
 //! `sgv2_lv2::load_unit`), `spp3`, `atsp` and `lsm2` (properties 1-4, 6, 7
-//! under fuzzed parameter words, audio, host slicing and sense). Run from
+//! under fuzzed parameter words, audio, host slicing and sense), `handoff`
+//! (a thermal hand-off record from outside the process into
+//! `sgv2_lv2::start_stream`) and `voicing` (the blob's pre-stage and voicing
+//! artifact, through both plugins' loaders and their processing). Run from
 //! `crates/sgv2-core` with cargo-fuzz; a stable toolchain works with
 //! `RUSTC_BOOTSTRAP=1` (cargo-fuzz passes `-Zsanitizer`):
 //!
@@ -27,9 +30,10 @@
 //!   (or 0) before spp3 is built;
 //! - FINDING 5: the `FailSafe` unit is only probed with finite input;
 //! - FINDING 6: spp3/atsp slice invariance is only checked on finite input;
+//!   atsp's is checked within one slicing family (SPEC-ATSP 11.3), as
+//!   `tests/adversarial.rs` does;
 //! - FINDING 9: spp3 thermal time constants are raised to at least one
 //!   update after mutation;
-//! - FINDING 11: atsp host-block mode is fed calls of 64 frames or more.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -300,7 +304,15 @@ pub fn check_bound_pilot(x: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain:
             assert!(o.is_finite(), "{what}: non-finite output {o} at ch{c}[{k}]");
             let i = if k >= latency { xi[k - latency] } else { 0.0 };
             let prog = if i.is_finite() { (i * gain).abs() } else { 0.0 };
-            let lim = if pilot > 0.0 { ((prog + pilot) * (1.0 + 1e-6)).min(1.0) } else { prog };
+            // above unity (atsp's dezipper peak) the output is still held
+            // to full scale
+            let lim = if pilot > 0.0 {
+                ((prog + pilot) * (1.0 + 1e-6)).min(1.0)
+            } else if gain > 1.0 {
+                prog.min(1.0)
+            } else {
+                prog
+            };
             assert!(o.abs() <= lim, "{what}: |out| {o:e} > {lim:e} (in {i:e}, pilot {pilot}) at ch{c}[{k}]");
         }
     }
@@ -317,6 +329,35 @@ pub fn spp3_pilot(p: &sgv2_core::spp3::Params) -> f32 {
     }
 }
 
+/// Property 1's gain for a protecting atsp unit: its output dezipper's own
+/// trajectory passes, as the reference's, so the gain is bounded by
+/// `gain_peak` at the unit's rate (as in `tests/adversarial.rs`), not by
+/// unity. The peak is a long filter run, so it is kept per rate.
+pub fn atsp_peak(unit: &sgv2_core::atsp::Unit) -> f32 {
+    let rate = unit.params().sample_rate;
+    thread_local!(static PEAKS: std::cell::RefCell<Vec<(u32, f32)>> = const { std::cell::RefCell::new(Vec::new()) });
+    PEAKS.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(&(_, g)) = p.iter().find(|e| e.0 == rate) {
+            return g;
+        }
+        let g = unit.gain_peak();
+        // a fuzzed rate word is any u32: keep the table small
+        if p.len() < 64 {
+            p.push((rate, g));
+        }
+        g
+    })
+}
+
+/// The allowance over property 1 an lsm2 unit takes: it is a five-band
+/// limiter (an output sample mixes hundreds of input samples with per-band
+/// gains, and its resonator compensation runs ahead of the limiter), so it
+/// is bounded by digital full scale, not by the one input sample at its
+/// delay, as in `tests/adversarial.rs`. Passed as a pilot allowance of full
+/// scale to [`check_bound_pilot`].
+pub const LSM2_ALLOWANCE: f32 = 1.0;
+
 /// Property 6: `y` is nowhere louder than `reference`.
 pub fn check_not_louder(y: &[Vec<f32>], reference: &[Vec<f32>], what: &str) {
     for (c, (a, b)) in y.iter().zip(reference).enumerate() {
@@ -326,45 +367,105 @@ pub fn check_not_louder(y: &[Vec<f32>], reference: &[Vec<f32>], what: &str) {
     }
 }
 
-/// Property 4, used from `render`'s `each` with one block per call: after a
-/// block boundary at which a channel's coil was past its hard limit, every
-/// channel of its group leaves the next block at least 20 dB down.
+/// Property 4 for atsp, used from `render`'s `each` with equal calls of at
+/// most one controller tick (as `check_hard_path` in `tests/adversarial.rs`):
+/// the panic is a target step through the output dezipper, so once a group
+/// has been past its hard limit at every call boundary for `settle` frames,
+/// its channels leave at most `bound` times the input for as long as it
+/// stays past it.
 pub struct HardPath<'a> {
     pub x: &'a [Vec<f32>],
     /// Per host channel: (group, hard limit).
     pub chans: Vec<(usize, f64)>,
-    pub armed: Vec<usize>,
+    /// Per group past its hard limit: the frame it has been so from.
+    pub hot_since: Vec<(usize, usize)>,
+    pub settle: usize,
+    pub bound: f32,
     pub last: usize,
     pub hits: usize,
 }
 
-impl HardPath<'_> {
+impl<'a> HardPath<'a> {
+    /// atsp's glide at `rate`: the panic target is scheduled at the first
+    /// tick after the coil is seen hot and the dezipper glides to within
+    /// 3 % of the 20 dB target well inside 60 ms.
+    pub fn atsp(x: &'a [Vec<f32>], chans: Vec<(usize, f64)>, rate: u32) -> Self {
+        let settle = (0.06 * rate as f64) as usize;
+        HardPath { x, chans, hot_since: Vec::new(), settle, bound: FAILSAFE_GAIN * 1.03, last: 0, hits: 0 }
+    }
+
     pub fn step(&mut self, done: usize, t: &Telemetry, out: &[Vec<f32>]) {
+        // the call just rendered was decided at the previous boundary
+        let mut any = false;
         for (c, &(g, _)) in self.chans.iter().enumerate() {
-            if !self.armed.contains(&g) {
-                continue;
-            }
-            let block = self.x[c][self.last..done].iter().zip(&out[c][self.last..done]);
-            for (k, (&i, &o)) in block.enumerate() {
-                let lim = if i.is_finite() { (i * FAILSAFE_GAIN).abs() } else { 0.0 };
-                let k = self.last + k;
-                assert!(o.abs() <= lim, "hard path missed: ch{c}[{k}] {o} from {i} (group {g})");
+            let Some(&(_, since)) = self.hot_since.iter().find(|h| h.0 == g) else { continue };
+            any = true;
+            let from = since.saturating_add(self.settle).max(self.last).min(done);
+            for (k, (&i, &o)) in self.x[c][from..done].iter().zip(&out[c][from..done]).enumerate() {
+                let k = from + k;
+                let lim = if i.is_finite() { (i * self.bound).abs() } else { 0.0 };
+                assert!(o.abs() <= lim, "hard path missed: ch{c}[{k}] {o} from {i} (group {g} over its hard limit)");
             }
         }
-        if !self.armed.is_empty() {
+        if any {
             self.hits += 1;
         }
-        self.armed.clear();
+        let mut hot: Vec<usize> = Vec::new();
         for (c, &(g, limit)) in self.chans.iter().enumerate() {
             let temp = t.channels[c].coil_temp_c as f64;
             // f32 telemetry: skip boundaries the rounding could decide either
             // way, and temperatures beyond f32 range
-            if temp.is_finite() && temp > limit + 1e-4 * limit.abs().max(1.0) && !self.armed.contains(&g) {
-                self.armed.push(g);
+            if temp.is_finite() && temp > limit + 1e-4 * limit.abs().max(1.0) && !hot.contains(&g) {
+                hot.push(g);
+            }
+        }
+        self.hot_since.retain(|h| hot.contains(&h.0));
+        for g in hot {
+            if !self.hot_since.iter().any(|h| h.0 == g) {
+                self.hot_since.push((g, done));
             }
         }
         self.last = done;
     }
+}
+
+/// Host slicings of one atsp family (SPEC-ATSP 11.3), whose output is the
+/// same bit for bit, as `atsp_family_slices` in `tests/adversarial.rs`:
+/// whole multiples of the fragment (`staged`), or calls of 2 frames up to
+/// one tick; one channel groups each call by eight (SPEC-ATSP 11.4), so its
+/// small family is whole groups of eight up to one tick.
+pub fn atsp_family_slices(u: &mut Unstructured, win: usize, staged: bool, mono: bool) -> Result<Vec<usize>> {
+    use sgv2_core::atsp::FRAGMENT;
+    let small = win.min(FRAGMENT);
+    let staged = staged || small < 2 || (mono && small < 8);
+    let k = u.int_in_range(1..=32usize)?;
+    let mut v = Vec::with_capacity(k);
+    for _ in 0..k {
+        v.push(if staged {
+            FRAGMENT * u.int_in_range(1..=8usize)?
+        } else if mono {
+            8 * u.int_in_range(1..=small / 8)?
+        } else {
+            u.int_in_range(2..=small)?
+        });
+    }
+    Ok(v)
+}
+
+/// Whether slicing `x`'s `len` frames by `cuts` ends on a one-frame call
+/// (the input running out): atsp's one-frame dezipper path, a family of
+/// its own.
+pub fn ends_on_one(cuts: &[usize], len: usize) -> bool {
+    let (mut done, mut k) = (0, 0);
+    while done < len {
+        let m = cuts[k % cuts.len()].min(len - done);
+        if done + m == len {
+            return m == 1;
+        }
+        done += m;
+        k += 1;
+    }
+    false
 }
 
 pub fn tele_bits(t: &Telemetry) -> Vec<u64> {
@@ -543,6 +644,7 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
         attack_time_ms: 2.0,
         fast_release_time_ms: 150.0,
         slow_release_time_ms: 10_000.0,
+        low_band_release_time_ms: 150.0,
         filterbank_latency_ms: 2.0,
         speaker_response_lookahead_ms: 4.0 / 3.0,
         power_time_scale_s: [0.002, 0.2, 2.0, 30.0],
@@ -563,10 +665,16 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
             mms_kg: 0.0002,
             rms: 0.2,
             kms: 1500.0,
+            disp_rdc: 4.0,
             disp_bl: 0.8,
             disp_mms_kg: 0.00022,
             disp_rms: 0.25,
             disp_kms: 1600.0,
+            vel_rdc: 4.0,
+            vel_bl: 0.8,
+            vel_mms_kg: 0.0002,
+            vel_rms: 0.2,
+            vel_kms: 1500.0,
             rth_vc: 30.0,
             tau_vc: 2.0,
             rth_mag: 20.0,
@@ -574,12 +682,22 @@ pub fn lsm2_base(n: usize, rate: u32) -> sgv2_core::lsm2::Params {
             ambient: 40.0,
             amplitude_limit: 1.0,
             displacement_limit: 0.0005,
-            velocity_limit0: 0.5,
+            velocity_limit: [0.5, 0.6, 0.9],
+            mask_energy_db: [0.0, 10.0, 20.0, 30.0],
+            mask_band_hz: [8000.0, 12000.0],
+            mask_attack_s: 0.01,
+            mask_release_s: 0.1,
+            mask_attack_fast_s: 0.005,
+            mask_attack_range_db: 70.0,
             max_velocity_attenuation_db: 18.0,
+            velocity_ignore_low_band: 1,
+            velocity_ignore_high_band: 1,
             temperature_soft_limit: 110.0,
             temperature_hard_limit: 125.0,
             temperature_headroom: 4.0,
             max_temperature_attenuation_db: 10.0,
+            band_center_hz: [60.0, 300.0, 650.0, 1600.0, 5000.0],
+            ..ChannelParams::default()
         };
     }
     p
@@ -1052,6 +1170,48 @@ impl Spp3HardOracle {
         }
         for (ci, c) in self.ch.iter().enumerate() {
             self.unit_sel_prev[c.group] = unit_cs[ci][1];
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/voicing_fixture/mod.rs"]
+mod voicing_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `voicing` target's bases load: every variant's artifact on the
+    /// voicing plugin, and an identity pre-stage on the protect plugin.
+    #[test]
+    fn every_voicing_base_loads() {
+        for lanes in [1usize, 2, 4, 6] {
+            let base = voicing_fixture::unit("j413", lanes);
+            let spec = voicing_fixture::spec(lanes);
+            let joined = sgv2_core::blob::with_voicing(&base, &spec).unwrap_or_else(|e| panic!("{lanes}: {e:?}"));
+            assert!(sgv2_lv2::voicing::Voicing::load(Some(&joined), "j413", 48_000.0, lanes).ready(), "{lanes}");
+        }
+    }
+
+    /// The mutation bases must start valid, or every mutation explores only
+    /// the refusal path (the lsm2 base drifted out of step with the unit's
+    /// parameters once already).
+    #[test]
+    fn every_base_is_a_valid_unit() {
+        for n in 1..=8 {
+            for rate in [44_100, 48_000, 96_000] {
+                if rate == 48_000 {
+                    // lsm2's controller cadence fixes its latency per rate:
+                    // the base is made for 48 kHz, as the unit's own tests
+                    assert_eq!(sgv2_core::lsm2::Unit::init_error(&lsm2_base(n, rate)), None, "lsm2 {n} ch");
+                }
+                assert_eq!(sgv2_core::atsp::Unit::init_error(&atsp_base(n, 512, rate)), None, "atsp {n} ch {rate} Hz");
+                for cl in [false, true] {
+                    let p = spp3_base(n, 512, rate, cl);
+                    assert_eq!(sgv2_core::spp3::Unit::init_error(&p), None, "spp3 {n} ch {rate} Hz cl {cl}");
+                }
+            }
         }
     }
 }
