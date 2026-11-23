@@ -138,9 +138,9 @@ use alloc::vec::Vec;
 
 mod laws;
 pub use laws::{
-    arbitrate_producer_segment, current_coefficients, mask_lattice_resized, minimum_phase_triplet, release_lambda,
-    temperature_candidate, transform_len, velocity_band_gains, velocity_band_gains_limit_window,
-    velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
+    arbitrate_producer_segment, current_coefficients, mask_lattice_resized, minimum_phase_triplet,
+    modeled_velocity_peak, release_lambda, temperature_candidate, transform_len, velocity_band_gains,
+    velocity_band_gains_limit_window, velocity_band_gains_window, velocity_limit, BandGain, Fft, Masker, ThermalBranch,
 };
 
 use crate::blob::{BlobError, Pod};
@@ -1719,6 +1719,9 @@ struct Chan {
     /// The logged candidates: peak, displacement, velocity, linked power,
     /// temperature.
     cand: [f64; 5],
+    /// Number of controller frames where `enforce_fast_axes` entered its
+    /// verified fallback after exhausting or stalling the 16-pass loop.
+    fast_axis_fallback_count: u64,
 }
 
 impl Chan {
@@ -2051,6 +2054,61 @@ impl Unit {
     pub fn is_failsafe(&self) -> bool {
         self.run.is_none() || self.companion.as_ref().is_some_and(|c| c.gates != 0)
     }
+    pub fn fast_axis_fallback_count(&self, ch: usize) -> u64 {
+        self.run.as_ref().and_then(|r| r.ch.get(ch)).map_or(0, |c| c.fast_axis_fallback_count)
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fast_axis_probe(
+        &mut self,
+        ch: usize,
+        db: [f32; BANDS],
+        vb: [f32; BANDS],
+        peak_ab: [f32; BANDS],
+        disp_limit: f64,
+        vlim: f32,
+        amp_limit: f64,
+        vel_floor: f64,
+    ) -> ([f32; BANDS], bool) {
+        let Some(r) = self.run.as_mut() else {
+            return ([0.0; BANDS], false);
+        };
+        let disp_on = r.axis[1];
+        let vel_on = r.axis[2] && !r.ch[ch].vel_off;
+        let peak_on = r.axis[0];
+        let od = r.od;
+        let c = &mut r.ch[ch];
+        c.disp_limit = disp_limit;
+        c.disp_bound_old = disp_limit as f32;
+        c.disp_bound_new = disp_limit as f32;
+        c.amp_limit = amp_limit;
+        c.vel_floor = vel_floor;
+        c.rd.fill(0.0);
+        c.vcar.fill(0.0);
+        for k in 0..BANDS {
+            c.db[k].fill(db[k]);
+            c.vb[k].fill(vb[k]);
+            c.peak_ab[k].fill(peak_ab[k]);
+        }
+        let vfloor = c.vel_floor as f32;
+        let (got, used_fallback) = enforce_fast_axes(
+            c,
+            disp_on,
+            vel_on,
+            peak_on,
+            od,
+            0,
+            1.0,
+            vlim,
+            &|req, _| velocity_band_gains(&c.vb, &c.vcar, 0, vlim, 1.0, c.vel_active, req, vfloor),
+            [1.0; BANDS],
+        );
+        if used_fallback {
+            c.fast_axis_fallback_count += 1;
+        }
+        (got, used_fallback)
+    }
 }
 
 /// Bilinear models `X/U` and `V/U` of one block, `R = Rdc` (rig law 1).
@@ -2059,6 +2117,773 @@ fn motion(rdc: f32, bl: f32, mms: f32, rms: f32, kms: f32, rate: f64, vel: bool)
     let den = [r * k, r * rm + bl * bl, r * m];
     let num = if vel { [0.0, bl, 0.0] } else { [bl, 0.0, 0.0] };
     Biquad::bilinear(num, den, rate)
+}
+
+/// Exact `f64` Phase-I Simplex feasibility search helpers for `enforce_fast_axes`
+/// (zero-allocation, `no_std`).
+const LP_MAX_CUTS: usize = 96;
+const LP_MAX_ROWS: usize = BANDS + 1 + LP_MAX_CUTS;
+const LP_MAX_COLS: usize = BANDS + 1;
+
+#[derive(Clone, Copy, PartialEq)]
+enum BoxSearch {
+    Feasible([f32; BANDS]),
+    Infeasible,
+    Undecided,
+}
+
+struct Phase1LpResult {
+    u: [f64; BANDS],
+    t_lp: f64,
+    t_exact: f64,
+    active_cuts: [bool; LP_MAX_CUTS],
+}
+
+/// Minimize `t` subject to `0 <= u[i] <= upper[i]` (`i < d`),
+/// `sum_i cuts_a[m][i] * u[i] - t <= cuts_b[m]` (`m < num_cuts`), and `t >= -1.0`.
+/// Returns `None` if Simplex fails to terminate within the pivot budget.
+fn solve_phase1_simplex(
+    d: usize,
+    upper: &[f64; BANDS],
+    cuts_a: &[[f64; BANDS]; LP_MAX_CUTS],
+    cuts_b: &[f64; LP_MAX_CUTS],
+    num_cuts: usize,
+) -> Option<Phase1LpResult> {
+    let k_cols = d + 1;
+    let mut t0 = 0.0f64;
+    for m in 0..num_cuts {
+        t0 = t0.max(-cuts_b[m]);
+    }
+    t0 += 1.0;
+    let r_rows = d + 1 + num_cuts;
+
+    let mut tab = [[0.0f64; LP_MAX_COLS]; LP_MAX_ROWS];
+    let mut rhs = [0.0f64; LP_MAX_ROWS];
+    for i in 0..d {
+        tab[i][i] = 1.0;
+        rhs[i] = upper[i];
+    }
+    tab[d][d] = 1.0;
+    rhs[d] = t0 + 1.0;
+    for m in 0..num_cuts {
+        let r = d + 1 + m;
+        for i in 0..d {
+            tab[r][i] = cuts_a[m][i];
+        }
+        tab[r][d] = 1.0;
+        rhs[r] = cuts_b[m] + t0;
+    }
+
+    let mut obj = [0.0f64; LP_MAX_COLS];
+    obj[d] = -1.0;
+    let mut obj_val = t0;
+
+    let mut nb = [0usize; LP_MAX_COLS];
+    for c in 0..k_cols {
+        nb[c] = c;
+    }
+    let mut bas = [0usize; LP_MAX_ROWS];
+    for r in 0..r_rows {
+        bas[r] = k_cols + r;
+    }
+
+    let mut optimal = false;
+    for it in 0..4096 {
+        let mut enter: Option<usize> = None;
+        if it < 256 {
+            let mut best_c = -1e-13;
+            for c in 0..k_cols {
+                if obj[c] < best_c {
+                    best_c = obj[c];
+                    enter = Some(c);
+                }
+            }
+        } else {
+            // Bland's anti-cycling rule
+            for c in 0..k_cols {
+                if obj[c] < -1e-13 && enter.is_none_or(|e| nb[c] < nb[e]) {
+                    enter = Some(c);
+                }
+            }
+        }
+        let Some(e) = enter else {
+            optimal = true;
+            break;
+        };
+
+        let mut leave: Option<usize> = None;
+        let mut best_ratio = f64::INFINITY;
+        let mut best_piv = 0.0f64;
+        for r in 0..r_rows {
+            let col_val = tab[r][e];
+            if col_val > 1e-12 {
+                let ratio = rhs[r] / col_val;
+                let better = if it < 256 {
+                    ratio < best_ratio - 1e-13 || ((ratio - best_ratio).abs() <= 1e-13 && col_val > best_piv)
+                } else {
+                    ratio < best_ratio - 1e-13
+                        || ((ratio - best_ratio).abs() <= 1e-13 && leave.is_none_or(|p| bas[r] < bas[p]))
+                };
+                if better {
+                    best_ratio = ratio;
+                    best_piv = col_val;
+                    leave = Some(r);
+                }
+            }
+        }
+        let p = leave?;
+
+        let inv = 1.0 / tab[p][e];
+        if !inv.is_finite() {
+            return None;
+        }
+        rhs[p] *= inv;
+        tab[p][e] = inv;
+        for c in 0..k_cols {
+            if c != e {
+                tab[p][c] *= inv;
+            }
+        }
+        for r in 0..r_rows {
+            if r == p {
+                continue;
+            }
+            let f = tab[r][e];
+            if f == 0.0 {
+                continue;
+            }
+            rhs[r] -= f * rhs[p];
+            if rhs[r] < 0.0 {
+                rhs[r] = 0.0;
+            }
+            tab[r][e] = -f * inv;
+            for c in 0..k_cols {
+                if c != e {
+                    tab[r][c] -= f * tab[p][c];
+                }
+            }
+        }
+        let f = obj[e];
+        obj_val += f * rhs[p];
+        obj[e] = -f * inv;
+        for c in 0..k_cols {
+            if c != e {
+                obj[c] -= f * tab[p][c];
+            }
+        }
+        core::mem::swap(&mut nb[e], &mut bas[p]);
+    }
+    if !optimal || !obj_val.is_finite() {
+        return None;
+    }
+
+    let mut u = [0.0f64; BANDS];
+    let mut active_cuts = [false; LP_MAX_CUTS];
+    for r in 0..r_rows {
+        let var = bas[r];
+        if var < d {
+            u[var] = rhs[r].clamp(0.0, upper[var]);
+        }
+    }
+    for c in 0..k_cols {
+        let var = nb[c];
+        if var > k_cols + d {
+            let m = var - (k_cols + d + 1);
+            if m < num_cuts {
+                active_cuts[m] = true;
+            }
+        }
+    }
+
+    let mut t_exact = -1.0f64;
+    for m in 0..num_cuts {
+        let mut val = -cuts_b[m];
+        for i in 0..d {
+            val += cuts_a[m][i] * u[i];
+        }
+        if val > t_exact {
+            t_exact = val;
+        }
+    }
+
+    Some(Phase1LpResult { u, t_lp: obj_val, t_exact, active_cuts })
+}
+
+fn step_f32_ulp(v: f32, delta: i32, lo: f32, hi: f32) -> f32 {
+    if !v.is_finite() || v < 0.0 {
+        return v.clamp(lo, hi);
+    }
+    let bits = if v == 0.0 { 0u32 } else { v.to_bits() };
+    let shifted = if delta >= 0 { bits.saturating_add(delta as u32) } else { bits.saturating_sub((-delta) as u32) };
+    f32::from_bits(shifted).clamp(lo, hi)
+}
+
+/// Verify and enforce all enabled fast-axis limits (`disp_on`, `vel_on`,
+/// `peak_on`) on `req` over up to 16 alternating passes, falling back to a
+/// verified conservative scale-down (respecting `vel_floor` whenever feasible)
+/// if passes stall or exhaust the retry budget while a limit remains violated.
+/// Returns `(verified_req, used_fallback)`.
+#[allow(clippy::too_many_arguments)]
+fn enforce_fast_axes(
+    c: &Chan,
+    disp_on: bool,
+    vel_on: bool,
+    peak_on: bool,
+    od: usize,
+    vfirst: usize,
+    sg: f32,
+    vlim_g: f32,
+    solve_vel: &impl Fn([f32; BANDS], bool) -> [f32; BANDS],
+    mut req: [f32; BANDS],
+) -> ([f32; BANDS], bool) {
+    let all = (0, BANDS);
+    let disp_room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
+    let disp_pass = |r: [f32; BANDS]| {
+        velocity_band_gains_window(&c.db, &c.rd, 0, c.disp_bound_old, c.disp_bound_new, od, disp_room, sg, all, r)
+    };
+    let disp_bad = |r: &[f32; BANDS]| {
+        disp_on && (modeled_velocity_peak(&c.db, &c.rd, 0, sg, r) > c.disp_limit as f32 || disp_pass(*r) != *r)
+    };
+    let vel_bad = |r: &[f32; BANDS]| {
+        vel_on && modeled_velocity_peak(&c.vb, &c.vcar, vfirst, sg, r) > vlim_g && solve_vel(*r, false) != *r
+    };
+    let peak_bad = |r: &[f32; BANDS]| peak_on && modeled_velocity_peak(&c.peak_ab, &[], 0, sg, r) > c.amp_limit as f32;
+    let all_ok = |r: &[f32; BANDS]| !disp_bad(r) && !vel_bad(r) && !peak_bad(r);
+
+    for _ in 0..16 {
+        let prev = req;
+        if disp_on {
+            req = disp_pass(req);
+        }
+        if vel_on && modeled_velocity_peak(&c.vb, &c.vcar, vfirst, sg, &req) > vlim_g {
+            req = solve_vel(req, true);
+        }
+        if peak_on && modeled_velocity_peak(&c.peak_ab, &[], 0, sg, &req) > c.amp_limit as f32 {
+            req = velocity_band_gains(&c.peak_ab, &[], 0, c.amp_limit as f32, sg, all, req, 0.0);
+        }
+        if req == prev {
+            break;
+        }
+    }
+    if all_ok(&req) {
+        return (req, false);
+    }
+
+    let vfloor = c.vel_floor as f32 / sg;
+    let is_vel_active = |k: usize| vel_on && k >= c.vel_active.0 && k < c.vel_active.1;
+    let floor_lo: [f32; BANDS] = core::array::from_fn(|k| if is_vel_active(k) { req[k].min(vfloor) } else { 0.0 });
+    let floor_req: [f32; BANDS] = core::array::from_fn(|k| {
+        if is_vel_active(k) {
+            req[k].min(vfloor)
+        } else if disp_on || peak_on {
+            0.0
+        } else {
+            req[k]
+        }
+    });
+    let bisect = |lo_r: [f32; BANDS], hi_r: [f32; BANDS]| -> [f32; BANDS] {
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            let cand: [f32; BANDS] = core::array::from_fn(|k| lo_r[k] + mid * (hi_r[k] - lo_r[k]));
+            if all_ok(&cand) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        core::array::from_fn(|k| lo_r[k] + lo * (hi_r[k] - lo_r[k]))
+    };
+
+    if all_ok(&floor_req) {
+        return (bisect(floor_req, req), true);
+    }
+
+    let disp_window_limit = |i: usize, n: usize| -> f32 {
+        if i < od {
+            c.disp_bound_old
+        } else if c.disp_bound_new >= c.disp_bound_old {
+            c.disp_bound_new
+        } else {
+            let count = n - od;
+            let step = (c.disp_bound_new - c.disp_bound_old) / count as f32;
+            c.disp_bound_old + step * (i - od + 1) as f32
+        }
+    };
+
+    // Search a box `[lo, hi]` using an exact `f64` cutting-plane Phase-I
+    // Simplex LP over active coordinates (at most `BANDS = 5`), distinguishing
+    // established infeasibility from search failure.
+    let find_feasible_linear_box =
+        |lo: [f32; BANDS], hi: [f32; BANDS], check_disp: bool, check_vel: bool, check_peak: bool| -> BoxSearch {
+            let axes_ok = |r: &[f32; BANDS]| {
+                (!check_disp || !disp_bad(r)) && (!check_vel || !vel_bad(r)) && (!check_peak || !peak_bad(r))
+            };
+            let mut active = [0usize; BANDS];
+            let mut d = 0usize;
+            let mut upper = [0.0f64; BANDS];
+            for k in 0..BANDS {
+                if hi[k] > lo[k] {
+                    active[d] = k;
+                    upper[d] = hi[k] as f64 - lo[k] as f64;
+                    d += 1;
+                }
+            }
+            if d == 0 || axes_ok(&lo) {
+                return if axes_ok(&lo) { BoxSearch::Feasible(lo) } else { BoxSearch::Infeasible };
+            }
+
+            let round_to_box = |u: &[f64; BANDS]| -> [f32; BANDS] {
+                let mut r = lo;
+                for (i, &k) in active[..d].iter().enumerate() {
+                    r[k] = ((lo[k] as f64 + u[i]) as f32).clamp(lo[k], hi[k]);
+                }
+                r
+            };
+
+            let f32_max_viol = |r: &[f32; BANDS]| -> f32 {
+                let mut v = 0.0f32;
+                if check_disp {
+                    v = v.max(modeled_velocity_peak(&c.db, &c.rd, 0, sg, r) - c.disp_limit as f32);
+                    if v <= 0.0 && disp_bad(r) {
+                        let n = c.db[0].len();
+                        let (mut idx, mut worst) = (0usize, 0.0f32);
+                        for i in 0..n {
+                            let mut y = c.rd[i];
+                            for k in 0..BANDS {
+                                y += (r[k] * sg) * c.db[k][i];
+                            }
+                            if y.abs() > worst.abs() {
+                                worst = y;
+                                idx = i;
+                            }
+                        }
+                        v = v.max(worst.abs() - (disp_window_limit(idx, n) + disp_room));
+                    }
+                }
+                if check_vel {
+                    v = v.max(modeled_velocity_peak(&c.vb, &c.vcar, vfirst, sg, r) - vlim_g);
+                }
+                if check_peak {
+                    v = v.max(modeled_velocity_peak(&c.peak_ab, &[], 0, sg, r) - c.amp_limit as f32);
+                }
+                v
+            };
+
+            let nudge_f32_feasible = |start: [f32; BANDS]| -> Option<[f32; BANDS]> {
+                let mut cur = start;
+                let mut cur_v = f32_max_viol(&cur);
+                for _ in 0..8 {
+                    let mut best = cur;
+                    let mut best_v = cur_v;
+                    for &k in &active[..d] {
+                        for delta in [-1, 1] {
+                            let mut cand = cur;
+                            cand[k] = step_f32_ulp(cur[k], delta, lo[k], hi[k]);
+                            if cand[k] == cur[k] {
+                                continue;
+                            }
+                            if axes_ok(&cand) {
+                                return Some(cand);
+                            }
+                            let v = f32_max_viol(&cand);
+                            if v < best_v {
+                                best = cand;
+                                best_v = v;
+                            }
+                        }
+                    }
+                    if best_v < cur_v {
+                        cur = best;
+                        cur_v = best_v;
+                    } else {
+                        break;
+                    }
+                }
+                for (ii, &ki) in active[..d].iter().enumerate() {
+                    for delta_i in [-2, -1, 1, 2] {
+                        let mut cand = cur;
+                        cand[ki] = step_f32_ulp(cur[ki], delta_i, lo[ki], hi[ki]);
+                        if axes_ok(&cand) {
+                            return Some(cand);
+                        }
+                    }
+                    for &kj in &active[ii + 1..d] {
+                        for di in [-1, 1] {
+                            for dj in [-1, 1] {
+                                let mut cand = cur;
+                                cand[ki] = step_f32_ulp(cur[ki], di, lo[ki], hi[ki]);
+                                cand[kj] = step_f32_ulp(cur[kj], dj, lo[kj], hi[kj]);
+                                if axes_ok(&cand) {
+                                    return Some(cand);
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            };
+
+            let f32_dot_round_bound = |vb: &[Vec<f32>; BANDS], resid: &[f32], i: usize| -> f64 {
+                let u = f64::from(f32::EPSILON) * 0.5;
+                let sub_eps = f64::from(f32::MIN_POSITIVE);
+                let sg64 = sg as f64;
+                let mut y_lo = if resid.is_empty() { 0.0f64 } else { resid[i] as f64 };
+                let mut y_hi = y_lo;
+                let mut err = 0.0f64;
+                for k in 0..BANDS {
+                    let v = vb[k][i] as f64;
+                    if v == 0.0 || (lo[k] == 0.0 && hi[k] == 0.0) {
+                        continue;
+                    }
+                    let lo_k = lo[k] as f64;
+                    let hi_k = hi[k] as f64;
+                    let max_k = lo_k.abs().max(hi_k.abs());
+                    let e_p = if sg == 1.0 { 0.0 } else { u * (max_k * sg64.abs()) + sub_eps };
+                    let w = sg64 * v;
+                    let prod_lo = (lo_k * w).min(hi_k * w);
+                    let prod_hi = (lo_k * w).max(hi_k * w);
+                    let t_max = (max_k * sg64.abs() + e_p) * v.abs();
+                    let e_t = e_p * v.abs() + (u * t_max + sub_eps);
+                    let t_lo = prod_lo - e_t;
+                    let t_hi = prod_hi + e_t;
+                    let e_add = if y_lo == 0.0 && y_hi == 0.0 {
+                        0.0
+                    } else {
+                        let sum_max = (y_lo + t_lo).abs().max((y_hi + t_hi).abs());
+                        u * sum_max + sub_eps
+                    };
+                    err += e_t + e_add;
+                    y_lo = y_lo + t_lo - e_add;
+                    y_hi = y_hi + t_hi + e_add;
+                }
+                err
+            };
+
+            let scan_worst_f64 = |vb: &[Vec<f32>; BANDS],
+                                  resid: &[f32],
+                                  first: usize,
+                                  x_f64: &[f64; BANDS],
+                                  relax_f32: bool,
+                                  lim_at: &dyn Fn(usize) -> f64|
+             -> Option<([f64; BANDS], f64, f64)> {
+                let n = vb[0].len();
+                let mut best_viol = 1e-13;
+                let mut best_idx = 0usize;
+                let mut best_sign = 1.0f64;
+                let mut best_lim = 0.0f64;
+                let mut best_eps = 0.0f64;
+                for i in first..n {
+                    let mut y = if resid.is_empty() { 0.0f64 } else { resid[i] as f64 };
+                    for k in 0..BANDS {
+                        y += x_f64[k] * (sg as f64) * (vb[k][i] as f64);
+                    }
+                    let lim = lim_at(i);
+                    let eps = if relax_f32 { f32_dot_round_bound(vb, resid, i) } else { 0.0 };
+                    let exc = y.abs() - (lim + eps);
+                    if exc > best_viol {
+                        best_viol = exc;
+                        best_idx = i;
+                        best_sign = if y >= 0.0 { 1.0 } else { -1.0 };
+                        best_lim = lim;
+                        best_eps = eps;
+                    }
+                }
+                if best_viol > 1e-13 {
+                    let mut a = [0.0f64; BANDS];
+                    for (j, &k) in active[..d].iter().enumerate() {
+                        a[j] = best_sign * (sg as f64) * (vb[k][best_idx] as f64);
+                    }
+                    let mut fixed = if resid.is_empty() { 0.0f64 } else { best_sign * (resid[best_idx] as f64) };
+                    for k in 0..BANDS {
+                        fixed += best_sign * (lo[k] as f64) * (sg as f64) * (vb[k][best_idx] as f64);
+                    }
+                    let b = best_lim - fixed;
+                    let eps = if relax_f32 { best_eps } else { f32_dot_round_bound(vb, resid, best_idx) };
+                    Some((a, b, eps))
+                } else {
+                    None
+                }
+            };
+
+            let mut cuts_a = [[0.0f64; BANDS]; LP_MAX_CUTS];
+            let mut cuts_b = [0.0f64; LP_MAX_CUTS];
+            let mut cuts_eps = [0.0f64; LP_MAX_CUTS];
+            let mut cuts_b_rel = [0.0f64; LP_MAX_CUTS];
+            let mut num_cuts = 0usize;
+
+            let push_cut = |cuts_a: &mut [[f64; BANDS]; LP_MAX_CUTS],
+                            cuts_b: &mut [f64; LP_MAX_CUTS],
+                            cuts_eps: &mut [f64; LP_MAX_CUTS],
+                            cuts_b_rel: &mut [f64; LP_MAX_CUTS],
+                            num_cuts: &mut usize,
+                            a: [f64; BANDS],
+                            b: f64,
+                            eps: f64| {
+                let mut norm = b.abs();
+                for j in 0..d {
+                    norm = norm.max(a[j].abs());
+                }
+                if norm <= 0.0 || !norm.is_finite() {
+                    return;
+                }
+                let inv = 1.0 / norm;
+                let idx = *num_cuts;
+                for j in 0..d {
+                    cuts_a[idx][j] = a[j] * inv;
+                }
+                cuts_b[idx] = b * inv;
+                cuts_eps[idx] = eps * inv;
+                cuts_b_rel[idx] = (b + eps) * inv;
+                *num_cuts += 1;
+            };
+
+            // Solve the exact `f64` LP first; if it reports infeasibility (or
+            // stalls without an `f32`-verified point), re-solve with each row
+            // RHS relaxed by its worst-case `f32` dot-product rounding bound so
+            // `BoxSearch::Infeasible` is only returned when proved beyond `f32`
+            // rounding, and otherwise return `BoxSearch::Undecided`.
+            for relaxed in [false, true] {
+                let mut exhausted = true;
+                for _ in 0..256 {
+                    let rhs_b = if relaxed { &cuts_b_rel } else { &cuts_b };
+                    let Some(res) = solve_phase1_simplex(d, &upper, &cuts_a, rhs_b, num_cuts) else {
+                        return BoxSearch::Undecided;
+                    };
+                    let cand = round_to_box(&res.u);
+                    if axes_ok(&cand) {
+                        return BoxSearch::Feasible(cand);
+                    }
+                    if res.t_lp > 1e-11 && res.t_exact > 1e-11 {
+                        if let Some(nudged) = nudge_f32_feasible(cand) {
+                            return BoxSearch::Feasible(nudged);
+                        }
+                        if relaxed {
+                            return BoxSearch::Infeasible;
+                        }
+                        exhausted = false;
+                        break;
+                    }
+
+                    let mut x_f64 = [0.0f64; BANDS];
+                    for k in 0..BANDS {
+                        x_f64[k] = lo[k] as f64;
+                    }
+                    for (i, &k) in active[..d].iter().enumerate() {
+                        x_f64[k] += res.u[i];
+                    }
+
+                    let mut pending_a = [[0.0f64; BANDS]; 3];
+                    let mut pending_b = [0.0f64; 3];
+                    let mut pending_eps = [0.0f64; 3];
+                    let mut pending_n = 0usize;
+
+                    if check_disp {
+                        if let Some((a, b, eps)) =
+                            scan_worst_f64(&c.db, &c.rd, 0, &x_f64, relaxed, &|_| (c.disp_limit as f32) as f64)
+                        {
+                            pending_a[pending_n] = a;
+                            pending_b[pending_n] = b;
+                            pending_eps[pending_n] = eps;
+                            pending_n += 1;
+                        } else if disp_bad(&cand) {
+                            let n = c.db[0].len();
+                            if let Some((a, b, eps)) = scan_worst_f64(&c.db, &c.rd, 0, &x_f64, relaxed, &|i| {
+                                (disp_window_limit(i, n) + disp_room) as f64
+                            }) {
+                                pending_a[pending_n] = a;
+                                pending_b[pending_n] = b;
+                                pending_eps[pending_n] = eps;
+                                pending_n += 1;
+                            }
+                        }
+                    }
+                    if check_vel {
+                        if let Some((a, b, eps)) =
+                            scan_worst_f64(&c.vb, &c.vcar, vfirst, &x_f64, relaxed, &|_| vlim_g as f64)
+                        {
+                            pending_a[pending_n] = a;
+                            pending_b[pending_n] = b;
+                            pending_eps[pending_n] = eps;
+                            pending_n += 1;
+                        }
+                    }
+                    if check_peak {
+                        if let Some((a, b, eps)) =
+                            scan_worst_f64(&c.peak_ab, &[], 0, &x_f64, relaxed, &|_| (c.amp_limit as f32) as f64)
+                        {
+                            pending_a[pending_n] = a;
+                            pending_b[pending_n] = b;
+                            pending_eps[pending_n] = eps;
+                            pending_n += 1;
+                        }
+                    }
+
+                    if pending_n == 0 {
+                        if let Some(nudged) = nudge_f32_feasible(cand) {
+                            return BoxSearch::Feasible(nudged);
+                        }
+                        if relaxed {
+                            return BoxSearch::Undecided;
+                        }
+                        exhausted = false;
+                        break;
+                    }
+
+                    if num_cuts + pending_n > LP_MAX_CUTS {
+                        // Preserve active basis cuts plus the most recent inactive cuts.
+                        let recent_floor = num_cuts.saturating_sub(LP_MAX_CUTS / 2);
+                        let mut keep = 0usize;
+                        for m in 0..num_cuts {
+                            if res.active_cuts[m] || m >= recent_floor {
+                                cuts_a[keep] = cuts_a[m];
+                                cuts_b[keep] = cuts_b[m];
+                                cuts_eps[keep] = cuts_eps[m];
+                                cuts_b_rel[keep] = cuts_b_rel[m];
+                                keep += 1;
+                            }
+                        }
+                        num_cuts = keep;
+                    }
+                    for p in 0..pending_n {
+                        push_cut(
+                            &mut cuts_a,
+                            &mut cuts_b,
+                            &mut cuts_eps,
+                            &mut cuts_b_rel,
+                            &mut num_cuts,
+                            pending_a[p],
+                            pending_b[p],
+                            pending_eps[p],
+                        );
+                    }
+                }
+                if exhausted {
+                    return BoxSearch::Undecided;
+                }
+            }
+
+            BoxSearch::Undecided
+        };
+
+    // Floor-pinned velocity fallback: when `vb <= vlim_g` is infeasible inside
+    // `[lo, req]`, check whether `disp_on`/`peak_on` can be satisfied while
+    // `solve_vel` leaves the solution unchanged (e.g. pinning active velocity
+    // bands at `lo`).
+    let find_feasible_in_box_vel_pin = |lo: [f32; BANDS], hi: [f32; BANDS]| -> BoxSearch {
+        let hi_all_pinned: [f32; BANDS] = core::array::from_fn(|k| if is_vel_active(k) { lo[k] } else { hi[k] });
+        match find_feasible_linear_box(lo, hi_all_pinned, disp_on, false, peak_on) {
+            BoxSearch::Feasible(f) if all_ok(&f) => return BoxSearch::Feasible(f),
+            BoxSearch::Undecided => return BoxSearch::Undecided,
+            BoxSearch::Feasible(_) | BoxSearch::Infeasible => {}
+        }
+
+        fn dfs(
+            mask: u8,
+            visited: &mut u32,
+            lo: [f32; BANDS],
+            hi: [f32; BANDS],
+            vel_active: (usize, usize),
+            all_ok: &dyn Fn(&[f32; BANDS]) -> bool,
+            solve_vel: &dyn Fn([f32; BANDS], bool) -> [f32; BANDS],
+            find_box: &dyn Fn([f32; BANDS], [f32; BANDS]) -> BoxSearch,
+        ) -> BoxSearch {
+            *visited |= 1u32 << mask;
+            let pin_hi: [f32; BANDS] = core::array::from_fn(|k| if (mask & (1 << k)) != 0 { lo[k] } else { hi[k] });
+            match find_box(lo, pin_hi) {
+                BoxSearch::Infeasible => BoxSearch::Infeasible,
+                BoxSearch::Undecided => BoxSearch::Undecided,
+                BoxSearch::Feasible(cand) => {
+                    if all_ok(&cand) {
+                        return BoxSearch::Feasible(cand);
+                    }
+                    let r_v = solve_vel(cand, false);
+                    if all_ok(&r_v) {
+                        return BoxSearch::Feasible(r_v);
+                    }
+                    let mut any_pinned = false;
+                    let mut saw_undecided = false;
+                    for k in vel_active.0..vel_active.1 {
+                        if (mask & (1 << k)) == 0 && cand[k] > lo[k] && r_v[k] <= lo[k] + 1e-6 {
+                            any_pinned = true;
+                            let next = mask | (1 << k);
+                            if (*visited & (1u32 << next)) == 0 {
+                                match dfs(next, visited, lo, hi, vel_active, all_ok, solve_vel, find_box) {
+                                    BoxSearch::Feasible(f) => return BoxSearch::Feasible(f),
+                                    BoxSearch::Undecided => saw_undecided = true,
+                                    BoxSearch::Infeasible => {}
+                                }
+                            }
+                        }
+                    }
+                    if any_pinned {
+                        if saw_undecided {
+                            BoxSearch::Undecided
+                        } else {
+                            BoxSearch::Infeasible
+                        }
+                    } else {
+                        BoxSearch::Undecided
+                    }
+                }
+            }
+        }
+
+        let mut visited = 0u32;
+        dfs(0, &mut visited, lo, hi, c.vel_active, &all_ok, solve_vel, &|b_lo, b_hi| {
+            find_feasible_linear_box(b_lo, b_hi, disp_on, false, peak_on)
+        })
+    };
+
+    if vel_on && vfloor > 0.0 {
+        // Constrain active velocity gains to `[floor_lo, req]` first; only
+        // permit below-floor cuts if `[floor_lo, req]` yields no verified
+        // feasible point (infeasible or undecided), and never return an
+        // unverified `floor_req` that violates `disp_on` or `peak_on`.
+        match find_feasible_linear_box(floor_lo, req, disp_on, true, peak_on) {
+            BoxSearch::Feasible(feasible) => return (bisect(feasible, req), true),
+            BoxSearch::Infeasible | BoxSearch::Undecided => {}
+        }
+        match find_feasible_in_box_vel_pin(floor_lo, req) {
+            BoxSearch::Feasible(feasible) => return (bisect(feasible, req), true),
+            BoxSearch::Infeasible | BoxSearch::Undecided => {}
+        }
+    }
+
+    // No verified feasible point was found in `[floor_lo, req]` (or velocity
+    // floor is inactive); allow below-floor cuts to satisfy `disp_on`/`peak_on`.
+    let mut keep_floor = floor_req;
+    for _ in 0..16 {
+        let prev = keep_floor;
+        if disp_on {
+            keep_floor = disp_pass(keep_floor);
+        }
+        if peak_on && modeled_velocity_peak(&c.peak_ab, &[], 0, sg, &keep_floor) > c.amp_limit as f32 {
+            keep_floor = velocity_band_gains(&c.peak_ab, &[], 0, c.amp_limit as f32, sg, all, keep_floor, 0.0);
+        }
+        if keep_floor == prev {
+            break;
+        }
+    }
+    let out = if all_ok(&keep_floor) {
+        bisect(keep_floor, req)
+    } else if let BoxSearch::Feasible(feasible) = find_feasible_linear_box([0.0; BANDS], req, disp_on, vel_on, peak_on)
+    {
+        bisect(feasible, req)
+    } else if vel_on {
+        if let BoxSearch::Feasible(feasible) = find_feasible_in_box_vel_pin([0.0; BANDS], req) {
+            bisect(feasible, req)
+        } else if all_ok(&[0.0; BANDS]) {
+            bisect([0.0; BANDS], req)
+        } else {
+            [0.0; BANDS]
+        }
+    } else if all_ok(&[0.0; BANDS]) {
+        bisect([0.0; BANDS], req)
+    } else {
+        [0.0; BANDS]
+    };
+    (out, true)
 }
 
 impl Run {
@@ -2223,6 +3048,7 @@ impl Run {
                 t_headroom: c.temperature_headroom as f64,
                 temp_floor: db_to_lin(c.max_temperature_attenuation_db as f64),
                 cand: [1.0; 5],
+                fast_axis_fallback_count: 0,
             });
         }
         // Derive the reported delay from the bank we actually constructed.
@@ -2374,6 +3200,7 @@ impl Run {
             c.pbar1_frame = 0.0;
             c.pbar1s_frame = 0.0;
             c.cand = [1.0; 5];
+            c.fast_axis_fallback_count = 0;
         }
         for b in self.xin.iter_mut().chain(self.yout.iter_mut()) {
             b[..ctl].iter_mut().for_each(|v| *v = 0.0);
@@ -2655,8 +3482,46 @@ impl Run {
             let retained_room_bound = c.vel_bound_window[od..].iter().copied().fold(0.0f32, f32::max);
             let velocity_cut = core::cell::Cell::new(false);
             let retained_episode = core::cell::Cell::new(c.vel_episode && c.vel_episode_retained);
+            let solve_vel = |c: &Chan,
+                             mut r: [f32; BANDS],
+                             start_episode: bool,
+                             record_cut: bool,
+                             active: (usize, usize)|
+             -> [f32; BANDS] {
+                let vfloor = c.vel_floor as f32 / sg;
+                let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, active, r, vfloor);
+                let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
+                let retained = if stream_ready && c.vel_bound_ready {
+                    velocity_band_gains_limit_window(
+                        &c.vb,
+                        &c.vcar,
+                        vfirst,
+                        &c.vel_bound_window,
+                        0.25 * (vlim_g - retained_room_bound).max(0.0),
+                        sg,
+                        active,
+                        ordinary,
+                        vfloor,
+                    )
+                } else {
+                    ordinary
+                };
+                if start_episode && !c.vel_episode && (ordinary_cut || streaming_ramp) && stream_ready {
+                    retained_episode.set(true);
+                }
+                let q = if retained_episode.get() { retained } else { ordinary };
+                for k in c.vel_active.0..c.vel_active.1 {
+                    // MaxVelocityAttenuation bounds the cut on every
+                    // solve, the retarget solve included.
+                    let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
+                    if record_cut {
+                        velocity_cut.set(velocity_cut.get() || v < r[k]);
+                    }
+                    r[k] = r[k].min(v);
+                }
+                r
+            };
             let chain = |c: &Chan, seed: [f32; BANDS]| -> [f32; BANDS] {
-                let all = (0, BANDS);
                 let mut r = seed;
                 if disp_on {
                     let room = 0.25 * (c.disp_limit as f32 - c.disp_bound_new).max(0.0);
@@ -2674,42 +3539,14 @@ impl Run {
                     );
                 }
                 if vel_on {
-                    let vfloor = c.vel_floor as f32 / sg;
-                    let ordinary = velocity_band_gains(&c.vb, &c.vcar, vfirst, vlim_g, sg, all, r, vfloor);
-                    let ordinary_cut = (c.vel_active.0..c.vel_active.1).any(|k| ordinary[k] < r[k]);
-                    let retained = if stream_ready && c.vel_bound_ready {
-                        velocity_band_gains_limit_window(
-                            &c.vb,
-                            &c.vcar,
-                            vfirst,
-                            &c.vel_bound_window,
-                            0.25 * (vlim_g - retained_room_bound).max(0.0),
-                            sg,
-                            all,
-                            ordinary,
-                            vfloor,
-                        )
-                    } else {
-                        ordinary
-                    };
-                    if !c.vel_episode && (ordinary_cut || streaming_ramp) && stream_ready {
-                        retained_episode.set(true);
-                    }
-                    let q = if retained_episode.get() { retained } else { ordinary };
-                    for k in c.vel_active.0..c.vel_active.1 {
-                        // MaxVelocityAttenuation bounds the cut on every
-                        // solve, the retarget solve included.
-                        let v = (sg * q[k]).max(c.vel_floor as f32) / sg;
-                        velocity_cut.set(velocity_cut.get() || v < r[k]);
-                        r[k] = r[k].min(v);
-                    }
+                    r = solve_vel(c, r, true, true, all);
                 }
                 if peak_on {
                     r = velocity_band_gains(&c.peak_ab, &[], 0, c.amp_limit as f32, sg, all, r, 0.0);
                 }
                 r
             };
-            let req: [f32; BANDS] = if disp_on || vel_on || peak_on {
+            let mut req: [f32; BANDS] = if disp_on || vel_on || peak_on {
                 // The scalar shapes every allocator trial, but the fast
                 // follower's request stays in the band domain. The output
                 // applies the slow trajectory after the fast-gained sum;
@@ -2743,6 +3580,34 @@ impl Run {
             } else {
                 [1.0; BANDS]
             };
+            // Final verification of the chosen request against all enabled fast
+            // axes before handing `req` to the fast band followers: if
+            // modeled velocity exceeds `vlim_g`, re-solve over `c.vel_active`
+            // (treating ignored bands as fixed and pinning any band at
+            // `vel_floor` while unpinned eligible bands still reduce the peak),
+            // and re-check displacement and sample peak so cutting a cancelling
+            // band cannot undo another axis's protection. If the 16-pass loop
+            // stalls or exhausts its budget while an enabled fast-axis limit is
+            // still violated, fall back to a verified conservative scale-down
+            // (respecting `vel_floor` whenever feasible).
+            if disp_on || vel_on || peak_on {
+                let (verified, fallback_used) = enforce_fast_axes(
+                    c,
+                    disp_on,
+                    vel_on,
+                    peak_on,
+                    od,
+                    vfirst,
+                    sg,
+                    vlim_g,
+                    &|r, record_cut| solve_vel(c, r, false, record_cut, c.vel_active),
+                    req,
+                );
+                req = verified;
+                if fallback_used {
+                    c.fast_axis_fallback_count += 1;
+                }
+            }
             if velocity_cut.get() {
                 if !c.vel_episode {
                     c.vel_episode = true;
@@ -3728,5 +4593,247 @@ mod fault_tests {
         // the floor
         let g = waterfill(&[0.0, 10.0, 0.0, 0.0, 0.0], &all, 0.1, 0.1);
         assert_eq!(g[1], 0.1);
+    }
+
+    #[test]
+    fn fast_axis_verification_recovers_when_sixteen_passes_exhaust() {
+        let mut p = params();
+        p.control_displacement = 1;
+        p.control_velocity = 1;
+        let mut u = Unit::new(p);
+        let r = u.run.as_mut().unwrap();
+        let od = r.od;
+        let c = &mut r.ch[0];
+        c.disp_limit = 0.002;
+        c.disp_bound_old = 0.002;
+        c.disp_bound_new = 0.002;
+        c.vel_active = (1, 4);
+        c.vel_floor = 0.25;
+        c.rd.fill(0.0);
+        c.vcar.fill(0.0);
+        for b in &mut c.db {
+            b.fill(0.0);
+        }
+        for b in &mut c.vb {
+            b.fill(0.0);
+        }
+        // Cancelling pair across displacement and velocity: 16 alternating
+        // passes stall far above disp_limit = 0.002 while [1.0, 0.25, 0.25, ...]
+        // or [0.25; 5] is feasible and respects vel_floor = 0.25.
+        c.db[0].fill(2.0);
+        c.db[1].fill(-1.996);
+        c.vb[0].fill(-1.996);
+        c.vb[1].fill(2.0);
+
+        let vlim_g = 0.002f32;
+        let sg = 1.0f32;
+        let vfloor = c.vel_floor as f32 / sg;
+        let mut raw_16 = [1.0f32; BANDS];
+        for _ in 0..16 {
+            raw_16 = velocity_band_gains_window(
+                &c.db,
+                &c.rd,
+                0,
+                c.disp_bound_old,
+                c.disp_bound_new,
+                od,
+                0.0,
+                sg,
+                (0, BANDS),
+                raw_16,
+            );
+            raw_16 = velocity_band_gains(&c.vb, &c.vcar, 0, vlim_g, sg, c.vel_active, raw_16, vfloor);
+        }
+        assert!(
+            modeled_velocity_peak(&c.db, &c.rd, 0, sg, &raw_16) > c.disp_limit as f32,
+            "expected 16 passes alone to remain over disp_limit"
+        );
+
+        let (got, used_fallback) = enforce_fast_axes(
+            c,
+            true,
+            true,
+            false,
+            od,
+            0,
+            sg,
+            vlim_g,
+            &|req, _| velocity_band_gains(&c.vb, &c.vcar, 0, vlim_g, sg, c.vel_active, req, vfloor),
+            [1.0; BANDS],
+        );
+        assert!(used_fallback, "expected fallback entry after 16 passes exhausted");
+        assert!(modeled_velocity_peak(&c.db, &c.rd, 0, sg, &got) <= c.disp_limit as f32, "{got:?}");
+        assert!(modeled_velocity_peak(&c.vb, &c.vcar, 0, sg, &got) <= vlim_g, "{got:?}");
+        assert!(got[1] >= vfloor, "expected band 1 >= {vfloor}, got {got:?}");
+    }
+
+    #[test]
+    fn fast_axis_fallback_preserves_feasible_velocity_floor_on_coupled_disp_and_peak() {
+        let mut p = params();
+        p.control_sample_peak = 1;
+        p.control_displacement = 1;
+        p.control_velocity = 1;
+        let mut u = Unit::new(p);
+        let r = u.run.as_mut().unwrap();
+        let od = r.od;
+        let c = &mut r.ch[0];
+        c.disp_limit = 0.0012;
+        c.disp_bound_old = 0.0012;
+        c.disp_bound_new = 0.0012;
+        c.amp_limit = 0.0012;
+        c.vel_active = (1, 4);
+        c.vel_floor = 0.5;
+        c.rd.fill(0.0);
+        c.vcar.fill(0.0);
+        for b in &mut c.db {
+            b.fill(0.0);
+        }
+        for b in &mut c.vb {
+            b.fill(0.0);
+        }
+        for b in &mut c.peak_ab {
+            b.fill(0.0);
+        }
+        // Coupled displacement (2a - 1.9b) and sample peak (-1.996a + 1.9b) on
+        // active velocity bands 1 and 2 with limits 0.0012 and floor 0.5:
+        // (0.5, 0.52579) satisfies both limits, whereas unconstrained cuts
+        // from floor_req = (0.5, 0.5) drive `a` down to ~0.4756.
+        c.db[1].fill(2.0);
+        c.db[2].fill(-1.9);
+        c.peak_ab[1].fill(-1.996);
+        c.peak_ab[2].fill(1.9);
+
+        let vlim_g = 0.5f32;
+        let sg = 1.0f32;
+        let vfloor = c.vel_floor as f32 / sg;
+        let (got, used_fallback) = enforce_fast_axes(
+            c,
+            true,
+            true,
+            true,
+            od,
+            0,
+            sg,
+            vlim_g,
+            &|req, _| velocity_band_gains(&c.vb, &c.vcar, 0, vlim_g, sg, c.vel_active, req, vfloor),
+            [1.0; BANDS],
+        );
+        assert!(used_fallback, "expected fallback entry after 16 passes exhausted");
+        assert!(modeled_velocity_peak(&c.db, &c.rd, 0, sg, &got) <= c.disp_limit as f32, "{got:?}");
+        assert!(modeled_velocity_peak(&c.peak_ab, &[], 0, sg, &got) <= c.amp_limit as f32, "{got:?}");
+        assert!(got[1] >= vfloor && got[2] >= vfloor, "expected active gains >= {vfloor}, got {got:?}");
+
+        // Thin-sliver feasible region at floor = 0.5999999:
+        // (0.5999999, 0.6309473) preserves the floor and yields ~0.00119996
+        // on both axes, within the 0.0012 limits.
+        let sliver_floor = 0.5999999f64;
+        c.vel_floor = sliver_floor;
+        let sliver_vfloor = sliver_floor as f32 / sg;
+        let (got_sliver, used_sliver) = enforce_fast_axes(
+            c,
+            true,
+            true,
+            true,
+            od,
+            0,
+            sg,
+            vlim_g,
+            &|req, _| velocity_band_gains(&c.vb, &c.vcar, 0, vlim_g, sg, c.vel_active, req, sliver_vfloor),
+            [1.0; BANDS],
+        );
+        assert!(used_sliver, "expected fallback entry on thin-sliver disp/peak fixture");
+        assert!(modeled_velocity_peak(&c.db, &c.rd, 0, sg, &got_sliver) <= c.disp_limit as f32, "{got_sliver:?}");
+        assert!(modeled_velocity_peak(&c.peak_ab, &[], 0, sg, &got_sliver) <= c.amp_limit as f32, "{got_sliver:?}");
+        assert!(
+            got_sliver[1] >= sliver_vfloor && got_sliver[2] >= sliver_vfloor,
+            "expected floor-preserving active gains >= {sliver_vfloor}, got {got_sliver:?}"
+        );
+
+        // Exact-f64 infeasible / f32-feasible rounding boundary at floor = 0.6
+        // with displacement limit 0.0012013912 and peak limit 0.0011985302:
+        // (0.6, 0.6309467) and (0.60000235, 0.63094914) pass both f32 checks.
+        c.disp_limit = 0.0012013912;
+        c.disp_bound_old = 0.0012013912;
+        c.disp_bound_new = 0.0012013912;
+        c.amp_limit = 0.0011985302;
+        c.vel_floor = 0.6;
+        let round_vfloor = c.vel_floor as f32 / sg;
+        let (got_round, used_round) = enforce_fast_axes(
+            c,
+            true,
+            true,
+            true,
+            od,
+            0,
+            sg,
+            vlim_g,
+            &|req, _| velocity_band_gains(&c.vb, &c.vcar, 0, vlim_g, sg, c.vel_active, req, round_vfloor),
+            [1.0; BANDS],
+        );
+        assert!(used_round, "expected fallback entry on f32-rounding disp/peak fixture");
+        assert!(modeled_velocity_peak(&c.db, &c.rd, 0, sg, &got_round) <= c.disp_limit as f32, "{got_round:?}");
+        assert!(modeled_velocity_peak(&c.peak_ab, &[], 0, sg, &got_round) <= c.amp_limit as f32, "{got_round:?}");
+        assert!(
+            got_round[1] >= round_vfloor && got_round[2] >= round_vfloor,
+            "expected floor-preserving active gains >= {round_vfloor}, got {got_round:?}"
+        );
+    }
+
+    #[test]
+    fn fast_axis_fallback_enforces_limits_when_box_search_undecided() {
+        let mut p = params();
+        p.control_sample_peak = 1;
+        p.control_displacement = 1;
+        p.control_velocity = 1;
+        let mut u = Unit::new(p);
+        let r = u.run.as_mut().unwrap();
+        let od = r.od;
+        let c = &mut r.ch[0];
+        // Lowering only amp_limit from 0.0011985302 to 0.00119849 at floor = 0.6
+        // leaves the relaxed LP feasible in f64 (so box search returns
+        // BoxSearch::Undecided) while no f32 point in [0.6, 1.0]^2 is feasible;
+        // fallback must still enforce displacement and sample peak rather than
+        // returning an unverified floor_req.
+        c.disp_limit = 0.0012013912;
+        c.disp_bound_old = 0.0012013912;
+        c.disp_bound_new = 0.0012013912;
+        c.amp_limit = 0.00119849;
+        c.vel_active = (1, 4);
+        c.vel_floor = 0.6;
+        c.rd.fill(0.0);
+        c.vcar.fill(0.0);
+        for b in &mut c.db {
+            b.fill(0.0);
+        }
+        for b in &mut c.vb {
+            b.fill(0.0);
+        }
+        for b in &mut c.peak_ab {
+            b.fill(0.0);
+        }
+        c.db[1].fill(2.0);
+        c.db[2].fill(-1.9);
+        c.peak_ab[1].fill(-1.996);
+        c.peak_ab[2].fill(1.9);
+
+        let vlim_g = 0.5f32;
+        let sg = 1.0f32;
+        let vfloor = c.vel_floor as f32 / sg;
+        let (got, used_fallback) = enforce_fast_axes(
+            c,
+            true,
+            true,
+            true,
+            od,
+            0,
+            sg,
+            vlim_g,
+            &|req, _| velocity_band_gains(&c.vb, &c.vcar, 0, vlim_g, sg, c.vel_active, req, vfloor),
+            [1.0; BANDS],
+        );
+        assert!(used_fallback, "expected fallback entry when BoxSearch::Undecided");
+        assert!(modeled_velocity_peak(&c.db, &c.rd, 0, sg, &got) <= c.disp_limit as f32, "{got:?}");
+        assert!(modeled_velocity_peak(&c.peak_ab, &[], 0, sg, &got) <= c.amp_limit as f32, "{got:?}");
+        assert!(got[1] > 0.0 && got[2] > 0.0 && got[1] < vfloor, "{got:?}");
     }
 }
