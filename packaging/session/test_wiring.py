@@ -712,6 +712,34 @@ class Atsp(unittest.TestCase):
             wiring.derive(h, fx("j313")["tuning"])
         self.assertIn("no sound-name-prefix", str(cm.exception))
 
+    def test_mono_amp_sense_switches_have_no_prefix(self):
+        # The lone desktop amp has no sound-name-prefix, so ALSA names its
+        # switches "VSENSE Switch"/"ISENSE Switch" (the J473's card); the
+        # derivation's "Speaker" is a label, not part of the control name.
+        for board in ("j274", "j473"):
+            f = fx(board)
+            w = wiring.derive(f["hw"], f["tuning"])
+            self.assertEqual(w["amps"][0]["prefix"], "Speaker")
+            self.assertEqual(w["amps"][0]["control_prefix"], "")
+            asked = []
+
+            def get(card, name):
+                asked.append(name)
+                return None
+
+            saved = sgsc.switch_get
+            sgsc.switch_get = get
+            try:
+                errs, fmt = sgsc.check_sense(None, 0, "Apple" + board.upper(), (1, 2), w, {})
+            finally:
+                sgsc.switch_get = saved
+            self.assertEqual(asked, ["VSENSE Switch"], board)
+            self.assertEqual(errs, ["no 'VSENSE Switch' control"])
+        # an amp that names itself keeps its prefix in the control name
+        f = fx("j413")
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertNotIn("control_prefix", w["amps"][0])
+
     def test_tas2770_register_check(self):
         w = wiring.derive(fx("j313")["hw"], fx("j313")["tuning"])
         for p, a in enumerate(w["amps"]):

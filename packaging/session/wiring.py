@@ -650,6 +650,11 @@ def hardware(hw):
         families.add(fam)
         side, role, ordinal = parse_prefix(c["prefix"])
         a = {"prefix": c["prefix"], "family": fam[0], "slot": slot, "side": side, "role": role, "ordinal": ordinal}
+        if mono:
+            # "Speaker" only labels the lone amp here: with no
+            # sound-name-prefix its ALSA controls carry no prefix at all
+            # ("VSENSE Switch", "Speaker Volume").
+            a["control_prefix"] = ""
         if c.get("i2c"):
             a["i2c"] = c["i2c"]
         if fam[1] and not sensed:
