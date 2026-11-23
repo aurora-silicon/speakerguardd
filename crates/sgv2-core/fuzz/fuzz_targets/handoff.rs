@@ -32,17 +32,22 @@ fn value(u: &mut Unstructured) -> Result<f64> {
 fn run(u: &mut Unstructured) -> Result<()> {
     let n = u.int_in_range(1..=8usize)?;
     let which = u.int_in_range(0..=2u8)?;
-    let (kind, mut unit, lat, allowance): (UnitKind, Box<dyn ProtectionUnit>, usize, f32) = match which {
+    type Case = (UnitKind, Box<dyn ProtectionUnit>, usize, f32, f32);
+    let (kind, mut unit, lat, gain, allowance): Case = match which {
         0 => {
             let p = spp3_base(n, 512, 48_000, u.arbitrary()?);
-            (UnitKind::Spp3, Box::new(spp3::Unit::new(p)), 0, spp3_pilot(&p))
+            (UnitKind::Spp3, Box::new(spp3::Unit::new(p)), 0, 1.0, spp3_pilot(&p))
         }
         1 => {
             let un = lsm2::Unit::new(lsm2_base(n, 48_000));
             let lat = un.latency_frames() as usize;
-            (UnitKind::Lsm2, Box::new(un), lat, LSM2_ALLOWANCE)
+            (UnitKind::Lsm2, Box::new(un), lat, 1.0, LSM2_ALLOWANCE)
         }
-        _ => (UnitKind::Atsp, Box::new(atsp::Unit::new(atsp_base(n, 512, 48_000))), 0, 0.0),
+        _ => {
+            let un = atsp::Unit::new(atsp_base(n, 512, 48_000));
+            let peak = atsp_peak(&un);
+            (UnitKind::Atsp, Box::new(un), 0, peak, 0.0)
+        }
     };
     let mut rec = HandOff::EMPTY;
     rec.kind = if u.ratio(7, 8)? { kind as u32 } else { u.arbitrary()? };
@@ -64,7 +69,7 @@ fn run(u: &mut Unstructured) -> Result<()> {
         assert!(age.is_finite() && age <= PROVIDED_MAX_AGE_S, "restored a record {age} s old");
     }
     let r = render(unit.as_mut(), &x, &[], &[256], &[], &mut nothing);
-    check_bound_pilot(&x, &r.out, lat, 1.0, allowance, "after the hand-off");
+    check_bound_pilot(&x, &r.out, lat, gain, allowance, "after the hand-off");
     for ch in &r.tele.channels[..n] {
         assert!(!ch.gain.is_nan() && (0.0..=1.0).contains(&ch.gain), "gain {} after the hand-off", ch.gain);
     }

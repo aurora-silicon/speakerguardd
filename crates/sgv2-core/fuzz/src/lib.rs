@@ -30,9 +30,10 @@
 //!   (or 0) before spp3 is built;
 //! - FINDING 5: the `FailSafe` unit is only probed with finite input;
 //! - FINDING 6: spp3/atsp slice invariance is only checked on finite input;
+//!   atsp's is checked within one slicing family (SPEC-ATSP 11.3), as
+//!   `tests/adversarial.rs` does;
 //! - FINDING 9: spp3 thermal time constants are raised to at least one
 //!   update after mutation;
-//! - FINDING 11: atsp host-block mode is fed calls of 64 frames or more.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -303,7 +304,15 @@ pub fn check_bound_pilot(x: &[Vec<f32>], out: &[Vec<f32>], latency: usize, gain:
             assert!(o.is_finite(), "{what}: non-finite output {o} at ch{c}[{k}]");
             let i = if k >= latency { xi[k - latency] } else { 0.0 };
             let prog = if i.is_finite() { (i * gain).abs() } else { 0.0 };
-            let lim = if pilot > 0.0 { ((prog + pilot) * (1.0 + 1e-6)).min(1.0) } else { prog };
+            // above unity (atsp's dezipper peak) the output is still held
+            // to full scale
+            let lim = if pilot > 0.0 {
+                ((prog + pilot) * (1.0 + 1e-6)).min(1.0)
+            } else if gain > 1.0 {
+                prog.min(1.0)
+            } else {
+                prog
+            };
             assert!(o.abs() <= lim, "{what}: |out| {o:e} > {lim:e} (in {i:e}, pilot {pilot}) at ch{c}[{k}]");
         }
     }
@@ -318,6 +327,27 @@ pub fn spp3_pilot(p: &sgv2_core::spp3::Params) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Property 1's gain for a protecting atsp unit: its output dezipper's own
+/// trajectory passes, as the reference's, so the gain is bounded by
+/// `gain_peak` at the unit's rate (as in `tests/adversarial.rs`), not by
+/// unity. The peak is a long filter run, so it is kept per rate.
+pub fn atsp_peak(unit: &sgv2_core::atsp::Unit) -> f32 {
+    let rate = unit.params().sample_rate;
+    thread_local!(static PEAKS: std::cell::RefCell<Vec<(u32, f32)>> = const { std::cell::RefCell::new(Vec::new()) });
+    PEAKS.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(&(_, g)) = p.iter().find(|e| e.0 == rate) {
+            return g;
+        }
+        let g = unit.gain_peak();
+        // a fuzzed rate word is any u32: keep the table small
+        if p.len() < 64 {
+            p.push((rate, g));
+        }
+        g
+    })
 }
 
 /// The allowance over property 1 an lsm2 unit takes: it is a five-band
@@ -337,45 +367,105 @@ pub fn check_not_louder(y: &[Vec<f32>], reference: &[Vec<f32>], what: &str) {
     }
 }
 
-/// Property 4, used from `render`'s `each` with one block per call: after a
-/// block boundary at which a channel's coil was past its hard limit, every
-/// channel of its group leaves the next block at least 20 dB down.
+/// Property 4 for atsp, used from `render`'s `each` with equal calls of at
+/// most one controller tick (as `check_hard_path` in `tests/adversarial.rs`):
+/// the panic is a target step through the output dezipper, so once a group
+/// has been past its hard limit at every call boundary for `settle` frames,
+/// its channels leave at most `bound` times the input for as long as it
+/// stays past it.
 pub struct HardPath<'a> {
     pub x: &'a [Vec<f32>],
     /// Per host channel: (group, hard limit).
     pub chans: Vec<(usize, f64)>,
-    pub armed: Vec<usize>,
+    /// Per group past its hard limit: the frame it has been so from.
+    pub hot_since: Vec<(usize, usize)>,
+    pub settle: usize,
+    pub bound: f32,
     pub last: usize,
     pub hits: usize,
 }
 
-impl HardPath<'_> {
+impl<'a> HardPath<'a> {
+    /// atsp's glide at `rate`: the panic target is scheduled at the first
+    /// tick after the coil is seen hot and the dezipper glides to within
+    /// 3 % of the 20 dB target well inside 60 ms.
+    pub fn atsp(x: &'a [Vec<f32>], chans: Vec<(usize, f64)>, rate: u32) -> Self {
+        let settle = (0.06 * rate as f64) as usize;
+        HardPath { x, chans, hot_since: Vec::new(), settle, bound: FAILSAFE_GAIN * 1.03, last: 0, hits: 0 }
+    }
+
     pub fn step(&mut self, done: usize, t: &Telemetry, out: &[Vec<f32>]) {
+        // the call just rendered was decided at the previous boundary
+        let mut any = false;
         for (c, &(g, _)) in self.chans.iter().enumerate() {
-            if !self.armed.contains(&g) {
-                continue;
-            }
-            let block = self.x[c][self.last..done].iter().zip(&out[c][self.last..done]);
-            for (k, (&i, &o)) in block.enumerate() {
-                let lim = if i.is_finite() { (i * FAILSAFE_GAIN).abs() } else { 0.0 };
-                let k = self.last + k;
-                assert!(o.abs() <= lim, "hard path missed: ch{c}[{k}] {o} from {i} (group {g})");
+            let Some(&(_, since)) = self.hot_since.iter().find(|h| h.0 == g) else { continue };
+            any = true;
+            let from = since.saturating_add(self.settle).max(self.last).min(done);
+            for (k, (&i, &o)) in self.x[c][from..done].iter().zip(&out[c][from..done]).enumerate() {
+                let k = from + k;
+                let lim = if i.is_finite() { (i * self.bound).abs() } else { 0.0 };
+                assert!(o.abs() <= lim, "hard path missed: ch{c}[{k}] {o} from {i} (group {g} over its hard limit)");
             }
         }
-        if !self.armed.is_empty() {
+        if any {
             self.hits += 1;
         }
-        self.armed.clear();
+        let mut hot: Vec<usize> = Vec::new();
         for (c, &(g, limit)) in self.chans.iter().enumerate() {
             let temp = t.channels[c].coil_temp_c as f64;
             // f32 telemetry: skip boundaries the rounding could decide either
             // way, and temperatures beyond f32 range
-            if temp.is_finite() && temp > limit + 1e-4 * limit.abs().max(1.0) && !self.armed.contains(&g) {
-                self.armed.push(g);
+            if temp.is_finite() && temp > limit + 1e-4 * limit.abs().max(1.0) && !hot.contains(&g) {
+                hot.push(g);
+            }
+        }
+        self.hot_since.retain(|h| hot.contains(&h.0));
+        for g in hot {
+            if !self.hot_since.iter().any(|h| h.0 == g) {
+                self.hot_since.push((g, done));
             }
         }
         self.last = done;
     }
+}
+
+/// Host slicings of one atsp family (SPEC-ATSP 11.3), whose output is the
+/// same bit for bit, as `atsp_family_slices` in `tests/adversarial.rs`:
+/// whole multiples of the fragment (`staged`), or calls of 2 frames up to
+/// one tick; one channel groups each call by eight (SPEC-ATSP 11.4), so its
+/// small family is whole groups of eight up to one tick.
+pub fn atsp_family_slices(u: &mut Unstructured, win: usize, staged: bool, mono: bool) -> Result<Vec<usize>> {
+    use sgv2_core::atsp::FRAGMENT;
+    let small = win.min(FRAGMENT);
+    let staged = staged || small < 2 || (mono && small < 8);
+    let k = u.int_in_range(1..=32usize)?;
+    let mut v = Vec::with_capacity(k);
+    for _ in 0..k {
+        v.push(if staged {
+            FRAGMENT * u.int_in_range(1..=8usize)?
+        } else if mono {
+            8 * u.int_in_range(1..=small / 8)?
+        } else {
+            u.int_in_range(2..=small)?
+        });
+    }
+    Ok(v)
+}
+
+/// Whether slicing `x`'s `len` frames by `cuts` ends on a one-frame call
+/// (the input running out): atsp's one-frame dezipper path, a family of
+/// its own.
+pub fn ends_on_one(cuts: &[usize], len: usize) -> bool {
+    let (mut done, mut k) = (0, 0);
+    while done < len {
+        let m = cuts[k % cuts.len()].min(len - done);
+        if done + m == len {
+            return m == 1;
+        }
+        done += m;
+        k += 1;
+    }
+    false
 }
 
 pub fn tele_bits(t: &Telemetry) -> Vec<u64> {
