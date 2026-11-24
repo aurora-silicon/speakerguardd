@@ -890,16 +890,27 @@ def write_report(path, links, carrier, wiring=None, amps=None, play=None):
 
 
 def machine(args):
-    """The machine's card and channel counts, from the self-check's record
-    (derived from this Mac's device tree and proven on it)."""
+    """The machine's card and channel counts: the self-check's machine
+    description, the one the protect stage's graph was generated from
+    (speakerguardd-selfcheck generate), so the links this helper owns are
+    the graph's ports. The record's own sense count is the wiring's sense
+    map, which a protection unit that takes no sense (ATSP, the J473's)
+    leaves out of the graph: helper links waiting for a sense node the
+    graph never has would never link the amps."""
     try:
         with open(args.selfcheck) as f:
-            rec = json.load(f)["record"]
+            report = json.load(f)
+        rec = report["record"]
     except (OSError, ValueError, KeyError) as e:
         raise SystemExit(f"{args.machine}: no self-check record ({e})")
     if rec.get("key") != args.machine or rec.get("result") != "pass":
         raise SystemExit(f"{args.machine}: the self-check record is for {rec.get('key')} ({rec.get('result')})")
-    return {"card": rec["card"], "amps": rec["amps"], "sense": rec["sense"]}
+    c = report.get("machine")
+    if not c:
+        raise SystemExit(f"{args.machine}: the self-check record has no machine description (no graph was generated from it)")
+    if c.get("key") != args.machine:
+        raise SystemExit(f"{args.machine}: the self-check's machine description is for {c.get('key')}")
+    return {"card": c["card"], "amps": c["amps"], "sense": c["sense"]}
 
 
 def main():
