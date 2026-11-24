@@ -101,7 +101,7 @@ SpTS is one unit's factory calibration. A bundle copied from another Mac of the 
 
 Open loop is the most protective case, not a guess: the closed loop can only raise the limit (`clamp(T_OL - T_CL, 0, cap)`), so without trusted calibration each channel holds its base limit, as M2 and M1 Pro already do. A unit without SpTS (lsm2, atsp, desktops) has nothing per unit, and a bundle without identity compiles for it as before. Provisioning binds the blob to the unit too (`provision.bind` key `unit`, the same hash), so a disk moved to another Mac recompiles and is refused there.
 
-To re-collect, run the installer's firmware step on this Mac's macOS, or `tools/speaker-tuning/collect-macos.sh` there and `install-linux.sh` on Linux (aurora-installer), then restart `speakerguardd-provision.service`. The manifest is integrity metadata, not a signature: the binding stops the wrong Mac's bundle, not a forged one.
+To re-collect, run `aurora-speaker-upgrade` (or the installer's firmware step). Both take the per-model tuning only from the pinned macOS restore image (27.2) and only per-unit values (calibration, speaker ID, identity) from the Mac. Then restart `speakerguardd-provision.service`. The manifest is integrity metadata, not a signature: the binding stops the wrong Mac's bundle, not a forged one.
 
 ## Rollout
 

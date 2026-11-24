@@ -1,43 +1,41 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Aurora Silicon Contributors
-"""This Mac's speaker tuning bundle, collected from Linux.
+"""This Mac's speaker tuning bundle, built on Linux from the pinned restore image.
 
 The bundle is the installer's own: the installer's collector
 (asahi_firmware.audio_tuning, vendored unchanged) builds it. This module
 only gives that collector what it reads on macOS:
 
-- the Tunings tree and the AudioDSP component, staged read-only from a
-  macOS System volume: the installed one (route 1, apfs_ro on the APFS
-  container) or the restore image's (route 2, apfs_ro over aea_ro);
-- the answers of `ioreg` and `sysctl`, from the ADT the boot chain exposes
-  (acoustic-id, speaker-thiele-small, target-type, serial-number), the
-  System volume's SystemVersion.plist (the build), and the speaker ID from
-  the boot chain (/chosen/asahi,speaker-id) or from this unit's own
-  installer bundle. Nothing is guessed: no source, no speaker ID.
+- the Tunings tree and the AudioDSP component, staged read-only from the
+  System volume of the pinned macOS restore image (ipsw.py: apfs_ro over
+  aea_ro, by HTTP ranges). Never from an installed macOS;
+- the answers of `ioreg` and `sysctl`: this unit's own values from unit.py
+  (acoustic-id, speaker-thiele-small, target-type, serial-number, speaker
+  ID) and the restore image's SystemVersion.plist (the build). Nothing is
+  guessed: no source, no speaker ID.
 """
 import json
 import logging
 import os
 import plistlib
 import shutil
-import stat
 import subprocess
 
-from . import adt_ro, apfs_ro
+from . import apfs_ro, unit
 from .asahi_firmware import audio_tuning, lsm2_lattice, lsm2_fill
 
 log = logging.getLogger("aurora-speaker-upgrade")
 
 TUNINGS = audio_tuning.TUNINGS_ROOT.lstrip("/")
 SYSTEM_VERSION = "System/Library/CoreServices/SystemVersion.plist"
-CHOSEN_SPID = "/proc/device-tree/chosen/asahi,speaker-id"
-DT_SERIAL = "/proc/device-tree/serial-number"
-APFS_GUID = "7c3457ef-0000-11aa-aa11-00306543ecac"
+CHOSEN_SPID = unit.CHOSEN_SPID
+INSTALLER_BUNDLES = unit.INSTALLER_BUNDLES
 STAGE_BUDGET = audio_tuning.MAX_BYTES + lsm2_lattice.MAX_COMPONENT_BYTES
 
 
-class CollectError(Exception):
-    pass
+# One error for both: a unit value the ADT cannot give refuses like a
+# tuning the restore image cannot give.
+CollectError = unit.UnitError
 
 
 class SpeakerIdUnknown(CollectError):
@@ -46,60 +44,10 @@ class SpeakerIdUnknown(CollectError):
 
 # --- the Mac's identity ---------------------------------------------------
 
-class Identity:
-    """What macOS's IORegistry would say, from the ADT."""
-
-    def __init__(self, adt_path=None):
-        try:
-            root = adt_ro.load(adt_path)
-        except (OSError, adt_ro.AdtError) as e:
-            raise CollectError(f"cannot read the ADT: {e}") from None
-        self.target_type = root["props"].get("target-type")
-        self.serial = root["props"].get("serial-number")
-        audio = [n for _, n in adt_ro.find(root, "audio")
-                 if isinstance(n["props"].get("acoustic-id"), bytes)]
-        if len(audio) != 1:
-            raise CollectError(f"the ADT has {len(audio)} audio nodes with an acoustic-id")
-        self.acoustic_raw = audio[0]["props"]["acoustic-id"]
-        self.spts = audio[0]["props"].get("speaker-thiele-small")
-        self.acoustic = audio_tuning.acoustic_id(self.acoustic_raw)
-        if self.acoustic is None:
-            raise CollectError("malformed acoustic-id in the ADT")
-        self.board = audio_tuning.board_name(self.target_type)
-        self.unit = audio_tuning.unit_id(self.serial)
-
-    def matches_dt(self, dt_serial=DT_SERIAL):
-        """The Linux device tree names the same unit (aura copies it)."""
-        try:
-            with open(dt_serial, "rb") as f:
-                return audio_tuning.unit_id(f.read()) == self.unit
-        except OSError:
-            return False
-
-
-# The HAL's invalid strap value. aura (aura#121) publishes it in
-# /chosen/asahi,speaker-id when the strap read is invalid, as macOS's
-# IORegistry reports it; the installer keeps it as reported in a bundle. It
-# is never a vendor index: it counts as no speaker ID.
-INVALID_SPEAKER_ID = 0xFFFF
-
-
-def valid_speaker_id(value):
-    return type(value) is int and 0 <= value <= 0xFFFFFFFF and value != INVALID_SPEAKER_ID
-
-
-def chosen_speaker_id(path=CHOSEN_SPID):
-    """/chosen/asahi,speaker-id (one big-endian u32 cell), or None (absent,
-    malformed, or the invalid strap value 65535)."""
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(16)
-    except OSError:
-        return None
-    if len(raw) != 4:
-        return None
-    value = int.from_bytes(raw, "big")
-    return value if valid_speaker_id(value) else None
+Identity = unit.Identity
+valid_speaker_id = unit.valid_speaker_id
+chosen_speaker_id = unit.chosen_speaker_id
+INVALID_SPEAKER_ID = unit.INVALID_SPEAKER_ID
 
 
 def selects_by_speaker_id(database_entry):
@@ -113,99 +61,6 @@ def selects_by_speaker_id(database_entry):
             return any(walk(v) for v in n)
         return False
     return walk(plistlib.loads(database_entry))
-
-
-# --- route 0: an installer bundle already on this Mac ----------------------
-
-INSTALLER_BUNDLES = ("/lib/firmware/vendor/apple/audio-tuning",
-                     "/run/aurora-firmware/vendorfw/apple/audio-tuning")
-
-
-def installer_bundle(identity, dirs=INSTALLER_BUNDLES):
-    """(directory, bundle dict) of a verified installer bundle bound to this
-    unit, or (None, reason)."""
-    reasons = []
-    for d in dirs:
-        if not os.path.isfile(os.path.join(d, audio_tuning.MANIFEST)):
-            continue
-        c = audio_tuning.AudioTuningFWCollection.__new__(audio_tuning.AudioTuningFWCollection)
-        c.fwfiles, c.bundle = [], {}
-        try:
-            c.update(d)
-        except Exception as e:
-            reasons.append(f"{d}: {e}")
-            continue
-        if not c.bundle:
-            reasons.append(f"{d}: empty")
-            continue
-        m = json.loads(c.bundle[audio_tuning.MANIFEST])
-        if m.get("unit_id") is None or m.get("unit_id") != identity.unit:
-            reasons.append(f"{d}: collected on {'an unnamed unit' if m.get('unit_id') is None else 'another unit'}")
-            continue
-        if m.get("board") != identity.board or m.get("acoustic_id") != identity.acoustic:
-            reasons.append(f"{d}: board or acoustic-id differ from this Mac's")
-            continue
-        if m.get("lsm2_mask_lattice") is None:
-            reasons.append(f"{d}: collected before the installer read the lsm2 lattice")
-            continue
-        if lsm2_fill.needs_fill(c.bundle) and m.get("lsm2_param_fill") is None:
-            reasons.append(f"{d}: collected before the installer read the lsm2 fill; "
-                           "route 3: aurora-speaker-upgrade guide")
-            continue
-        if not valid_speaker_id(m.get("speaker_id")) \
-                and selects_by_speaker_id(c.bundle[audio_tuning.DATABASE]):
-            # Its tuning selects by speaker ID, and the bundle has none (or the
-            # invalid strap value): the other routes, with the boot chain's ID.
-            reasons.append(f"{d}: no valid speaker ID, and AID{identity.acoustic} selects by it")
-            continue
-        return d, c.bundle
-    return None, "; ".join(reasons) or "no installer bundle on this Mac"
-
-
-# --- System volumes ----------------------------------------------------------
-
-def apfs_partitions(run=subprocess.run):
-    p = run(["lsblk", "-J", "-p", "-o", "PATH,PARTTYPE"], capture_output=True, text=True)
-    if p.returncode != 0:
-        return []
-    out = []
-
-    def walk(devs):
-        for d in devs:
-            if (d.get("parttype") or "").lower() == APFS_GUID:
-                out.append(d["path"])
-            walk(d.get("children") or [])
-    walk(json.loads(p.stdout).get("blockdevices", []))
-    return out
-
-
-def system_volumes(acoustic, devices=None):
-    """[(build, device, volume)] of every readable macOS System volume that
-    has this Mac's AID<n> tuning folder."""
-    found = []
-    for dev in devices if devices is not None else apfs_partitions():
-        try:
-            c = apfs_ro.Container(dev)
-            vols = [v for v in c.volumes() if v.role == apfs_ro.ROLE_SYSTEM and not v.encrypted]
-        except (OSError, apfs_ro.ApfsError) as e:
-            log.info(f"{dev}: not readable as APFS ({e})")
-            continue
-        for v in vols:
-            try:
-                v.resolve(f"{TUNINGS}/AID{acoustic}")
-                build = plistlib.loads(v.read_file(v.resolve(SYSTEM_VERSION)[0]))["ProductBuildVersion"]
-            except (apfs_ro.ApfsError, KeyError, ValueError) as e:
-                log.info(f"{dev} {v.name}: no tuning for AID{acoustic} ({e})")
-                continue
-            found.append((build, dev, v))
-    return found
-
-
-def build_key(build):
-    """25C56 -> (25, 'C', 56, ''): newer macOS builds sort later."""
-    import re
-    m = re.match(r"\A(\d+)([A-Z])(\d+)([a-z]?)\Z", build or "")
-    return (int(m[1]), m[2], int(m[3]), m[4]) if m else (0, "", 0, build or "")
 
 
 # --- staging ------------------------------------------------------------------
@@ -419,6 +274,40 @@ def for_this_reader(bundle):
     return out, dropped
 
 
+def component_sha256(staged):
+    """SHA-256 of the staged AudioDSP component (the restore image's)."""
+    import hashlib
+    with open(os.path.join(staged, lsm2_lattice.AUDIODSP), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def attach_fill(bundle, fill, component):
+    """The bundle with this unit's lsm2 parameter readback, or a reason it
+    does not fit (CollectError).
+
+    The readback runs Apple's AudioUnit, which only a running macOS can do,
+    so it cannot come from the restore image. It is taken only when it was
+    read from exactly this bundle: the same AID, build and unit, a
+    configuration digest over byte-identical strips, propstrips and property
+    lists, and the same AudioDSP component (SHA-256) as the restore image's.
+    The tuning itself always stays the restore image's."""
+    m = json.loads(bundle[audio_tuning.MANIFEST])
+    aid, build, own = m.get("aid"), m.get("macos_build"), m.get("unit_id")
+    try:
+        rec = audio_tuning.fill_record(fill, aid, build, own)
+        lsm2_fill.validate_configuration(fill, bundle, aid)
+        comps = {c["component_sha256"] for c in json.loads(fill)["presets"]}
+    except (ValueError, KeyError, TypeError) as e:
+        raise CollectError(f"lsm2 readback does not fit the restore image's {aid}: {e}") from None
+    if comps != {component}:
+        raise CollectError(f"lsm2 readback was taken from another AudioDSP component than macOS {build}'s")
+    out = dict(bundle)
+    out[lsm2_fill.NAME] = fill
+    m["lsm2_param_fill"] = rec
+    out[audio_tuning.MANIFEST] = audio_tuning.encode_manifest(m)
+    return out
+
+
 def write_bundle(bundle, dest):
     """Writes a bundle tree (0700 directories, 0600 files) at dest, which
     must not exist."""
@@ -444,37 +333,3 @@ def compare(a, b):
 def rmtree(path):
     if os.path.lexists(path):
         shutil.rmtree(path)
-
-
-ROLE_PREBOOT = 0x10
-# Where Preboot records each macOS's build: the restore record of the
-# installed system, then its cryptex.
-PREBOOT_VERSIONS = ("restore/SystemVersion.plist", "cryptex1/current/SystemVersion.plist")
-
-
-def preboot_build(dev):
-    """The installed macOS build as its Preboot volume records it (the
-    volume is never encrypted): <group>/restore/SystemVersion.plist; the
-    newest when several macOS share the container."""
-    try:
-        c = apfs_ro.Container(dev)
-        vols = [v for v in c.volumes() if v.role == ROLE_PREBOOT and not v.encrypted]
-    except (OSError, apfs_ro.ApfsError):
-        return None
-    builds = []
-    for v in vols:
-        try:
-            groups = v.children(v.resolve("/")[0])
-        except apfs_ro.ApfsError:
-            continue
-        for name, (ino, kind) in groups.items():
-            if kind != 4:
-                continue
-            for rec in PREBOOT_VERSIONS:
-                try:
-                    data = v.read_file(v.resolve(f"{name}/{rec}")[0])
-                    builds.append(plistlib.loads(data)["ProductBuildVersion"])
-                    break
-                except (apfs_ro.ApfsError, KeyError, ValueError):
-                    continue
-    return max(builds, key=build_key) if builds else None

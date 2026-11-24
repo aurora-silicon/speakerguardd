@@ -4,24 +4,20 @@
 protection (speakersafetyd, speakerguardd 0.1) to speakerguardd v2, with
 this Mac's own tuning, and back.
 
-    aurora-speaker-upgrade [run] [--route auto|0|1|2|3] [--ipsw URL] [--macos-build B]
-                                 [--collection TARBALL] [--no-switch]
+    aurora-speaker-upgrade [run] [--ipsw URL] [--no-switch]
     aurora-speaker-upgrade --revert [--purge]
     aurora-speaker-upgrade --check [--json FILE]                (dry run: /run only, nothing stored or switched)
     aurora-speaker-upgrade status
-    aurora-speaker-upgrade collect --out DIR [--route ...]     (no switch; for checks)
+    aurora-speaker-upgrade collect --out DIR                   (no switch; for checks)
     aurora-speaker-upgrade interface-apply                     (what speakerguardd-gate interface does; kept for scripts)
 
-1. The tuning bundle, the installer's own, first found of:
-   0. an installer bundle already on this Mac, bound to this unit;
-   1. the installed macOS System volume (read only from Linux; it is not
-      encrypted, FileVault or not) with the ADT the boot chain exposes;
-   2. Apple's restore image of that macOS build, by HTTP ranges;
-   3. a collection made on this Mac's macOS by the installer
-      (`--collection`, see `aurora-speaker-upgrade guide`).
-   The speaker ID comes from the boot chain (/chosen/asahi,speaker-id) or
-   from this unit's installer bundle; a Mac whose tuning selects by speaker
-   ID without either needs route 3. Nothing is guessed.
+1. The tuning bundle, the installer's own, built from one source only:
+   Apple's restore image of the pinned macOS release (27.2, the speaker
+   safety stack's), read by HTTP ranges (ipsw.py). Never from an installed
+   macOS, an older bundle or another build; no restore image, no bundle.
+   Only this unit's own values come from the Mac (unit.py: the ADT, the
+   boot chain's speaker ID, and the speaker ID and lsm2 readback of this
+   unit's installer bundle when they fit). Nothing is guessed.
 2. It is stored root-only in /var/lib/aurora-speaker-upgrade (0700), never
    packaged or sent anywhere.
 3. speakerguardd v2 compiles it and its self-check proves it, silently.
@@ -42,11 +38,10 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 
-from . import collect, ipsw
+from . import collect, ipsw, unit
 from .asahi_firmware import audio_tuning
 
 log = logging.getLogger("aurora-speaker-upgrade")
@@ -165,173 +160,71 @@ def digest(bundle):
 # --- acquisition -------------------------------------------------------------
 
 def speaker_id_source(identity, chosen=collect.CHOSEN_SPID, dirs=collect.INSTALLER_BUNDLES):
-    """(speaker ID or None, known?, where from)."""
-    v = collect.chosen_speaker_id(chosen)
-    if v is not None:
-        return v, True, "the boot chain (/chosen/asahi,speaker-id)"
-    for d in dirs:
-        try:
-            with open(os.path.join(d, audio_tuning.MANIFEST)) as f:
-                m = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if m.get("unit_id") == identity.unit and identity.unit and collect.valid_speaker_id(m.get("speaker_id")):
-            return m["speaker_id"], True, f"this unit's installer bundle ({d})"
-    return None, False, "none"
+    """(speaker ID or None, known?, where from): unit.speaker_id."""
+    return unit.speaker_id(identity, chosen, dirs)
 
 
-def route0(identity, a):
-    d, b = collect.installer_bundle(identity, a.installer_dirs)
-    if d is None:
-        raise collect.CollectError(b)
-    return b, {"route": 0, "source": d}
-
-
-def route1(identity, a, spid, known, scratch):
-    vols = collect.system_volumes(identity.acoustic, a.devices)
-    if not vols:
-        raise collect.CollectError("no readable macOS System volume with this Mac's tuning")
-    builds = sorted({b for b, _, _ in vols}, key=collect.build_key)
-    build, dev, vol = max(vols, key=lambda x: collect.build_key(x[0]))
-    if len(builds) > 1:
-        say(f"several macOS installs ({', '.join(builds)}): using the newest, {build} on {dev}")
-    st = tempfile.mkdtemp(prefix="stage-", dir=scratch)
-    collect.stage(vol, identity.acoustic, st)
-    b, got = collect.collect(st, identity, spid, known)
-    return b, {"route": 1, "source": f"{dev} ({vol.name})", "macos_build": got}
-
-
-def build_hint(identity, a):
-    """The macOS build to fetch: --macos-build, else the installed macOS's
-    Preboot record, else this unit's installer bundle."""
-    if a.macos_build:
-        return a.macos_build, "--macos-build"
-    for dev in a.devices if a.devices is not None else collect.apfs_partitions():
-        b = collect.preboot_build(dev)
-        if b:
-            return b, f"the Preboot volume of {dev}"
-    for d in a.installer_dirs:
-        try:
-            with open(os.path.join(d, audio_tuning.MANIFEST)) as f:
-                m = json.load(f)
-            if m.get("unit_id") == identity.unit and m.get("macos_build"):
-                return m["macos_build"], f"this unit's installer bundle ({d})"
-        except (OSError, ValueError):
-            pass
-    raise collect.CollectError("the installed macOS build is unknown (pass --macos-build)")
-
-
-def route2(identity, a, spid, known, scratch):
-    build, why = build_hint(identity, a)
-    url = ipsw.find_url(build, a.ipsw)
-    say(f"route 2: macOS {build} ({why}) from Apple's restore image, by ranges")
-    vol, rng, got = ipsw.open_system(url, identity.board, None if a.ipsw else build)
+def from_ipsw(identity, a, spid, known, scratch):
+    """(bundle, provenance, AudioDSP SHA-256) from the pinned restore image."""
+    try:
+        vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw)
+    except ipsw.IpswError as e:
+        raise collect.CollectError(str(e)) from None
+    say(f"macOS {build} restore image ({url.rsplit('/', 1)[-1]}), by ranges")
     st = tempfile.mkdtemp(prefix="stage-", dir=scratch)
     collect.stage(vol, identity.acoustic, st)
     b, sysbuild = collect.collect(st, identity, spid, known)
-    say(f"route 2: {rng.fetched >> 20} MiB fetched from Apple")
-    return b, {"route": 2, "source": url.rsplit("/", 1)[-1], "macos_build": sysbuild}
+    if sysbuild != build:
+        raise collect.CollectError(f"the restore image's System volume is macOS {sysbuild}, not {build}")
+    say(f"{rng.fetched >> 20} MiB fetched from Apple")
+    return b, {"source": url.rsplit("/", 1)[-1], "macos_build": sysbuild}, collect.component_sha256(st)
 
 
-def route3(identity, a):
-    if not a.collection:
-        raise collect.CollectError("no macOS collection given (see `aurora-speaker-upgrade guide`)")
-    with tempfile.TemporaryDirectory(dir=a.scratch) as t:
-        with tarfile.open(a.collection) as tf:
-            for m in tf.getmembers():
-                if not (m.isfile() or m.isdir()) or m.name.startswith("/") or ".." in m.name.split("/"):
-                    raise collect.CollectError(f"unexpected member in the collection: {m.name!r}")
-            tf.extractall(t, filter="data")
-        roots = [os.path.dirname(os.path.join(dp, audio_tuning.FALLBACK_DIR))
-                 for dp, dn, _ in os.walk(t) if audio_tuning.FALLBACK_DIR in dn]
-        if len(roots) != 1:
-            raise collect.CollectError("the collection holds no single audio-tuning/ bundle")
-        c = audio_tuning.AudioTuningFWCollection.__new__(audio_tuning.AudioTuningFWCollection)
-        c.fwfiles, c.bundle = [], {}
-        c.update(os.path.join(roots[0], audio_tuning.FALLBACK_DIR))
-    m = json.loads(c.bundle[audio_tuning.MANIFEST])
-    if m.get("unit_id") != identity.unit or m.get("board") != identity.board:
-        raise collect.CollectError("the collection was made on another Mac")
-    return c.bundle, {"route": 3, "source": os.path.basename(a.collection)}
+def with_fill(identity, b, component, dirs):
+    """b with this unit's lsm2 readback when its short presets need one
+    (collect.attach_fill decides whether it fits); refuses without one."""
+    m = json.loads(b[audio_tuning.MANIFEST])
+    if not collect.lsm2_fill.needs_fill(b) or m.get("lsm2_param_fill") is not None:
+        return b, None
+    reasons = []
+    for d, fill in unit.installer_fill(identity, m.get("aid"), dirs):
+        try:
+            return collect.attach_fill(b, fill, component), d
+        except collect.CollectError as e:
+            reasons.append(f"{d}: {e}")
+    raise Refused(f"{m.get('aid')} has short lsm2 presets, which need the parameter readback the installer "
+                  f"takes on this Mac's macOS {m.get('macos_build')} from the same files; "
+                  + ("; ".join(reasons) if reasons else "this unit's installer bundle has none")
+                  + ". The speakers stay as they are")
 
 
 def acquire(identity, a):
-    """(bundle, provenance). Tries the routes in order; refuses when none
-    gives a bundle."""
+    """(bundle, provenance) from the pinned restore image, or Refused."""
     spid, known, spid_from = speaker_id_source(identity, a.chosen, a.installer_dirs)
-    routes = [a.route] if a.route != "auto" else ["0", "1", "2", "3"]
-    reasons = []
-    # An installer bundle written before the installer collected the BuzzKill
-    # matrix, for a tuning with a BuzzKill unit, does not compile. With the
-    # other routes still to try (they read the matrix from this Mac's own
-    # macOS), it is kept aside and used only when none of them gives a bundle.
-    # A tuning without the unit takes the installer bundle as before.
-    held = None
-
-    def done(b, prov, m, r):
-        prov.update(speaker_id=m.get("speaker_id"), speaker_id_from=spid_from if r in "12" else "the bundle",
-                    aid=m.get("aid"), macos_build=m.get("macos_build"))
-        say(f"tuning {m.get('aid')} from macOS {m.get('macos_build')} via route {r} ({prov['source']})")
-        return b, prov
-
     os.makedirs(a.scratch, mode=0o700, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="scratch-", dir=a.scratch)
     try:
-        todo = list(routes)
-        while todo:
-            r = todo.pop(0)
-            try:
-                if r == "0":
-                    b, prov = route0(identity, a)
-                elif r == "1":
-                    b, prov = route1(identity, a, spid, known, scratch)
-                elif r == "2":
-                    b, prov = route2(identity, a, spid, known, scratch)
-                else:
-                    b, prov = route3(identity, a)
-            except collect.SpeakerIdUnknown as e:
-                reasons.append(f"route {r}: {e}")
-                # Every other route reads the same tuning: only route 3 (the
-                # macOS collection, which records the speaker ID) can give it.
-                todo = [x for x in todo if x == "3"]
-                continue
-            except Exception as e:
-                reasons.append(f"route {r}: {e}")
-                continue
-            try:
-                b, dropped = collect.for_this_reader(b)
-            except collect.CollectError as e:
-                reasons.append(f"route {r}: {e}")
-                continue
-            if dropped:
-                say(f"route {r}: the bundle carries {', '.join(dropped)}, which this speakerguardd "
-                    "does not read yet; it is stored without it")
-            m = json.loads(b[audio_tuning.MANIFEST])
-            if collect.lsm2_fill.needs_fill(b) and m.get("lsm2_param_fill") is None:
-                reasons.append(f"route {r}: collected before the installer read the lsm2 fill; "
-                               "route 3: boot this Mac's macOS and collect (aurora-speaker-upgrade guide)")
-                # Offline routes cannot host this owner's macOS AudioUnit.
-                # Still try an explicitly supplied route-3 collection.
-                continue
-            if m.get("unit_id") != identity.unit:
-                reasons.append(f"route {r}: the bundle does not name this unit")
-                continue
-            if r == "0" and todo and audio_tuning.BUZZKILL_KEY not in m and collect.has_buzz_unit(b):
-                say(f"route 0: {prov['source']} was collected before the installer read the BuzzKill "
-                    "quadrature matrix; trying the other routes for one (this bundle is used if none works)")
-                reasons.append(f"route 0: {prov['source']}: no BuzzKill quadrature matrix")
-                held = (b, prov, m)
-                continue
-            return done(b, prov, m, r)
+        try:
+            b, prov, component = from_ipsw(identity, a, spid, known, scratch)
+        except collect.CollectError as e:
+            raise Refused(f"no speaker tuning for this Mac: {e}") from None
     finally:
         collect.rmtree(scratch)
-    if held is not None:
-        say("route 0: no other route gave a bundle ("
-            + "; ".join(x for x in reasons if not x.startswith("route 0")) + "); using the installer bundle")
-        return done(*held, "0")
-    if a.route in ("auto", "3") and a.collection is None:
-        reasons.append("route 3: boot macOS once and collect (aurora-speaker-upgrade guide)")
-    raise Refused("no speaker tuning for this Mac:\n  " + "\n  ".join(reasons))
+    try:
+        b, dropped = collect.for_this_reader(b)
+    except collect.CollectError as e:
+        raise Refused(str(e)) from None
+    if dropped:
+        say(f"the bundle carries {', '.join(dropped)}, which this speakerguardd does not read yet; "
+            "it is stored without it")
+    b, fill_from = with_fill(identity, b, component, a.installer_dirs)
+    m = json.loads(b[audio_tuning.MANIFEST])
+    if m.get("unit_id") != identity.unit:
+        raise Refused("the bundle does not name this unit")
+    prov.update(speaker_id=m.get("speaker_id"), speaker_id_from=spid_from, aid=m.get("aid"),
+                macos_build=m.get("macos_build"), lsm2_fill_from=fill_from)
+    say(f"tuning {m.get('aid')} from macOS {m.get('macos_build')} ({prov['source']})")
+    return b, prov
 
 
 # --- speakerguardd v2 --------------------------------------------------------
@@ -760,9 +653,10 @@ def cmd_check(a):
         except Refused as e:
             step("acquire", "refused", str(e))
             return finish("refused", EXIT_REFUSED, str(e).splitlines()[0])
-        out.update({k: prov.get(k) for k in ("route", "source", "aid", "macos_build", "speaker_id", "speaker_id_from")},
+        out.update({k: prov.get(k) for k in ("source", "aid", "macos_build", "speaker_id", "speaker_id_from",
+                                              "lsm2_fill_from")},
                    bundle_digest=digest(b))
-        step("acquire", "pass", f"route {prov['route']} ({prov['source']})")
+        step("acquire", "pass", prov["source"])
         os.makedirs(a.scratch, mode=0o700, exist_ok=True)
         work = tempfile.mkdtemp(prefix="check-", dir=a.scratch)
         bdir = os.path.join(work, "bundle")
@@ -891,7 +785,7 @@ def _cmd_run(a):
         if (mode != "dual" or read_text(store.interface) == "v2\n") \
                 and (getattr(a, "at_boot", False) or v2_owns_speakers(mode, card)):
             say(f"nothing to do: speakerguardd v2 owns the speakers with {m.get('aid')} from macOS "
-                f"{m.get('macos_build')} (route {state.get('route')})")
+                f"{m.get('macos_build')} ({state.get('source')})")
             return EXIT_OK
         if not getattr(a, "at_boot", False):
             # Switched on record, but v2 does not hold the speakers in this
@@ -954,7 +848,7 @@ def _cmd_run(a):
         raise Refused("speakerguardd v2 did not take the speakers within "
                       f"{GRANT_WAIT_S} s: back on the legacy protection")
     say(f"done: speakerguardd v2 owns the speakers ({prov.get('aid')}, macOS {prov.get('macos_build')}, "
-        f"route {prov['route']}); the legacy stack stays installed (aurora-speaker-upgrade --revert)")
+        f"{prov.get('source')}); the legacy stack stays installed (aurora-speaker-upgrade --revert)")
     return EXIT_OK
 
 
@@ -966,7 +860,8 @@ def refusal_key(identity):
     try again; nothing else does."""
     h = hashlib.sha256()
     h.update(f"{identity.unit}\0{os.uname().release}\0".encode())
-    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY, GATE]:
+    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY, GATE,
+              ipsw.CATALOG]:
         try:
             with open(p or "", "rb") as f:
                 h.update(hashlib.sha256(f.read()).digest())
@@ -978,8 +873,9 @@ def refusal_key(identity):
 def cmd_run(a):
     """run, plus the boot unit's refusal record: a Mac the self-check (or the
     collection) refused is not tried again at every boot, which would stop
-    and restart the legacy protection each time for the same answer. The
-    record lives in the store and is keyed by refusal_key(); `run` by hand
+    and restart the legacy protection each time for the same answer (a new
+    pin of restore images counts as new data). The record lives in the
+    store and is keyed by refusal_key(); `run` by hand
     always tries again."""
     store = Store(a.store)
     identity = collect.Identity(a.adt)
@@ -1087,12 +983,13 @@ def cmd_status(a):
     b = store.read_bundle()
     m = json.loads(b[audio_tuning.MANIFEST]) if b else {}
     fill_needed = bool(b) and collect.lsm2_fill.needs_fill(b) and m.get("lsm2_param_fill") is None
-    print(json.dumps({"lsm2_fill": "collected before the installer read the lsm2 fill" if fill_needed
+    print(json.dumps({"lsm2_fill": "needed, not present" if fill_needed
                       else "present" if m.get("lsm2_param_fill") is not None else "not required",
-                      "lsm2_fill_next": "route 3: aurora-speaker-upgrade guide" if fill_needed else None,
+                      "lsm2_fill_next": "the installer's readback on this Mac's macOS, from the pinned build"
+                      if fill_needed else None,
                       "kernel_interface": mode, "switched": bool(st.get("switched")),
                       "setting": (read_text(store.interface) or "").strip() or None,
-                      "route": st.get("route"), "aid": m.get("aid"), "macos_build": m.get("macos_build"),
+                      "source": st.get("source"), "aid": m.get("aid"), "macos_build": m.get("macos_build"),
                       "speaker_id": m.get("speaker_id"), "bundle_digest": st.get("digest"),
                       "boot_migration": boot_migration(a)}, indent=2))
     return EXIT_OK
@@ -1128,34 +1025,17 @@ def cmd_interface_apply(a):
 ACK_FLAG = "--i-understand-preview"
 
 
-GUIDE = """Route 3: collect this Mac's speaker tuning on its own macOS, once.
-Needed only when Linux cannot read it (no readable macOS, no restore image of
-its build) or when the tuning selects by speaker ID and the boot chain does
-not report it.
-  1. Boot macOS (hold the power button, choose Macintosh HD) and turn the
-     volume to 0.
-  2. In Terminal, from a checkout of github.com/aurora-silicon/aurora-installer:
-       tools/speaker-tuning/collect-macos.sh
-     It reads only, needs no sudo, and writes
-     ~/aurora-speaker-tuning-<mac>-AID<n>.tar.gz.
-  3. Copy that file to Linux (a USB stick or scp), boot Linux, then:
-       sudo aurora-speaker-upgrade --collection ~/aurora-speaker-tuning-<mac>-AID<n>.tar.gz
-"""
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="aurora-speaker-upgrade", description=__doc__.split("\n\n")[0])
     ap.add_argument("cmd", nargs="?", default="run",
-                    choices=["run", "check", "collect", "status", "guide", "interface-apply", "revert"])
+                    choices=["run", "check", "collect", "status", "interface-apply", "revert"])
     ap.add_argument("--revert", action="store_true", help="go back to the legacy protection")
     ap.add_argument("--check", action="store_true",
                     help="dry run: collect, compile and self-check in /run only; nothing stored or switched")
     ap.add_argument("--json", help="--check: write the result here")
     ap.add_argument("--purge", action="store_true", help="with --revert: remove the stored bundle")
-    ap.add_argument("--route", default="auto", choices=["auto", "0", "1", "2", "3"])
-    ap.add_argument("--ipsw", help="route 2: this restore image (an Apple CDN URL)")
-    ap.add_argument("--macos-build", help="route 2: this macOS build")
-    ap.add_argument("--collection", help="route 3: the installer's macOS collection tarball")
+    ap.add_argument("--ipsw", help="read the pinned restore image from this address (a mirror); "
+                    "its build must still be a pinned one")
     ap.add_argument("--no-switch", action="store_true", help="collect and store only")
     ap.add_argument("--at-boot", action="store_true",
                     help="run: skip a Mac refused before for the same kernel and speakerguardd (the boot unit)")
@@ -1163,7 +1043,6 @@ def main(argv=None):
     ap.add_argument("--out", help="collect: the directory to write the bundle to (must not exist)")
     ap.add_argument("--store", default=STORE)
     ap.add_argument("--adt", help="the ADT (default: the boot chain's 'adt' MTD partition)")
-    ap.add_argument("--device", action="append", dest="devices", help="APFS container(s) to read (default: all)")
     ap.add_argument("--installer-dir", action="append", dest="installer_dirs")
     ap.add_argument("--chosen", default=collect.CHOSEN_SPID)
     ap.add_argument("--scratch", default=None)
@@ -1180,9 +1059,6 @@ def main(argv=None):
     a.installer_dirs = a.installer_dirs or list(collect.INSTALLER_BUNDLES)
     # Staging (about 25 MB) in a root-only directory on /run, never in the store.
     a.scratch = a.scratch or "/run/aurora-speaker-upgrade.scratch"
-    if a.cmd == "guide":
-        print(GUIDE)
-        return EXIT_OK
     if os.geteuid() != 0:
         say("run me as root")
         return EXIT_RETRY

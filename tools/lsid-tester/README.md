@@ -50,11 +50,9 @@ sudo bash linux/run-linux.sh            # writes ./lsid-tester-linux-<time>.log
 ```
 
 Options for `run-linux.sh`:
-- `--bundle PATH` uses your tuning bundle (the directory or `.tar.gz` from
-  `collect-macos.sh`). Without it the script uses the bundle
-  `aurora-speaker-upgrade` stored, then the system firmware.
-- `--collection TARBALL` passes the same tarball to
-  `aurora-speaker-upgrade --check`.
+- `--bundle PATH` uses your tuning bundle (a directory or `.tar.gz`).
+  Without it the script uses the bundle `aurora-speaker-upgrade` stored,
+  then the system firmware.
 
 `build-v2.sh --src DIR` uses a checkout you already have, and so does running
 the kit from `tools/lsid-tester` inside a speakerguardd checkout; nothing in

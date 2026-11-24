@@ -1,26 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Aurora Silicon Contributors
-"""Route 2: this Mac's macOS build, read from Apple's restore image (IPSW)
-by HTTP ranges, without downloading it.
+"""The one source of this Mac's per-model speaker tuning: Apple's macOS
+restore image (IPSW) of the pinned release, read by HTTP ranges without
+downloading it.
 
-The restore image of a build is found in Apple's IPSW feed (mesu) or in the
-packaged catalog of restore images (public CDN addresses only, no Apple
-data). Its BuildManifest names the root file system member for this board;
-aea_ro decodes it on demand and apfs_ro reads its System volume.
+The pin (share/restore-images.json) names the release (macOS 27.2, the
+speaker safety stack's) and its restore images in order. The first one
+whose BuildManifest carries this Mac's board gives the root file system;
+aea_ro decodes it on demand and apfs_ro reads its System volume. The image
+must be exactly a pinned build. There is no other source: not the installed
+macOS, not an older bundle, not another build. If no pinned image carries
+the board, or one cannot be read, the tool refuses and the speakers stay
+as they are.
 """
 import json
 import logging
 import os
 import plistlib
-import urllib.request
 
 from . import aea_ro, apfs_ro, remotezip
 
 log = logging.getLogger("aurora-speaker-upgrade")
 
-MESU = "https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml"
 CATALOG = "/usr/share/aurora-speaker-upgrade/restore-images.json"
-MAX_FEED = 8 << 20
 MAX_MANIFEST = 64 << 20
 
 
@@ -28,70 +30,82 @@ class IpswError(Exception):
     pass
 
 
-def feed_urls(fetch=None):
-    """{build: url} from Apple's IPSW feed."""
-    try:
-        req = urllib.request.Request(MESU, headers={"User-Agent": aea_ro.UA})
-        with (fetch or urllib.request.urlopen)(req, timeout=30) as r:
-            data = r.read(MAX_FEED + 1)
-        if len(data) > MAX_FEED:
-            raise IpswError("Apple's IPSW feed is over budget")
-        feed = plistlib.loads(data)
-    except Exception as e:
-        log.info(f"Apple's IPSW feed is unavailable: {e}")
-        return {}
-    out = {}
-    for group in feed.get("MobileDeviceSoftwareVersionsByVersion", {}).values():
-        for builds in (group.get("MobileDeviceSoftwareVersions") or {}).values():
-            for build, v in (builds or {}).items():
-                url = ((v or {}).get("Restore") or {}).get("FirmwareURL")
-                if isinstance(url, str) and build != "Unknown":
-                    out.setdefault(build, url)
-    return out
-
-
-def catalog_urls(paths=(CATALOG, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                "share", "restore-images.json"))):
-    """{build: url} from the packaged catalog (or, uninstalled, the one
-    beside this package)."""
+def pin(paths=None):
+    """(release, [(build, url)]) from the packaged pin (or, uninstalled, the
+    one beside this package)."""
+    if paths is None:
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        paths = (CATALOG, os.path.join(here, "share", "restore-images.json"))
     for path in paths:
         try:
             with open(path) as f:
-                return {k: v for k, v in json.load(f).get("restore_images", {}).items() if isinstance(v, str)}
+                doc = json.load(f)
         except (OSError, ValueError):
             continue
-    return {}
+        images = doc.get("restore_images")
+        release = doc.get("macos")
+        if not isinstance(release, str) or not isinstance(images, list) or not images:
+            raise IpswError(f"{path}: malformed restore image pin")
+        out = []
+        for i in images:
+            if not (isinstance(i, dict) and isinstance(i.get("build"), str)
+                    and isinstance(i.get("url"), str) and i["url"].startswith("https://")):
+                raise IpswError(f"{path}: malformed restore image pin entry")
+            out.append((i["build"], i["url"]))
+        return release, out
+    raise IpswError("no restore image pin is installed (restore-images.json)")
 
 
-def find_url(build, explicit=None):
-    if explicit:
-        return explicit
-    url = catalog_urls().get(build) or feed_urls().get(build)
-    if not url:
-        raise IpswError(f"no restore image of macOS {build} is known (pass --ipsw URL)")
-    return url
+def os_member(manifest, board):
+    """The root file system member a BuildManifest names for a board, or
+    None when the image does not carry it."""
+    paths = {bi["Manifest"]["OS"]["Info"]["Path"] for bi in manifest.get("BuildIdentities", [])
+             if bi.get("Info", {}).get("DeviceClass") == f"{board}ap" and "OS" in bi.get("Manifest", {})}
+    if len(paths) > 1:
+        raise IpswError(f"the restore image names {len(paths)} root file systems for {board}")
+    return paths.pop() if paths else None
 
 
-def open_system(url, board, build=None):
-    """(System volume, range fetcher) of the restore image at url, for a
-    board (j413) and, when given, exactly that build."""
-    z = remotezip.RemoteZip(url)
+def _manifest(z):
     m = z.members.get("BuildManifest.plist")
     if m is None or m.usize > MAX_MANIFEST:
         raise IpswError("the restore image has no usable BuildManifest")
-    bm = plistlib.loads(m.read(MAX_MANIFEST))
-    if build and bm.get("ProductBuildVersion") != build:
-        raise IpswError(f"the restore image is macOS {bm.get('ProductBuildVersion')}, not {build}")
-    paths = {bi["Manifest"]["OS"]["Info"]["Path"] for bi in bm.get("BuildIdentities", [])
-             if bi.get("Info", {}).get("DeviceClass") == f"{board}ap" and "OS" in bi.get("Manifest", {})}
-    if len(paths) != 1:
-        raise IpswError(f"the restore image names {len(paths)} root file systems for {board}")
-    member = paths.pop()
+    return plistlib.loads(m.read(MAX_MANIFEST))
+
+
+def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
+    """(build, url, BuildManifest, member) of the pinned image for a board.
+    url (--ipsw, e.g. a local mirror) replaces the addresses, never the pin:
+    its build must still be a pinned one."""
+    release, pinned = pin() if images is None else images
+    builds = [b for b, _ in pinned]
+    candidates = [(None, url)] if url else pinned
+    reasons = []
+    for build, u in candidates:
+        try:
+            bm = _manifest(open_zip(u))
+        except (IpswError, remotezip.RemoteZipError, OSError, ValueError) as e:
+            raise IpswError(f"macOS {release} restore image {build or u}: {e}") from None
+        got = bm.get("ProductBuildVersion")
+        if got not in builds or (build is not None and got != build):
+            raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
+                            f"({', '.join(builds)})")
+        member = os_member(bm, board)
+        if member is not None:
+            return got, u, bm, member
+        reasons.append(got)
+    raise IpswError(f"no pinned macOS {release} restore image ({', '.join(reasons)}) carries board {board}")
+
+
+def open_system(board, images=None, url=None):
+    """(System volume, range fetcher, build) of the pinned restore image for
+    a board (j413)."""
+    build, url, bm, member = find(board, images, url)
     if member.endswith(".aea"):
         a, rng, _ = aea_ro.open_member(url, member)
         src = a
     else:
-        mem = z.members.get(member)
+        mem = remotezip.RemoteZip(url).members.get(member)
         if mem is None or mem.method != 0:
             raise IpswError(f"{member}: not a stored member")
         rng = aea_ro.Ranges(url)
@@ -99,4 +113,4 @@ def open_system(url, board, build=None):
     vols = [v for v in apfs_ro.Container(src).volumes() if v.role == apfs_ro.ROLE_SYSTEM]
     if len(vols) != 1:
         raise IpswError("the root file system has no single System volume")
-    return vols[0], rng, bm.get("ProductBuildVersion")
+    return vols[0], rng, build, url

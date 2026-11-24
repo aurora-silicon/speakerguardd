@@ -38,7 +38,7 @@
 //! the limit above the base (`clamp(T_OL - T_CL, 0, cap)`), so without
 //! trusted calibration every channel holds the base limit.  A refusal
 //! leaves no blob: no grant, the speakers stay at the kernel's floor.  The
-//! remedy for both is to collect the tuning again on this Mac's macOS.
+//! remedy for both is to collect the tuning again (aurora-speaker-upgrade).
 //! The manifest is integrity metadata, not a signature: the binding stops a
 //! bundle from the wrong Mac, not a forged one.
 //!
@@ -113,8 +113,8 @@ struct Bound {
 }
 
 /// What the compile tells someone fixing a refusal or a warning.
-pub const RECOLLECT: &str = "collect the speaker tuning again on this Mac's macOS \
-(the installer's firmware step, or tools/speaker-tuning/collect-macos.sh then install-linux.sh)";
+pub const RECOLLECT: &str = "collect the speaker tuning again from the pinned restore image \
+(sudo aurora-speaker-upgrade, or the installer's firmware step)";
 
 /// Whether the bundle's per-unit calibration is this Mac's.  `Err` for a
 /// bundle collected on another unit; see the module documentation.

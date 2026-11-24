@@ -167,50 +167,6 @@ class SpeakerId(unittest.TestCase):
         self.assertIsNone(at.probe_speaker_id(collect.FakeRun(I(), "25C56", None)))
 
 
-class UnknownSpeakerIdGoesToRoute3(unittest.TestCase):
-    """An AID that selects its tuning by speaker ID, with no speaker ID from
-    the boot chain: routes 1 and 2 read the same tuning and cannot select
-    it, but the macOS collection (route 3) records the ID and must still be
-    tried."""
-
-    def test_route3_after_unknown_speaker_id(self):
-        import tempfile, types
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
-        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-        tried = []
-        unit = "u" * 64
-        bundle = {at.MANIFEST: json.dumps({"unit_id": unit, "aid": "AID40", "macos_build": "26A428",
-                                           "speaker_id": 3}).encode()}
-
-        def r0(identity, a):
-            tried.append("0")
-            raise collect.CollectError("no installer bundle on this Mac")
-
-        def r1(identity, a, spid, known, scratch):
-            tried.append("1")
-            raise collect.SpeakerIdUnknown("AID40 selects its speaker tuning by speaker ID")
-
-        def r2(identity, a, spid, known, scratch):
-            tried.append("2")
-            return bundle, {"route": "2", "source": "ipsw"}
-
-        def r3(identity, a):
-            tried.append("3")
-            return bundle, {"route": "3", "source": "collection"}
-
-        with tempfile.TemporaryDirectory() as d:
-            a = types.SimpleNamespace(route="auto", chosen=None, installer_dirs=[], scratch=d, collection="c.tar.gz")
-            ident = types.SimpleNamespace(unit=unit)
-            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, None)), \
-                    mock.patch.object(up, "route0", r0), mock.patch.object(up, "route1", r1), \
-                    mock.patch.object(up, "route2", r2), mock.patch.object(up, "route3", r3):
-                b, prov = up.acquire(ident, a)
-        self.assertEqual(tried, ["0", "1", "3"])
-        self.assertEqual(prov["route"], "3")
-        self.assertEqual(prov["speaker_id"], 3)
-
-
 class RecordsThisReaderDoesNotRead(unittest.TestCase):
     """A record a newer installer writes before this speakerguardd reads it
     (UNREAD_RECORDS) is dropped with its file; `buzzkill_quadrature`, which
@@ -270,30 +226,6 @@ class RecordsThisReaderDoesNotRead(unittest.TestCase):
         with mock.patch.dict(collect.UNREAD_RECORDS, self.FUTURE), self.assertRaises(collect.CollectError):
             collect.for_this_reader(b)
 
-    def test_acquire_keeps_the_matrix_of_a_route3_collection(self):
-        import tempfile, types
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
-        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-
-        def r3(identity, a):
-            return self.bundle(True), {"route": "3", "source": "collection"}
-
-        with tempfile.TemporaryDirectory() as d:
-            a = types.SimpleNamespace(route="auto", chosen=None, installer_dirs=[], scratch=d,
-                                      collection="c.tar.gz")
-            ident = types.SimpleNamespace(unit="u" * 64)
-            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, None)), \
-                    mock.patch.object(up, "route0", mock.Mock(side_effect=collect.CollectError("none"))), \
-                    mock.patch.object(up, "route1", mock.Mock(side_effect=collect.CollectError("x"))), \
-                    mock.patch.object(up, "route2", mock.Mock(side_effect=collect.CollectError("y"))), \
-                    mock.patch.object(up, "route3", r3), mock.patch.object(up, "say"):
-                b, prov = up.acquire(ident, a)
-        self.assertEqual(prov["route"], "3")
-        self.assertIn("buzzkill_quadrature", json.loads(b[at.MANIFEST]))
-        self.assertEqual(b[self.BIN], b"\x01" * 80)
-
-
 def buzz_strip(subtype=0x62757A6B, kind=0x61756678, fmt=plistlib.FMT_BINARY):
     """A strip naming one Audio Unit, the way the tuning's strips do."""
     return plistlib.dumps({"Boxes": [{"unit": {"type": kind, "subtype": subtype, "manufacturer": "appl"}}]},
@@ -319,80 +251,6 @@ class BuzzUnit(unittest.TestCase):
     def test_the_manifest_is_not_read(self):
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
         self.assertFalse(collect.has_buzz_unit({at.MANIFEST: buzz_strip()}))
-
-
-class Route0WithoutTheBuzzKillMatrix(unittest.TestCase):
-    """An installer bundle collected before the installer read the BuzzKill
-    matrix, for a tuning with a BuzzKill unit, does not compile: the other
-    routes (this Mac's own macOS) are tried first, and the installer bundle is
-    used only when none gives a bundle. Without the unit, route 0 is used as
-    before."""
-
-    def bundle(self, buzz, matrix, route):
-        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-        doc = {"schema": 2, "aid": "AID12", "acoustic_id": 12, "unit_id": "u" * 64,
-               "speaker_id": None, "macos_build": "00A00" + route}
-        b = {"AID12/DSP/Strips/s.austrip": buzz_strip(subtype=0x62757A6B if buzz else 0x7662656E)}
-        if matrix:
-            doc["buzzkill_quadrature"] = {"path": "buzzkill-quadrature.bin"}
-            b["buzzkill-quadrature.bin"] = b"\x01" * 80
-        b[at.MANIFEST] = json.dumps(doc).encode()
-        return b
-
-    def acquire(self, r0, r1, r2=None, route="auto"):
-        import tempfile, types
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
-        tried = []
-
-        def wrap(name, f):
-            def g(*args):
-                tried.append(name)
-                if isinstance(f, Exception):
-                    raise f
-                return f, {"route": int(name), "source": "src" + name}
-            return g
-        with tempfile.TemporaryDirectory() as d:
-            a = types.SimpleNamespace(route=route, chosen=None, installer_dirs=[], scratch=d, collection=None)
-            ident = types.SimpleNamespace(unit="u" * 64)
-            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, "none")), \
-                    mock.patch.object(up, "route0", wrap("0", r0)), mock.patch.object(up, "route1", wrap("1", r1)), \
-                    mock.patch.object(up, "route2", wrap("2", r2 or collect.CollectError("no ipsw"))), \
-                    mock.patch.object(up, "route3", wrap("3", collect.CollectError("no collection"))), \
-                    mock.patch.object(up, "say"):
-                b, prov = up.acquire(ident, a)
-        return b, prov, tried
-
-    def test_the_macos_route_gives_the_matrix(self):
-        b, prov, tried = self.acquire(self.bundle(True, False, "0"), self.bundle(True, True, "1"))
-        self.assertEqual(tried, ["0", "1"])
-        self.assertEqual(prov["route"], 1)
-        self.assertIn("buzzkill-quadrature.bin", b)
-
-    def test_the_installer_bundle_when_no_other_route_works(self):
-        r0 = self.bundle(True, False, "0")
-        b, prov, tried = self.acquire(r0, collect.CollectError("no System volume"))
-        self.assertEqual(tried, ["0", "1", "2", "3"])
-        self.assertEqual(prov["route"], 0)
-        self.assertEqual(b, r0)
-
-    def test_without_a_buzzkill_unit_route0_is_used(self):
-        r0 = self.bundle(False, False, "0")
-        b, prov, tried = self.acquire(r0, self.bundle(False, True, "1"))
-        self.assertEqual(tried, ["0"])
-        self.assertEqual(b, r0)
-
-    def test_with_the_matrix_route0_is_used(self):
-        r0 = self.bundle(True, True, "0")
-        b, prov, tried = self.acquire(r0, self.bundle(True, True, "1"))
-        self.assertEqual(tried, ["0"])
-        self.assertEqual(b, r0)
-
-    def test_route0_asked_for_is_used_as_is(self):
-        r0 = self.bundle(True, False, "0")
-        b, prov, tried = self.acquire(r0, self.bundle(True, True, "1"), route="0")
-        self.assertEqual(tried, ["0"])
-        self.assertEqual(b, r0)
 
 
 class DualKernelRun(unittest.TestCase):
@@ -495,7 +353,7 @@ class DualKernelRun(unittest.TestCase):
             with contextlib.ExitStack() as es:
                 es.enter_context(mock.patch.object(up.collect, "Identity", Ident))
                 es.enter_context(mock.patch.object(up, "interface_mode", return_value=("dual", "1")))
-                es.enter_context(mock.patch.object(up, "acquire", return_value=({}, {"route": 1, "aid": "AID9"})))
+                es.enter_context(mock.patch.object(up, "acquire", return_value=({}, {"source": "ipsw", "aid": "AID9"})))
                 es.enter_context(mock.patch.object(up, "digest", return_value="dg"))
                 es.enter_context(mock.patch.object(up.Store, "put_bundle", lambda self, b: None))
                 es.enter_context(mock.patch.object(up.Store, "read_bundle", lambda self: None))

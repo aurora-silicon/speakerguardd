@@ -10,48 +10,45 @@ sudo aurora-speaker-upgrade            # collect, compile, self-check, switch (i
 sudo aurora-speaker-upgrade status
 sudo aurora-speaker-upgrade --check [--json F]   # dry run: collect, compile, self-check in /run; nothing stored or switched
 sudo aurora-speaker-upgrade --revert   # back to the legacy protection (--purge drops the bundle)
-aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read the tuning
 ```
 
 ## What it does
 
 1. **Tuning bundle.** The bundle is the installer's own. The installer's
    collector (`asahi_firmware.audio_tuning`, vendored unchanged, see
-   `aurora_speaker_upgrade/asahi_firmware/__init__.py`) builds it from the
-   first source that works:
-   0. an installer bundle already on the Mac, bound to this unit
-      (`unit_id`);
-   1. the installed macOS's System volume. `apfs_ro` reads it from Linux,
-      read only, straight from the block device. The volume is not encrypted,
-      whether FileVault is on or off; only Data is.
-   2. Apple's restore image (IPSW) of that macOS build. `aea_ro` reads it by
-      HTTP ranges, about 20 MB of a 19 GB image, and decrypts it with the key
-      Apple publishes for it. `aea_ro` is a port of the installer's AEA range
-      path (its pinned reference, macos-firmware-extract@71b413af).
-      `tests/` checks it against that reference's vectors. The build comes
-      from the Preboot volume, which is also not encrypted.
-   3. a collection made on the Mac's own macOS with the installer's
-      `tools/speaker-tuning/collect-macos.sh` (`--collection`).
+   `aurora_speaker_upgrade/asahi_firmware/__init__.py`) builds it from one
+   source only: Apple's restore image (IPSW) of the pinned macOS release.
+   The pin, `share/restore-images.json`, names the release (macOS 27.2, the
+   speaker safety stack's, for every Mac whatever macOS it runs) and its
+   restore images in order; the first one whose BuildManifest carries this
+   Mac's board is used, and its build must be a pinned one. `aea_ro` reads
+   it by HTTP ranges, about 26 MB of a 19 GB image, and decrypts it with the
+   key Apple publishes for it (a port of the installer's AEA range path,
+   macos-firmware-extract@71b413af; `tests/` checks it against that
+   reference's vectors). `apfs_ro` reads its System volume: the Tunings
+   tree and the AudioDSP component (lsm2 lattice, BuzzKill quadrature
+   matrix). `--ipsw URL` reads the same pinned image from a mirror.
+   There is no other source: not the installed macOS, not an older bundle,
+   not another build. If no pinned image carries the board, or it cannot be
+   read, the tool refuses and the speakers stay as they are.
 
-   The ADT the boot chain exposes as the `adt` MTD partition answers what
-   the collector asks macOS's IORegistry for: acoustic-id,
-   speaker-thiele-small, target-type and the serial number (only its hash
-   is kept). The speaker ID comes from the boot chain
-   (`/chosen/asahi,speaker-id`) or from this unit's installer bundle. If the
-   tuning selects by speaker ID and neither source has it, the tool refuses
-   and points to route 3. Nothing is guessed.
-   Short lsm2 presets also require the owner's live macOS parameter readback
-   (`lsm2-param-fill.bin`, manifest `lsm2_param_fill`). `status` and `--check`
-   report “collected before the installer read the lsm2 fill” when it is
-   missing and point to `aurora-speaker-upgrade guide` (route 3). Offline
-   routes cannot manufacture this field; collect it on this Mac's running
-   macOS with the current `tools/speaker-tuning/collect-macos.sh`. No tuning
-   values are packaged or uploaded. Full presets need no fill.
-   Routes 1 and 2 also collect the BuzzKill detector's quadrature matrix
-   (`buzzkill_quadrature`) from that macOS's AudioDSP component; a tuning
-   with a BuzzKill unit does not compile without it. A route 0 bundle
-   collected before the installer read the matrix, for such a tuning, is
-   used only when routes 1 to 3 give nothing.
+   Only this unit's own values come from the Mac, all in `unit.py`: the ADT
+   the boot chain exposes as the `adt` MTD partition (acoustic-id,
+   speaker-thiele-small, target-type, the serial number, of which only its
+   hash is kept), the speaker ID from the boot chain
+   (`/chosen/asahi,speaker-id`) or from this unit's installer bundle, and
+   the lsm2 parameter readback described next. If the tuning selects by
+   speaker ID and neither source has it, the tool refuses. Nothing is
+   guessed.
+
+   Short lsm2 presets need the parameter readback (`lsm2-param-fill.bin`,
+   manifest `lsm2_param_fill`) that the installer takes by hosting the
+   AudioUnit on this Mac's macOS; a restore image cannot run it. It is
+   taken from this unit's installer bundle only when it was read from
+   exactly the restore image's files: the same AID, build and unit, the
+   same configuration digest over the strips, propstrips and property
+   lists, and the same AudioDSP component (SHA-256). Otherwise the tool
+   refuses. `status` reports a missing readback. Full presets need none.
    A bundle that carries a record speakerguardd v2 does not read yet
    (`UNREAD_RECORDS` in `collect.py`; none today) is stored without that
    record and its file, and the tool says so: the tuning reader refuses any
@@ -99,5 +96,6 @@ the gate data holds for playback rows, LSID's static release), and `status`
 shows `boot_migration`. A new playback row makes the boot unit try a
 refused Mac again.
 
-Requirements: python3, python3-cryptography, liblzfse, util-linux
-(lsblk), alsa-utils, systemd, and speakerguardd v2 for the switch.
+Requirements: python3, python3-cryptography, liblzfse, alsa-utils,
+systemd, network access to Apple's CDN and key service, and speakerguardd
+v2 (the same release) for the switch.
