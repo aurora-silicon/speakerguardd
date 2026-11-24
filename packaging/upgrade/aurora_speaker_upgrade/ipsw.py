@@ -90,7 +90,7 @@ def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
     for build, u in candidates:
         try:
             bm = _manifest(open_zip(u))
-        except OSError as e:
+        except (remotezip.RemoteZipUnavailable, OSError) as e:
             raise IpswUnavailable(f"macOS {release} restore image {build or u}: {e}") from None
         except (IpswError, remotezip.RemoteZipError, ValueError) as e:
             raise IpswError(f"macOS {release} restore image {build or u}: {e}") from None
@@ -116,7 +116,7 @@ def open_system(board, images=None, url=None):
     try:
         a, rng, _ = aea_ro.open_member(url, member)
         vols = [v for v in apfs_ro.Container(a).volumes() if v.role == apfs_ro.ROLE_SYSTEM]
-    except (aea_ro.AeaUnavailable, OSError) as e:
+    except (aea_ro.AeaUnavailable, remotezip.RemoteZipUnavailable, OSError) as e:
         raise IpswUnavailable(f"macOS {build} restore image: {e}") from None
     except (aea_ro.AeaError, apfs_ro.ApfsError, remotezip.RemoteZipError) as e:
         raise IpswError(f"macOS {build} restore image: {e}") from None

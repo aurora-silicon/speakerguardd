@@ -2,6 +2,7 @@
 """The pinned restore image is the only source of per-model tuning; only
 unit.py reads the Mac. Synthetic data only, no network, no hardware."""
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -103,7 +104,7 @@ class OfflineAtBoot(unittest.TestCase):
     boot (with Wi-Fi up) tries again. The image's own answers still refuse
     and are recorded."""
 
-    def run_boot(self, error):
+    def run_boot(self):
         with tempfile.TemporaryDirectory() as d:
             ident = types.SimpleNamespace(unit="u" * 64, board="j473", acoustic=12, matches_dt=lambda: True)
             a = types.SimpleNamespace(store=d, adt=None, at_boot=True, chosen=None, installer_dirs=[],
@@ -113,7 +114,6 @@ class OfflineAtBoot(unittest.TestCase):
                     mock.patch.object(up, "playback_proof", return_value=True), \
                     mock.patch.object(up, "speaker_id_source", return_value=(None, False, "none")), \
                     mock.patch.object(up.Store, "ensure", lambda self: os.makedirs(self.root, exist_ok=True)), \
-                    mock.patch.object(up.ipsw, "open_system", side_effect=error), \
                     mock.patch.object(up, "say"):
                 try:
                     up.cmd_run(a)
@@ -125,10 +125,29 @@ class OfflineAtBoot(unittest.TestCase):
             return outcome, os.path.exists(os.path.join(d, "refused.json"))
 
     def test_unreachable_is_retry_without_a_record(self):
-        self.assertEqual(self.run_boot(ipsw.IpswUnavailable("no route to host")), ("retry", False))
+        with mock.patch.object(ipsw, "open_system", side_effect=ipsw.IpswUnavailable("no route to host")):
+            self.assertEqual(self.run_boot(), ("retry", False))
 
     def test_an_answer_of_the_image_is_recorded(self):
-        self.assertEqual(self.run_boot(ipsw.IpswError("no pinned image carries board j473")), ("refused", True))
+        with mock.patch.object(ipsw, "open_system", side_effect=ipsw.IpswError("no pinned image carries board j473")):
+            self.assertEqual(self.run_boot(), ("refused", True))
+
+    def test_incomplete_zip_range_retries_without_a_record(self):
+        def open_url(request, **kwargs):
+            if request.get_method() == "HEAD":
+                response = io.BytesIO()
+                response.headers = {"Content-Length": "400", "Accept-Ranges": "bytes"}
+                return response
+            if reported_by_http:
+                raise http.client.IncompleteRead(bytes(399), 1)
+            return io.BytesIO(bytes(399))
+
+        for reported_by_http in (False, True):
+            with self.subTest(reported_by_http=reported_by_http), \
+                    mock.patch.object(ipsw, "pin", return_value=PIN), \
+                    mock.patch.object(ipsw.remotezip.urllib.request, "urlopen", side_effect=open_url) as fetch:
+                self.assertEqual(self.run_boot(), ("retry", False))
+                self.assertEqual(fetch.call_count, 5)  # One HEAD and four range attempts.
 
     def test_a_drop_while_staging_is_retry(self):
         vol = object()
