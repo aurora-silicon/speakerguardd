@@ -41,7 +41,7 @@ import sys
 import tempfile
 import time
 
-from . import collect, ipsw, unit
+from . import aea_ro, apfs_ro, collect, ipsw, unit
 from .asahi_firmware import audio_tuning
 
 log = logging.getLogger("aurora-speaker-upgrade")
@@ -166,13 +166,23 @@ def speaker_id_source(identity, chosen=collect.CHOSEN_SPID, dirs=collect.INSTALL
 
 def from_ipsw(identity, a, spid, known, scratch):
     """(bundle, provenance, AudioDSP SHA-256) from the pinned restore image."""
+    # Reaching Apple is not an answer: no network (a laptop whose Wi-Fi
+    # connects only after login), a timeout or a server error is Retry, which
+    # leaves no refusal record, so the next boot tries again.
     try:
         vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw)
+    except ipsw.IpswUnavailable as e:
+        raise Retry(f"the pinned restore image cannot be read now: {e}") from None
     except ipsw.IpswError as e:
         raise collect.CollectError(str(e)) from None
     say(f"macOS {build} restore image ({url.rsplit('/', 1)[-1]}), by ranges")
     st = tempfile.mkdtemp(prefix="stage-", dir=scratch)
-    collect.stage(vol, identity.acoustic, st)
+    try:
+        collect.stage(vol, identity.acoustic, st)
+    except (aea_ro.AeaUnavailable, OSError) as e:
+        raise Retry(f"the pinned restore image cannot be read now: {e}") from None
+    except (aea_ro.AeaError, apfs_ro.ApfsError) as e:
+        raise collect.CollectError(f"macOS {build} restore image: {e}") from None
     b, sysbuild = collect.collect(st, identity, spid, known)
     if sysbuild != build:
         raise collect.CollectError(f"the restore image's System volume is macOS {sysbuild}, not {build}")

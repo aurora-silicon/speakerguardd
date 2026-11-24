@@ -79,11 +79,68 @@ class Pin(unittest.TestCase):
             ipsw.find("j473", PIN, url="https://mirror.invalid/x.ipsw", open_zip=oz)
         self.assertEqual(ipsw.find("j473", PIN, url="https://mirror.invalid/y.ipsw", open_zip=oz)[0], "26B123")
 
-    def test_an_unreadable_image_refuses_without_trying_another_source(self):
+    def test_an_unreachable_image_is_unavailable_and_no_other_source_is_tried(self):
+        tried = []
+
         def oz(url):
+            tried.append(url)
             raise OSError("offline")
-        with self.assertRaises(ipsw.IpswError):
+        with self.assertRaises(ipsw.IpswUnavailable):
             ipsw.find("j473", PIN, open_zip=oz)
+        self.assertEqual(tried, ["https://example.invalid/a.ipsw"])
+
+    def test_only_an_apple_encrypted_archive_is_read(self):
+        with mock.patch.object(ipsw, "find", return_value=("26B123", "https://m.invalid/x.ipsw", None,
+                                                          "root.dmg")), \
+                mock.patch.object(ipsw.aea_ro, "open_member") as om:
+            with self.assertRaisesRegex(ipsw.IpswError, "not an Apple Encrypted Archive"):
+                ipsw.open_system("j473", PIN, url="https://m.invalid/x.ipsw")
+        om.assert_not_called()
+
+
+class OfflineAtBoot(unittest.TestCase):
+    """No network at boot is not an answer: no refusal record, so a later
+    boot (with Wi-Fi up) tries again. The image's own answers still refuse
+    and are recorded."""
+
+    def run_boot(self, error):
+        with tempfile.TemporaryDirectory() as d:
+            ident = types.SimpleNamespace(unit="u" * 64, board="j473", acoustic=12, matches_dt=lambda: True)
+            a = types.SimpleNamespace(store=d, adt=None, at_boot=True, chosen=None, installer_dirs=[],
+                                      scratch=os.path.join(d, "scratch"), ipsw=None, no_switch=False)
+            with mock.patch.object(up.collect, "Identity", return_value=ident), \
+                    mock.patch.object(up, "interface_mode", return_value=("v2-only", "card")), \
+                    mock.patch.object(up, "playback_proof", return_value=True), \
+                    mock.patch.object(up, "speaker_id_source", return_value=(None, False, "none")), \
+                    mock.patch.object(up.Store, "ensure", lambda self: os.makedirs(self.root, exist_ok=True)), \
+                    mock.patch.object(up.ipsw, "open_system", side_effect=error), \
+                    mock.patch.object(up, "say"):
+                try:
+                    up.cmd_run(a)
+                    outcome = "ok"
+                except up.Retry:
+                    outcome = "retry"
+                except up.Refused:
+                    outcome = "refused"
+            return outcome, os.path.exists(os.path.join(d, "refused.json"))
+
+    def test_unreachable_is_retry_without_a_record(self):
+        self.assertEqual(self.run_boot(ipsw.IpswUnavailable("no route to host")), ("retry", False))
+
+    def test_an_answer_of_the_image_is_recorded(self):
+        self.assertEqual(self.run_boot(ipsw.IpswError("no pinned image carries board j473")), ("refused", True))
+
+    def test_a_drop_while_staging_is_retry(self):
+        vol = object()
+        with tempfile.TemporaryDirectory() as d:
+            a = types.SimpleNamespace(ipsw=None)
+            ident = types.SimpleNamespace(board="j473", acoustic=12)
+            rng = types.SimpleNamespace(fetched=0)
+            with mock.patch.object(up.ipsw, "open_system", return_value=(vol, rng, "26B123", "https://x/y.ipsw")), \
+                    mock.patch.object(up.collect, "stage", side_effect=up.aea_ro.AeaUnavailable("range fetch failed")), \
+                    mock.patch.object(up, "say"):
+                with self.assertRaises(up.Retry):
+                    up.from_ipsw(ident, a, None, False, d)
 
 
 class NoMachineRoutes(unittest.TestCase):

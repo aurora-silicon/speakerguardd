@@ -47,6 +47,11 @@ class AeaError(Exception):
     pass
 
 
+class AeaUnavailable(AeaError):
+    """Apple's CDN or key service could not be reached (no network, a
+    timeout, a server error): worth trying again later, unlike an answer."""
+
+
 # --- HTTP ranges -------------------------------------------------------------
 
 class Ranges:
@@ -83,7 +88,7 @@ class Ranges:
                 return data
             except (OSError, AeaError) as e:
                 last = e
-        raise AeaError(f"range fetch failed: {last}")
+        raise AeaUnavailable(f"range fetch failed: {last}")
 
 
 class Slice:
@@ -179,10 +184,10 @@ def fetch_key(raw, opener=None):
     try:
         with op(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30) as r:
             if r.status != 200:
-                raise AeaError(f"Apple FCS key service returned HTTP {r.status}")
+                raise AeaUnavailable(f"Apple FCS key service returned HTTP {r.status}")
             data = r.read(16385)
     except OSError as e:
-        raise AeaError(f"Apple FCS key service unreachable: {type(e).__name__}") from None
+        raise AeaUnavailable(f"Apple FCS key service unreachable: {type(e).__name__}") from None
     if len(data) > 16384:
         raise AeaError("invalid Apple FCS response size")
     return data

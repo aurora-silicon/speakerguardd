@@ -30,6 +30,12 @@ class IpswError(Exception):
     pass
 
 
+class IpswUnavailable(IpswError):
+    """The restore image or Apple's key service cannot be reached now (no
+    network, a timeout, a server error): try again later. Every other
+    IpswError is the pinned image's answer."""
+
+
 def pin(paths=None):
     """(release, [(build, url)]) from the packaged pin (or, uninstalled, the
     one beside this package)."""
@@ -84,7 +90,9 @@ def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
     for build, u in candidates:
         try:
             bm = _manifest(open_zip(u))
-        except (IpswError, remotezip.RemoteZipError, OSError, ValueError) as e:
+        except OSError as e:
+            raise IpswUnavailable(f"macOS {release} restore image {build or u}: {e}") from None
+        except (IpswError, remotezip.RemoteZipError, ValueError) as e:
             raise IpswError(f"macOS {release} restore image {build or u}: {e}") from None
         got = bm.get("ProductBuildVersion")
         if got not in builds or (build is not None and got != build):
@@ -98,19 +106,20 @@ def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
 
 
 def open_system(board, images=None, url=None):
-    """(System volume, range fetcher, build) of the pinned restore image for
-    a board (j413)."""
+    """(System volume, range fetcher, build, url) of the pinned restore image
+    for a board (j413). Only an Apple Encrypted Archive is read: every byte
+    of it is authenticated against Apple's key, so a mirror (--ipsw) cannot
+    serve an altered volume under a pinned build."""
     build, url, bm, member = find(board, images, url)
-    if member.endswith(".aea"):
+    if not member.endswith(".aea"):
+        raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
+    try:
         a, rng, _ = aea_ro.open_member(url, member)
-        src = a
-    else:
-        mem = remotezip.RemoteZip(url).members.get(member)
-        if mem is None or mem.method != 0:
-            raise IpswError(f"{member}: not a stored member")
-        rng = aea_ro.Ranges(url)
-        src = type("_M", (), {"pread": staticmethod(lambda n, off: mem.pread(n, off))})
-    vols = [v for v in apfs_ro.Container(src).volumes() if v.role == apfs_ro.ROLE_SYSTEM]
+        vols = [v for v in apfs_ro.Container(a).volumes() if v.role == apfs_ro.ROLE_SYSTEM]
+    except (aea_ro.AeaUnavailable, OSError) as e:
+        raise IpswUnavailable(f"macOS {build} restore image: {e}") from None
+    except (aea_ro.AeaError, apfs_ro.ApfsError, remotezip.RemoteZipError) as e:
+        raise IpswError(f"macOS {build} restore image: {e}") from None
     if len(vols) != 1:
         raise IpswError("the root file system has no single System volume")
     return vols[0], rng, build, url
