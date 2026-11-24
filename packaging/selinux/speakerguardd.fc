@@ -1,3 +1,5 @@
 /usr/bin/speakerguardd	--	gen_context(system_u:object_r:speakerguardd_exec_t,s0)
 /run/speakerguardd(/.*)?		gen_context(system_u:object_r:speakerguardd_runtime_t,s0)
 /var/lib/speakerguardd(/.*)?		gen_context(system_u:object_r:speakerguardd_var_lib_t,s0)
+/var/lib/aurora-speaker-upgrade	-d	gen_context(system_u:object_r:speakerguardd_upgrade_store_t,s0)
+/var/lib/aurora-speaker-upgrade/bundle(/.*)?		gen_context(system_u:object_r:speakerguardd_upgrade_bundle_t,s0)

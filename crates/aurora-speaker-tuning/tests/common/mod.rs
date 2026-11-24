@@ -475,7 +475,12 @@ pub fn collector_json(files: &BTreeMap<String, Vec<u8>>) -> String {
 
 /// A fresh empty directory under the target dir.
 pub fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    // Integration tests get Cargo's scratch directory at compile time;
+    // binary unit tests reuse their own target directory at run time.
+    let root = option_env!("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("CARGO_TARGET_DIR").map(|p| PathBuf::from(p).join("tmp")).unwrap_or_else(std::env::temp_dir)
+    });
+    let d = root.join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -488,4 +493,101 @@ pub fn write_dir(dir: &Path, files: &BTreeMap<String, Vec<u8>>, manifest: &str) 
         std::fs::write(full, d).unwrap();
     }
     std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+}
+
+/// A synthetic lsm2 saved state: one active type-A model, two channels.
+pub fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
+    use aurora_speaker_tuning::compile::lsm2_ids as id;
+    let mut m: BTreeMap<u32, f32> = BTreeMap::new();
+    m.insert(id::ENABLE_CLOSED_LOOP_TEMPERATURE, 0.0);
+    m.insert(id::BYPASS_SYS_ID, 1.0);
+    // type-A PilotToneAmplitude_dB: the peak axis reserves it
+    m.insert(1024 + 2, -40.0);
+    for c in 0..8 {
+        m.insert(id::CH_TUNING + c, 0.0);
+        m.insert(id::CH_SPEAKER_TYPE + c, 0.0);
+    }
+    for mgr in 0..5 {
+        for ty in 0..3 {
+            for k in 0..37 {
+                m.insert(id::model(mgr, ty, k), 0.0);
+            }
+            let set = |m: &mut BTreeMap<u32, f32>, k, v| {
+                m.insert(id::model(mgr, ty, k), v);
+            };
+            set(&mut m, id::M_RDC, 5.0 + mgr as f32);
+            set(&mut m, id::M_ENABLE_RES1, 1.0);
+            set(&mut m, id::M_BL, 0.9);
+            set(&mut m, id::M_MMS_G, 0.3);
+            set(&mut m, id::M_RMS, 0.2);
+            set(&mut m, id::M_KMS, 1500.0 + 10.0 * mgr as f32);
+        }
+    }
+    for ty in 0..3 {
+        for (k, v) in [(id::T_RTH_VC, 30.0), (id::T_TAU_VC, 3.0), (id::T_RTH_MG, 20.0), (id::T_TAU_MG, 80.0)] {
+            m.insert(id::thermal(ty, k), v);
+        }
+        m.insert(id::thermal(ty, id::T_AMBIENT), 45.0);
+        m.insert(id::thermal(ty, id::T_ENABLE), 1.0);
+    }
+    for k in 0..23 {
+        m.insert(id::controller(k), 1.0);
+    }
+    for (k, v) in [
+        (id::C_ATTACK, 4.0),
+        (id::C_FAST_RELEASE, 150.0),
+        (id::C_SLOW_RELEASE, 15000.0),
+        (id::C_LATENCY, 22.0 / 3.0),
+        (id::C_FILTERBANK_LATENCY, 10.0 / 3.0),
+        (id::C_LOOKAHEAD, 2.0 / 3.0),
+        (id::C_UNLINK_TEMPERATURE, 0.0),
+        (id::C_COMPENSATE_RESONATORS, 0.0),
+        (id::C_USE_FAST_PEAK, 0.0),
+    ] {
+        m.insert(id::controller(k), v);
+    }
+    for k in 0..37 {
+        m.insert(id::amp0(k), 0.0);
+    }
+    for j in 0..4 {
+        m.insert(id::amp0(id::A_TIME_SCALE + j), [0.01, 0.2, 2.0, 30.0][j as usize]);
+        m.insert(id::amp0(id::A_HARD_LIMIT + j), [50.0, 8.0, 3.0, 2.0][j as usize]);
+        m.insert(id::amp0(id::A_SOFT_LIMIT + j), 100.0);
+    }
+    m.insert(id::amp0(id::A_LOW_IDLE), 0.02);
+    m.insert(id::amp0(id::A_LOW_RATIO), 1.2);
+    m.insert(id::amp0(id::A_MAX_ATTENUATION), 4.0);
+    for c in 0..8 {
+        for k in 0..33 {
+            m.insert(id::channel(c, k), 1.0);
+        }
+        m.insert(id::channel(c, id::CH_VOLTS_FS), 11.89);
+        m.insert(id::channel(c, id::CH_PARASITIC), 0.2);
+        m.insert(id::channel(c, id::CH_DISPLACEMENT_LIMIT), 0.0005);
+        m.insert(id::channel(c, id::CH_TEMP_HARD), 130.0);
+        m.insert(id::channel(c, id::CH_TEMP_SOFT), 115.0);
+        m.insert(id::channel(c, id::CH_VELOCITY_LIMIT0), 0.5);
+        m.insert(id::channel(c, id::CH_MAX_VELOCITY_ATTEN), 18.0);
+        m.insert(id::channel(c, id::CH_MAX_TEMP_ATTEN), 10.0);
+        m.insert(id::channel(c, id::CH_TEMP_HEADROOM), 4.0);
+        m.insert(id::channel(c, id::CH_POWER_AMP_MODEL), 0.0);
+        m.insert(id::channel(c, id::CH_MASK_BAND_MIN), 8000.0);
+        m.insert(id::channel(c, id::CH_MASK_BAND_MAX), 12000.0);
+        m.insert(id::channel(c, id::CH_MASK_ATTACK), 0.01);
+        m.insert(id::channel(c, id::CH_MASK_RELEASE), 0.1);
+        m.insert(id::channel(c, id::CH_MASK_ATTACK_FAST_MS), 5.0);
+        m.insert(id::channel(c, id::CH_MASK_ATTACK_RANGE), 70.0);
+        m.insert(id::channel(c, id::CH_BANDWIDTH), 0.0);
+        for (j, v) in [0.5, 0.6, 0.9].into_iter().enumerate() {
+            m.insert(id::channel(c, id::CH_VELOCITY_LIMIT0 + j as u32), v);
+        }
+        for (j, v) in [10.0, 20.0, 30.0, 40.0].into_iter().enumerate() {
+            m.insert(id::channel(c, id::CH_MASK_ENERGY0 + j as u32), v);
+        }
+        for (j, v) in [60.0, 300.0, 650.0, 1600.0, 5000.0].into_iter().enumerate() {
+            m.insert(id::channel(c, id::CH_BAND_CENTER0 + j as u32), v);
+        }
+    }
+    tweak(&mut m);
+    ParamState { sections: vec![ParamSection { scope: 0, element: 0, params: m.into_iter().collect() }] }
 }

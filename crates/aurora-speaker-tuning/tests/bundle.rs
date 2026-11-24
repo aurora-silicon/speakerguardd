@@ -71,6 +71,75 @@ fn directory_bundle_end_to_end() {
 }
 
 #[test]
+fn missing_directory_manifest_loads_legacy_collector() {
+    let files = spp3_files(2);
+    let dir = scratch("missing-manifest-legacy");
+    write_dir(&dir, &files, "{}");
+    std::fs::remove_file(dir.join("manifest.json")).unwrap();
+    std::fs::write(dir.join("metadata.json"), collector_json(&files)).unwrap();
+    let bundle = Bundle::from_dir(&dir).unwrap();
+    assert!(bundle.verified);
+    assert_eq!(bundle.files, files);
+    assert_eq!(bundle.manifest.source, aurora_speaker_tuning::manifest::Source::Collector);
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_manifest_probe_preserves_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    let files = spp3_files(2);
+    let dir = scratch("manifest-eacces");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    std::fs::write(dir.join("metadata.json"), collector_json(&files)).unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let probe = std::fs::metadata(dir.join("manifest.json"));
+    let result = Bundle::from_dir(&dir);
+    std::fs::set_permissions(&dir, mode).unwrap();
+    // Root/CAP_DAC_OVERRIDE cannot exercise a DAC denial. The loop test
+    // below still checks non-NotFound failures for privileged test runners.
+    if probe.is_ok() {
+        eprintln!("EACCES row not run: this process bypasses directory search permissions");
+        return;
+    }
+    let denied = probe.unwrap_err();
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    match result.unwrap_err() {
+        Error::Io { path, message } => {
+            assert_eq!(path, dir.join("manifest.json").display().to_string());
+            assert_eq!(message, denied.to_string());
+        }
+        e => panic!("expected structured manifest I/O, got {e:?}"),
+    }
+    assert!(Bundle::from_dir(&dir).is_ok(), "access restoration must reload the verified manifest");
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_manifest_probe_preserves_symlink_loop() {
+    let files = spp3_files(2);
+    let dir = scratch("manifest-eloop");
+    write_dir(&dir, &files, &manifest_json(&files, "25G83"));
+    std::fs::remove_file(dir.join("manifest.json")).unwrap();
+    std::os::unix::fs::symlink("manifest.json", dir.join("manifest.json")).unwrap();
+    // A valid legacy manifest must not mask an inaccessible new manifest.
+    std::fs::write(dir.join("metadata.json"), collector_json(&files)).unwrap();
+    let denied = std::fs::metadata(dir.join("manifest.json")).unwrap_err();
+    assert_ne!(denied.kind(), std::io::ErrorKind::NotFound);
+    let error = match Bundle::from_dir(&dir) {
+        Err(e) => e,
+        Ok(_) => panic!("a manifest symlink loop must not fall back to the valid collector bundle"),
+    };
+    match error {
+        Error::Io { path, message } => {
+            assert_eq!(path, dir.join("manifest.json").display().to_string());
+            assert_eq!(message, denied.to_string());
+        }
+        e => panic!("expected structured manifest I/O, got {e:?}"),
+    }
+}
+
+#[test]
 fn tar_gz_bundle_with_top_directory() {
     let files = spp3_files(2);
     let manifest = manifest_json(&files, "26A1");

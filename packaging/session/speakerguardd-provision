@@ -464,6 +464,34 @@ def compile_blob(cli, source, out, voicing_pre=False):
 BIND_KEYS = ["version", "board", "unit", "kernel", "bundle_digest", "macos_build", "speaker_id", "compiler", "source", "params_sha256", "voicing_pre", "protection_units", "compile_refusals", "provenance"]
 
 
+UPGRADE_BUNDLE = "/var/lib/aurora-speaker-upgrade/bundle"
+SELINUX_ENFORCE = "/sys/fs/selinux/enforce"
+
+
+def relabel_upgrade_bundle(src, live):
+    """Repair existing and newly replaced upgrade bundles before use.
+
+    The upgrade tool renames a root-only bundle.new into place. Labels
+    follow those inodes, so merely installing file contexts does not fix
+    an existing store or a replacement. Provisioning runs before every
+    supervisor start (also on the upgrade path), even with a current blob.
+    Relabel only the store directory itself and the exact bundle subtree;
+    sibling state and staging directories keep their private labels.
+    """
+    if not live or os.path.normpath(src) != UPGRADE_BUNDLE or not os.path.exists(SELINUX_ENFORCE):
+        return
+    restorecon = shutil.which("restorecon")
+    if not restorecon:
+        raise Failed("SELinux is enabled but restorecon is unavailable for the upgrade bundle")
+    for flags, path in (([], os.path.dirname(UPGRADE_BUNDLE)), (["-R"], UPGRADE_BUNDLE)):
+        try:
+            r = subprocess.run([restorecon, *flags, "--", path], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise Failed(f"restorecon {path}: {e}") from None
+        if r.returncode:
+            raise Failed(f"restorecon {path} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+
 def source_args(args, override):
     src = args.bundle or override.get("SGV2_BUNDLE", "")
     if src and not SAFE.match(src):
@@ -474,10 +502,14 @@ def source_args(args, override):
 
 
 def conf_text(rec, entry_key, user, uid, card, pcm, p, src):
-    for v in (entry_key, user, card, p.params):
+    for v in (entry_key, user, card, p.params, src):
         if not SAFE.match(str(v)):
             raise Failed(f"{v!r} cannot be carried in {p.conf}")
-    sargs = f"--card {card} --pcm {pcm} --uid {uid} --params {p.params}"
+    sargs = f"--card {card} --pcm {pcm} --uid {uid}"
+    if src:
+        sargs += f" --bundle {src}"
+    if rec["voicing_pre"] == "true":
+        sargs += " --voicing-pre"
     return "\n".join([
         f"{GENERATED} on {rec['time']}; it is rewritten on every boot.",
         f"# Overrides go in {p.override} (SGV2_SEAT_USER=<name>, SGV2_BUNDLE=<path>).",
@@ -533,6 +565,7 @@ def cmd_run(args, p):
         import gen
         rec["voicing_pre"] = str(gen.runtime_voicing_enabled(rec["board"])).lower()
         src, sargs = source_args(args, override)
+        relabel_upgrade_bundle(src, live)
         cli = tuning_cli(args)
         ident = identify(cli, sargs)
         if (ident.get("verified") is not True or ident.get("kind") != "Installer"
