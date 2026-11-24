@@ -212,14 +212,14 @@ class UnknownSpeakerIdGoesToRoute3(unittest.TestCase):
 
 
 class RecordsThisReaderDoesNotRead(unittest.TestCase):
-    """A collection made by the installer's collector while it wrote the
-    BuzzKill matrix by default (aurora-installer#119): this speakerguardd's
-    tuning reader refuses the unknown `buzzkill_quadrature` key, so the tool
-    stores the bundle without it."""
+    """A record a newer installer writes before this speakerguardd reads it
+    (UNREAD_RECORDS) is dropped with its file; `buzzkill_quadrature`, which
+    speakerguardd v2 reads since #244, is kept."""
 
     BIN = "buzzkill-quadrature.bin"
+    FUTURE = {"future_record": "future-record.bin"}
 
-    def manifest(self, buzzkill):
+    def manifest(self, buzzkill, future=False):
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
         doc = {"schema": 2, "kind": "aurora-audio-tuning", "aid": "AID36", "acoustic_id": 36,
                "unit_id": "u" * 64, "board": "j999", "macos_build": "00A000", "complete": True,
@@ -230,69 +230,169 @@ class RecordsThisReaderDoesNotRead(unittest.TestCase):
             doc["buzzkill_quadrature"] = {"path": self.BIN, "bytes": 80, "sha256": "0" * 64,
                                           "version": 1, "format": "f32le-sos4-output-major",
                                           "sections": 4}
+        if future:
+            doc["future_record"] = {"path": "future-record.bin", "bytes": 4, "sha256": "0" * 64}
         return at.MANIFEST, json.dumps(doc, indent=2, sort_keys=True).encode("utf-8")
 
-    def bundle(self, buzzkill, with_file=True):
-        name, data = self.manifest(buzzkill)
+    def bundle(self, buzzkill, future=False, with_file=True):
+        name, data = self.manifest(buzzkill, future)
         b = {name: data, "AID36/a.plist": b"abc", "lsm2-mask-lattice.bin": b"L" * 800}
-        if buzzkill and with_file:
+        if buzzkill:
             b[self.BIN] = b"\x01" * 80
+        if future and with_file:
+            b["future-record.bin"] = b"FFFF"
         return b
 
-    def test_the_record_and_its_file_are_dropped(self):
-        b, dropped = collect.for_this_reader(self.bundle(True))
-        self.assertEqual(dropped, ["buzzkill_quadrature"])
-        # Exactly the bundle the collector writes without the matrix.
-        self.assertEqual(b, self.bundle(False))
-
-    def test_the_vendored_collector_keeps_the_record_without_its_file(self):
-        # The vendored collector predates the record: it carries the
-        # manifest unchanged but not the file the record names.
-        b, dropped = collect.for_this_reader(self.bundle(True, with_file=False))
-        self.assertEqual(dropped, ["buzzkill_quadrature"])
-        self.assertEqual(b, self.bundle(False))
-
-    def test_a_bundle_without_them_is_unchanged(self):
-        plain = self.bundle(False)
+    def test_the_buzzkill_matrix_is_kept(self):
+        self.assertNotIn("buzzkill_quadrature", collect.UNREAD_RECORDS)
+        plain = self.bundle(True)
         b, dropped = collect.for_this_reader(plain)
         self.assertIs(b, plain)
         self.assertEqual(dropped, [])
 
-    def test_a_malformed_record_refuses(self):
+    def test_an_unread_record_and_its_file_are_dropped(self):
+        from unittest import mock
+        with mock.patch.dict(collect.UNREAD_RECORDS, self.FUTURE):
+            b, dropped = collect.for_this_reader(self.bundle(True, future=True))
+            self.assertEqual(dropped, ["future_record"])
+            self.assertEqual(b, self.bundle(True))
+            b, dropped = collect.for_this_reader(self.bundle(True, future=True, with_file=False))
+            self.assertEqual(dropped, ["future_record"])
+            self.assertEqual(b, self.bundle(True))
+
+    def test_a_malformed_unread_record_refuses(self):
+        from unittest import mock
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-        b = self.bundle(True)
+        b = self.bundle(False, future=True)
         m = json.loads(b[at.MANIFEST])
-        m["buzzkill_quadrature"]["path"] = "AID36/a.plist"
+        m["future_record"]["path"] = "AID36/a.plist"
         b[at.MANIFEST] = json.dumps(m).encode()
-        with self.assertRaises(collect.CollectError):
+        with mock.patch.dict(collect.UNREAD_RECORDS, self.FUTURE), self.assertRaises(collect.CollectError):
             collect.for_this_reader(b)
 
-    def test_acquire_stores_a_route3_collection_without_it(self):
+    def test_acquire_keeps_the_matrix_of_a_route3_collection(self):
         import tempfile, types
         from unittest import mock
         from aurora_speaker_upgrade import upgrade as up
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
 
-        def r0(identity, a):
-            raise collect.CollectError("no installer bundle on this Mac")
-
         def r3(identity, a):
-            return self.bundle(True, with_file=False), {"route": "3", "source": "collection"}
+            return self.bundle(True), {"route": "3", "source": "collection"}
 
         with tempfile.TemporaryDirectory() as d:
             a = types.SimpleNamespace(route="auto", chosen=None, installer_dirs=[], scratch=d,
                                       collection="c.tar.gz")
             ident = types.SimpleNamespace(unit="u" * 64)
             with mock.patch.object(up, "speaker_id_source", return_value=(None, False, None)), \
-                    mock.patch.object(up, "route0", r0), \
+                    mock.patch.object(up, "route0", mock.Mock(side_effect=collect.CollectError("none"))), \
                     mock.patch.object(up, "route1", mock.Mock(side_effect=collect.CollectError("x"))), \
                     mock.patch.object(up, "route2", mock.Mock(side_effect=collect.CollectError("y"))), \
-                    mock.patch.object(up, "route3", r3), mock.patch.object(up, "say") as said:
+                    mock.patch.object(up, "route3", r3), mock.patch.object(up, "say"):
                 b, prov = up.acquire(ident, a)
         self.assertEqual(prov["route"], "3")
-        self.assertNotIn("buzzkill_quadrature", json.loads(b[at.MANIFEST]))
-        self.assertEqual(b, self.bundle(False))
-        self.assertTrue(any("buzzkill_quadrature" in c.args[0] for c in said.call_args_list))
+        self.assertIn("buzzkill_quadrature", json.loads(b[at.MANIFEST]))
+        self.assertEqual(b[self.BIN], b"\x01" * 80)
+
+
+def buzz_strip(subtype=0x62757A6B, kind=0x61756678, fmt=plistlib.FMT_BINARY):
+    """A strip naming one Audio Unit, the way the tuning's strips do."""
+    return plistlib.dumps({"Boxes": [{"unit": {"type": kind, "subtype": subtype, "manufacturer": "appl"}}]},
+                          fmt=fmt)
+
+
+class BuzzUnit(unittest.TestCase):
+    """has_buzz_unit: whether the tuning's graph names a BuzzKill unit."""
+
+    def test_integer_fourccs(self):
+        self.assertTrue(collect.has_buzz_unit({"AID1/s.austrip": buzz_strip()}))
+
+    def test_string_fourccs(self):
+        self.assertTrue(collect.has_buzz_unit({"AID1/s.austrip": buzz_strip("buzk", "aufx", plistlib.FMT_XML)}))
+
+    def test_other_units_and_files(self):
+        self.assertFalse(collect.has_buzz_unit({
+            "AID1/s.austrip": buzz_strip(subtype=0x7662656E),       # vben
+            "AID1/t.austrip": buzz_strip(kind=0x61756D78),          # aumx/buzk
+            "lsm2-mask-lattice.bin": b"buzk" * 200,                  # not a property list
+        }))
+
+    def test_the_manifest_is_not_read(self):
+        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
+        self.assertFalse(collect.has_buzz_unit({at.MANIFEST: buzz_strip()}))
+
+
+class Route0WithoutTheBuzzKillMatrix(unittest.TestCase):
+    """An installer bundle collected before the installer read the BuzzKill
+    matrix, for a tuning with a BuzzKill unit, does not compile: the other
+    routes (this Mac's own macOS) are tried first, and the installer bundle is
+    used only when none gives a bundle. Without the unit, route 0 is used as
+    before."""
+
+    def bundle(self, buzz, matrix, route):
+        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
+        doc = {"schema": 2, "aid": "AID12", "acoustic_id": 12, "unit_id": "u" * 64,
+               "speaker_id": None, "macos_build": "00A00" + route}
+        b = {"AID12/DSP/Strips/s.austrip": buzz_strip(subtype=0x62757A6B if buzz else 0x7662656E)}
+        if matrix:
+            doc["buzzkill_quadrature"] = {"path": "buzzkill-quadrature.bin"}
+            b["buzzkill-quadrature.bin"] = b"\x01" * 80
+        b[at.MANIFEST] = json.dumps(doc).encode()
+        return b
+
+    def acquire(self, r0, r1, r2=None, route="auto"):
+        import tempfile, types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        tried = []
+
+        def wrap(name, f):
+            def g(*args):
+                tried.append(name)
+                if isinstance(f, Exception):
+                    raise f
+                return f, {"route": int(name), "source": "src" + name}
+            return g
+        with tempfile.TemporaryDirectory() as d:
+            a = types.SimpleNamespace(route=route, chosen=None, installer_dirs=[], scratch=d, collection=None)
+            ident = types.SimpleNamespace(unit="u" * 64)
+            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, "none")), \
+                    mock.patch.object(up, "route0", wrap("0", r0)), mock.patch.object(up, "route1", wrap("1", r1)), \
+                    mock.patch.object(up, "route2", wrap("2", r2 or collect.CollectError("no ipsw"))), \
+                    mock.patch.object(up, "route3", wrap("3", collect.CollectError("no collection"))), \
+                    mock.patch.object(up, "say"):
+                b, prov = up.acquire(ident, a)
+        return b, prov, tried
+
+    def test_the_macos_route_gives_the_matrix(self):
+        b, prov, tried = self.acquire(self.bundle(True, False, "0"), self.bundle(True, True, "1"))
+        self.assertEqual(tried, ["0", "1"])
+        self.assertEqual(prov["route"], 1)
+        self.assertIn("buzzkill-quadrature.bin", b)
+
+    def test_the_installer_bundle_when_no_other_route_works(self):
+        r0 = self.bundle(True, False, "0")
+        b, prov, tried = self.acquire(r0, collect.CollectError("no System volume"))
+        self.assertEqual(tried, ["0", "1", "2", "3"])
+        self.assertEqual(prov["route"], 0)
+        self.assertEqual(b, r0)
+
+    def test_without_a_buzzkill_unit_route0_is_used(self):
+        r0 = self.bundle(False, False, "0")
+        b, prov, tried = self.acquire(r0, self.bundle(False, True, "1"))
+        self.assertEqual(tried, ["0"])
+        self.assertEqual(b, r0)
+
+    def test_with_the_matrix_route0_is_used(self):
+        r0 = self.bundle(True, True, "0")
+        b, prov, tried = self.acquire(r0, self.bundle(True, True, "1"))
+        self.assertEqual(tried, ["0"])
+        self.assertEqual(b, r0)
+
+    def test_route0_asked_for_is_used_as_is(self):
+        r0 = self.bundle(True, False, "0")
+        b, prov, tried = self.acquire(r0, self.bundle(True, True, "1"), route="0")
+        self.assertEqual(tried, ["0"])
+        self.assertEqual(b, r0)
 
 
 class DualKernelRun(unittest.TestCase):

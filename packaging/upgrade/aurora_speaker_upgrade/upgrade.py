@@ -261,6 +261,19 @@ def acquire(identity, a):
     spid, known, spid_from = speaker_id_source(identity, a.chosen, a.installer_dirs)
     routes = [a.route] if a.route != "auto" else ["0", "1", "2", "3"]
     reasons = []
+    # An installer bundle written before the installer collected the BuzzKill
+    # matrix, for a tuning with a BuzzKill unit, does not compile. With the
+    # other routes still to try (they read the matrix from this Mac's own
+    # macOS), it is kept aside and used only when none of them gives a bundle.
+    # A tuning without the unit takes the installer bundle as before.
+    held = None
+
+    def done(b, prov, m, r):
+        prov.update(speaker_id=m.get("speaker_id"), speaker_id_from=spid_from if r in "12" else "the bundle",
+                    aid=m.get("aid"), macos_build=m.get("macos_build"))
+        say(f"tuning {m.get('aid')} from macOS {m.get('macos_build')} via route {r} ({prov['source']})")
+        return b, prov
+
     os.makedirs(a.scratch, mode=0o700, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="scratch-", dir=a.scratch)
     try:
@@ -303,12 +316,19 @@ def acquire(identity, a):
             if m.get("unit_id") != identity.unit:
                 reasons.append(f"route {r}: the bundle does not name this unit")
                 continue
-            prov.update(speaker_id=m.get("speaker_id"), speaker_id_from=spid_from if r in "12" else "the bundle",
-                        aid=m.get("aid"), macos_build=m.get("macos_build"))
-            say(f"tuning {m.get('aid')} from macOS {m.get('macos_build')} via route {r} ({prov['source']})")
-            return b, prov
+            if r == "0" and todo and audio_tuning.BUZZKILL_KEY not in m and collect.has_buzz_unit(b):
+                say(f"route 0: {prov['source']} was collected before the installer read the BuzzKill "
+                    "quadrature matrix; trying the other routes for one (this bundle is used if none works)")
+                reasons.append(f"route 0: {prov['source']}: no BuzzKill quadrature matrix")
+                held = (b, prov, m)
+                continue
+            return done(b, prov, m, r)
     finally:
         collect.rmtree(scratch)
+    if held is not None:
+        say("route 0: no other route gave a bundle ("
+            + "; ".join(x for x in reasons if not x.startswith("route 0")) + "); using the installer bundle")
+        return done(*held, "0")
     if a.route in ("auto", "3") and a.collection is None:
         reasons.append("route 3: boot macOS once and collect (aurora-speaker-upgrade guide)")
     raise Refused("no speaker tuning for this Mac:\n  " + "\n  ".join(reasons))
