@@ -9,9 +9,10 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-P
 # failure fails closed: no blob, no configuration, the supervisor does not
 # start, the kernel's floor holds, and the journal says why.
 Before=speakerguardd-selfcheck.service speakerguardd.service
-# The speaker card (its PCM), and the ESP, where the tuning may only be in
-# the vendor firmware archive.
-After=systemd-udev-settle.service local-fs.target boot.mount boot-efi.mount efi.mount
+# The ESP, where the tuning may only be in the vendor firmware archive.
+# The speaker card is not an ordering: provisioning waits for the card the
+# device tree describes itself (find_card, bounded by --card-wait).
+After=local-fs.target boot.mount boot-efi.mount efi.mount
 ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
