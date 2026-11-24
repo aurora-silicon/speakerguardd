@@ -32,11 +32,14 @@ selects /System/Library/Audio/Tunings/AID35) and, on Macs with speaker
 calibration, carries the per-unit `speaker-thiele-small` record. Both are
 copied unchanged, read-only, into the per-machine vendor firmware under
 `apple/audio-tuning/`, with a manifest of sizes and SHA-256 hashes, and into
-the raw fallback archive under `audio-tuning/`. Nothing is shipped: the data
-comes from the user's own system volume and stays on the user's own ESP.
+the raw fallback archive under `audio-tuning/`. Nothing is shipped: the
+tuning is the per-model data of the pinned macOS restore image (ipsw.py
+stages it into a tree laid out like a system volume), never the installed
+macOS; only the per-unit values (speaker ID, SpTS record, unit) come from
+the Mac itself. The data stays on the user's own ESP.
 
-The bundle also carries the lsm2 masker's bucket lattice, read from this
-Mac's own AudioDSP component (see lsm2_lattice). A collection without it is
+The bundle also carries the lsm2 masker's bucket lattice, read from the
+staged image's AudioDSP component (see lsm2_lattice). A collection without it is
 no bundle.
 
 The manifest names the Mac the bundle was collected on: its board (the
@@ -56,6 +59,7 @@ from .core import FWFile
 
 log = logging.getLogger("asahi_firmware.audio_tuning")
 
+# The tuning tree's place in a system volume layout (staged image trees).
 TUNINGS_ROOT = "/System/Library/Audio/Tunings"
 PACKAGE_PREFIX = "apple/audio-tuning/"
 FALLBACK_DIR = "audio-tuning"
@@ -76,8 +80,6 @@ BUZZKILL_KEY = "buzzkill_quadrature"
 # native installer does. A bundle that already carries it is still verified
 # and read; `without_buzzkill` gives the same bundle without it.
 COLLECT_BUZZKILL = False
-# Where it is read: the AudioDSP component of the running macOS.
-AUDIODSP_PATH = "/" + lsm2_lattice.AUDIODSP
 
 
 # macOS 27 keeps each Mac's entry in its own folder instead of the shared
@@ -541,93 +543,24 @@ def os_build(run=subprocess.run):
     return value if value.isalnum() and len(value) <= 16 else "unknown"
 
 
-class OfflineMac(object):
-    """This Mac's identity from its ADT and its tuning from its own macOS
-    system volume mounted read-only, for a collection from Linux.
-
-    The ADT is the one iBoot passed on this boot (aura exposes it as the
-    "adt" MTD partition), so it carries the same `acoustic-id`,
-    `speaker-thiele-small`, `target-type` and `serial-number` that
-    `ioreg -p IODeviceTree` shows on macOS. The build is the volume's
-    SystemVersion.plist ProductBuildVersion (`kern.osversion` on macOS).
-    The speaker ID (the IORegistry `speakerID`) has no ADT source: it is
-    taken from the Linux device tree's `/chosen/asahi,speaker-id` when the
-    boot chain exports it, else unknown, as on macOS when it is missing."""
-
-    def __init__(self, adt_bytes, macos_root, speaker_id=None):
-        from . import adt
-        self.root = adt.parse(adt_bytes)
-        self.macos_root = macos_root
-        self.tunings_root = os.path.join(macos_root, TUNINGS_ROOT.lstrip("/"))
-        self.audiodsp = os.path.join(macos_root, lsm2_lattice.AUDIODSP)
-        self._speaker = speaker_id
-
-    def probe(self):
-        found = []
-        for node in self.root.walk():
-            if node.name == "audio" and "acoustic-id" in node.properties:
-                found.append((node.get("acoustic-id"), node.get("speaker-thiele-small")))
-        if len(found) != 1:
-            if found:
-                log.warning("Several audio nodes carry acoustic-id; speaker tuning not collected")
-            return None
-        return found[0]
-
-    def identity(self):
-        try:
-            return board_name(self.root.get("target-type")), unit_id(self.root.get("serial-number"))
-        except Exception as e:
-            log.info(f"Mac identity unknown: {e}")
-            return None, None
-
-    def speaker_id(self):
-        value = self._speaker
-        if type(value) is not int or not 0 <= value <= MAX_SPEAKER_ID:
-            return None
-        return value
-
-    def model(self):
-        raw = self.root.get("model")
-        return raw.rstrip(b"\0").decode("ascii", "replace") if raw else None
-
-    def target(self):
-        """hw.target as macOS reports it (J616sAP): the root `target-type`
-        and `AP`, the same name the installer's info file records."""
-        raw = self.root.get("target-type")
-        if not raw:
-            return None
-        name = raw.rstrip(b"\0").decode("ascii", "replace")
-        return name if name.endswith("AP") else name + "AP"
-
-    def os_build(self):
-        path = os.path.join(self.macos_root, "System/Library/CoreServices/SystemVersion.plist")
-        try:
-            value = plistlib.loads(read_bounded(path, MAX_CONFIG_BYTES)).get("ProductBuildVersion")
-        except Exception as e:
-            log.info(f"macOS build unknown: {e}")
-            return "unknown"
-        return value if isinstance(value, str) and value.isalnum() and len(value) <= 16 else "unknown"
-
-
 class AudioTuningFWCollection(object):
-    """Live collection on macOS (path None), or re-collection from an
-    extracted fallback archive (path = the directory holding audio-tuning/)."""
+    """Collection from a staged restore-image tree (tunings_root and
+    audiodsp, see ipsw.py), or re-collection from an extracted fallback
+    archive (path = the directory holding audio-tuning/). There is no
+    default source: the installed macOS is never read for per-model data."""
 
-    def __init__(self, path=None, tunings_root=TUNINGS_ROOT, run=subprocess.run, audiodsp=None,
-                 offline=None, force_lsm2_fill=False, buzzkill=None):
-        """offline: an OfflineMac, to collect from a mounted macOS system
-        volume and the Mac's ADT (Linux) instead of the running macOS.
-        buzzkill: also collect the BuzzKill quadrature matrix (default
+    def __init__(self, path=None, tunings_root=None, run=subprocess.run, audiodsp=None,
+                 force_lsm2_fill=False, buzzkill=None):
+        """buzzkill: also collect the BuzzKill quadrature matrix (default
         COLLECT_BUZZKILL); a re-collection (path) keeps what the bundle has."""
         self.fwfiles = []
         self.bundle = {}
         self.collect_buzzkill = COLLECT_BUZZKILL if buzzkill is None else bool(buzzkill)
         try:
-            if offline is not None:
-                self.load(offline.tunings_root, None, offline.audiodsp, offline)
-            elif path is None:
-                self.load(tunings_root, run, AUDIODSP_PATH if audiodsp is None else audiodsp,
-                          force_lsm2_fill=force_lsm2_fill)
+            if path is None:
+                if tunings_root is None or audiodsp is None:
+                    raise ValueError("no staged restore-image tree to collect from")
+                self.load(tunings_root, run, audiodsp, force_lsm2_fill=force_lsm2_fill)
             else:
                 self.update(os.path.join(path, FALLBACK_DIR))
         except lsm2_lattice.LatticeError as e:
@@ -647,8 +580,8 @@ class AudioTuningFWCollection(object):
         self.fwfiles = [(PACKAGE_PREFIX + rel, FWFile(PACKAGE_PREFIX + rel, data))
                         for rel, data in sorted(bundle.items())]
 
-    def load(self, tunings_root, run, audiodsp=AUDIODSP_PATH, offline=None, force_lsm2_fill=False):
-        props = probe(run) if offline is None else offline.probe()
+    def load(self, tunings_root, run, audiodsp, force_lsm2_fill=False):
+        props = probe(run)
         if props is None:
             log.info("No device-tree acoustic-id; no speaker tuning to collect")
             return
@@ -689,23 +622,17 @@ class AudioTuningFWCollection(object):
             data = read_bounded(lm_path, MAX_CONFIG_BYTES)
             if loudness_lists(data, acoustic):
                 loudness = data
-        if offline is None:
-            speaker = probe_speaker_id(run)
-            board, unit = probe_identity(run)
-            build = os_build(run)
-        else:
-            speaker = offline.speaker_id()
-            board, unit = offline.identity()
-            build = offline.os_build()
+        speaker = probe_speaker_id(run)
+        board, unit = probe_identity(run)
+        build = os_build(run)
         if unit is None and props[1] is not None:
             log.warning("This Mac's serial-number is unreadable: the speaker tuning is collected "
                         "without its unit, and Linux will not use its speaker calibration")
         # Exactly one valid lattice, or no bundle: never a guessed table.
         lattice = lsm2_lattice.read(audiodsp)
-        # A running owner macOS is required: never import defaults from a
-        # mounted volume or another Mac. Failure retains the old muted path.
+        # Hosted only on macOS (lsm2_fill); failure retains the muted path.
         fill = None
-        if offline is None and sys.platform == "darwin":
+        if sys.platform == "darwin":
             try:
                 capture_files = {f"AID{acoustic}/{p}": d for p, d in files.items()}
                 capture_files.update(shared)
