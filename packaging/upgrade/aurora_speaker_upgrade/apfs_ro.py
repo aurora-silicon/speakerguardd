@@ -440,8 +440,14 @@ class Volume:
         if magic != DECMPFS_MAGIC or usize > MAX_FILE:
             raise ApfsError(f"inode {ino}: bad decmpfs header")
         body = hdr[16:]
-        if ctype in (1, 9):
+        if ctype == 1:
             return body[:usize]
+        if ctype == 9:
+            # Stored in the attribute, uncompressed: a 0xcc marker byte, then
+            # exactly the file.
+            if body[:1] != b"\xcc" or len(body) != usize + 1:
+                raise ApfsError(f"inode {ino}: malformed uncompressed decmpfs attribute")
+            return body[1:]
         if ctype == 3:
             return body[1:1 + usize] if body[:1] == b"\xff" else zlib.decompress(body)[:usize]
         if ctype == 7:
