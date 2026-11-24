@@ -7,6 +7,7 @@ megabytes out of a 19 GB IPSW without downloading it.
 
     remotezip.py URL list
 """
+import http.client
 import struct
 import sys
 import urllib.request
@@ -17,6 +18,10 @@ UA = "aurora-speaker-upgrade/1"
 
 class RemoteZipError(Exception):
     pass
+
+
+class RemoteZipUnavailable(RemoteZipError):
+    """A range could not be transferred completely."""
 
 
 class RemoteFile:
@@ -43,12 +48,12 @@ class RemoteFile:
                 try:
                     with urllib.request.urlopen(req, timeout=self.timeout) as r:
                         data = r.read()
+                    if len(data) != hi - lo + 1:
+                        raise RemoteZipUnavailable("short range response")
                     break
-                except OSError:
+                except (OSError, http.client.IncompleteRead, RemoteZipUnavailable) as e:
                     if attempt == 3:
-                        raise
-            if len(data) != hi - lo + 1:
-                raise RemoteZipError("short range response")
+                        raise RemoteZipUnavailable(f"range fetch failed: {e}") from e
             self.fetched += len(data)
             if len(self.cache) > 512:
                 self.cache.clear()
