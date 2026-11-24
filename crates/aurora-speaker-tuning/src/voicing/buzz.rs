@@ -28,7 +28,14 @@ fn default(id: u32) -> Option<f64> {
     })
 }
 
-pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option<Params>> {
+/// `matrix` is the Mac's own BuzzKill quadrature matrix
+/// ([`crate::buzzmatrix`]); without it no box compiles.
+pub fn compile(
+    stage: &Stage,
+    matrix: Option<&crate::buzzmatrix::Matrix>,
+    fs: f64,
+    diags: &mut Diagnostics,
+) -> Result<Option<Params>> {
     let context = format!("BuzzKill box {}", stage.name);
     let bad = |message: String| Error::format(&context, message);
     if stage.unit.map(|unit| unit.subtype) != Some(BUZK) {
@@ -64,7 +71,14 @@ pub fn compile(stage: &Stage, fs: f64, diags: &mut Diagnostics) -> Result<Option
     if get(0)? != 0.0 {
         return Ok(None);
     }
+    let Some(matrix) = matrix else {
+        return Err(Error::format(
+            &context,
+            "the bundle has no BuzzKill quadrature matrix (the installer reads it from macOS's AudioDSP); collect the tuning again on macOS",
+        ));
+    };
     let mut params = Params {
+        quadrature: crate::buzzmatrix::amplitude_cascade(matrix),
         operation_frequency: integer(1, 4)?,
         lookahead_s: get(2)? / 1000.0,
         threshold_db: get(3)?,
@@ -122,13 +136,28 @@ mod tests {
             before_protection: true,
         }
     }
+    // Made-up sections with the matrix's structure only (not macOS's values).
+    const MATRIX: crate::buzzmatrix::Matrix = [
+        [0.25, -0.5, 1.0, 0.125, 0.25],
+        [0.375, -0.25, 1.0, -0.25, 0.375],
+        [0.75, 0.5, 1.0, 0.5, -0.125],
+        [1.125, -1.875, 0.875, -1.75, 0.8125],
+    ];
+
     #[test]
     fn compiles_active_version_zero_and_bypass() {
         let mut d = Diagnostics::default();
-        assert_eq!(compile(&stage(true), 48_000.0, &mut d).unwrap(), None);
-        let p = compile(&stage(false), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        assert_eq!(compile(&stage(true), Some(&MATRIX), 48_000.0, &mut d).unwrap(), None);
+        let p = compile(&stage(false), Some(&MATRIX), 48_000.0, &mut Diagnostics::default()).unwrap().unwrap();
+        assert_eq!(p.quadrature, [MATRIX[2], MATRIX[3]]);
         assert_eq!(p.lookahead_s, 0.008);
         assert_eq!(p.threshold_db, -12.0);
         assert!(p.bands[2].enabled);
+    }
+
+    #[test]
+    fn no_matrix_no_box() {
+        let e = compile(&stage(false), None, 48_000.0, &mut Diagnostics::default()).unwrap_err();
+        assert!(e.to_string().contains("quadrature matrix"), "{e}");
     }
 }

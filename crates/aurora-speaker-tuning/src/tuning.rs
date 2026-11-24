@@ -180,6 +180,11 @@ pub struct Tuning {
     /// dumps; `mask_lattice_present` says whether it is there.
     #[serde(skip)]
     pub mask_lattice: Option<[u32; crate::lattice::ENTRIES]>,
+    /// The BuzzKill detector's quadrature matrix from the bundle (or the
+    /// development override), validated ([`crate::buzzmatrix`]); `None`
+    /// when there is none. Kept out of dumps.
+    #[serde(skip)]
+    pub buzzkill: Option<crate::buzzmatrix::Matrix>,
     pub mask_lattice_present: bool,
     /// Private owner-local missing records; excluded from tuning dumps.
     #[serde(skip)]
@@ -199,6 +204,10 @@ pub struct Options {
     /// The speaker ID the loader exported into the device tree
     /// ([`crate::machine::speaker_id`]), used when the manifest has none.
     pub device_tree_speaker_id: Option<u32>,
+    /// A BuzzKill quadrature matrix for trees without an installer bundle
+    /// (rigs, the parity gate): [`crate::buzzmatrix::from_env`]. A bundle's
+    /// own matrix wins.
+    pub buzzkill_matrix: Option<crate::buzzmatrix::Matrix>,
 }
 
 /// The speaker ID for selection: the override, then the manifest, then the
@@ -518,6 +527,19 @@ impl Tuning {
         // The masker lattice: checked again with the installer's rule.  A
         // listed lattice that fails it makes the tuning unsafe to run; an
         // absent one leaves lsm2 without masking credit.
+        // The BuzzKill matrix: checked again with the installer's rule. A
+        // listed matrix that fails it is an error; an absent one leaves Buzz
+        // boxes uncompiled (the voicing reports a gap).
+        let buzzkill = match b.buzzkill_quadrature() {
+            Some(bytes) => match crate::buzzmatrix::parse(bytes) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    diags.error("buzzkill-matrix-invalid", crate::buzzmatrix::NAME, e.to_string());
+                    None
+                }
+            },
+            None => opts.buzzkill_matrix,
+        };
         let mask_lattice = match b.mask_lattice() {
             Some(bytes) => match crate::lattice::parse(bytes) {
                 Ok(l) => Some(l),
@@ -592,6 +614,7 @@ impl Tuning {
             lsm2_param_fill,
             volume_range,
             mask_lattice,
+            buzzkill,
             graph,
         })
     }

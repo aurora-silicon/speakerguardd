@@ -82,8 +82,16 @@ fn main() {
     }
     .expect("bundle");
     let mut diags = Diagnostics::default();
-    let mut t = Tuning::load(&b, &Options { speaker_id, ..Options::default() }, &mut diags)
-        .unwrap_or_else(|e| panic!("load: {e}"));
+    let mut t = Tuning::load(
+        &b,
+        &Options {
+            speaker_id,
+            buzzkill_matrix: aurora_speaker_tuning::buzzmatrix::from_env().expect("SGV2_BUZZKILL_MATRIX"),
+            ..Options::default()
+        },
+        &mut diags,
+    )
+    .unwrap_or_else(|e| panic!("load: {e}"));
     // Raw tuning roots have no installer manifest. Offline cross-OS rigs
     // supply the source build explicitly; production bundles carry it in
     // their manifest and therefore never consult this harness override.

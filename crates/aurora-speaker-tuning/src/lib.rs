@@ -20,6 +20,7 @@
 //! * [`spp3`]: the spp3 sidecar (OL_thermal, OL_disp, CL, globals);
 //! * [`names`]: the specification's parameter-ID maps;
 //! * [`spts`]: the factory calibration record;
+//! * [`buzzmatrix`]: the BuzzKill detector's quadrature matrix the installer extracts;
 //! * [`lattice`]: the lsm2 masker's bucket lattice the installer extracts;
 //! * [`tuning`]: all of it assembled for the engine and graph generator;
 //! * [`units`]: the units-and-semantics table; [`versions`]: macOS releases;
@@ -33,6 +34,7 @@
 
 pub mod aupreset;
 pub mod bundle;
+pub mod buzzmatrix;
 pub mod compile;
 pub mod dspg;
 pub mod error;
