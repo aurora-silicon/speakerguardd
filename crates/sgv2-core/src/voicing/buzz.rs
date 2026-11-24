@@ -242,6 +242,22 @@ fn rejection(frequency_hz: f64, quality: f64, fs: f64) -> Section {
     Section { b0: alpha * norm, b1: 0.0, b2: -alpha * norm, a1: -2.0 * libm::cos(w) * norm, a2: (1.0 - alpha) * norm }
 }
 
+/// The host-rate rejection.  The unit states its notch quality in the 12 kHz
+/// analysis domain, and its host-rate resonance rings out at that design's
+/// rate: the pole radius per second of an analysis-rate band-pass of
+/// `NOTCH_QUALITY`.  Measured on the installed unit: the step-off ring is
+/// 1.5 % longer than a host-rate constant quality's at 500 Hz, 4.6 % at
+/// 1 kHz, 13 % at 1.6 kHz and 22 % at 2 kHz.
+fn audio_rejection(frequency_hz: f64, fs: f64) -> Section {
+    let design = rejection(frequency_hz, NOTCH_QUALITY, ANALYSIS_RATE);
+    // a2 is the squared pole radius per analysis sample.
+    let radius = libm::pow(design.a2.clamp(0.0, 1.0), 0.5 * ANALYSIS_RATE / fs);
+    let alpha = (1.0 - radius * radius) / (1.0 + radius * radius);
+    let w = 2.0 * core::f64::consts::PI * frequency_hz / fs;
+    let norm = 1.0 / (1.0 + alpha);
+    Section { b0: alpha * norm, b1: 0.0, b2: -alpha * norm, a1: -2.0 * libm::cos(w) * norm, a2: (1.0 - alpha) * norm }
+}
+
 fn wet_smoother(fs: f64) -> Section {
     let k = libm::tan(core::f64::consts::PI * WET_SMOOTH_HZ / fs);
     let b = k / (1.0 + k);
@@ -446,7 +462,7 @@ impl Run {
 
     fn redesign(&mut self, index: usize) {
         let t = &mut self.tracks[index];
-        t.audio_section = rejection(t.frequency_hz as f64, NOTCH_QUALITY, self.fs);
+        t.audio_section = audio_rejection(t.frequency_hz as f64, self.fs);
     }
 
     // The index also addresses self.tracks and self.redesign(), which an iterator over used cannot borrow.
@@ -740,5 +756,19 @@ mod tests {
             let half_bandwidth = f / (2.0 * NOTCH_QUALITY);
             assert!((section.magnitude(f + half_bandwidth, fs) - core::f64::consts::FRAC_1_SQRT_2).abs() < 0.02);
         }
+    }
+
+    #[test]
+    fn host_rate_rejection_rings_at_the_analysis_rate() {
+        let decay = |s: Section, fs: f64| -1.0 / (fs * 0.5 * libm::log(s.a2));
+        for f in [250.0, 1000.0, 2000.0] {
+            let analysis = decay(rejection(f, NOTCH_QUALITY, ANALYSIS_RATE), ANALYSIS_RATE);
+            let host = audio_rejection(f, 48_000.0);
+            assert!((decay(host, 48_000.0) / analysis - 1.0).abs() < 1.0e-9);
+            assert!((host.magnitude(f, 48_000.0) - 1.0).abs() < 1.0e-9);
+        }
+        let constant = decay(rejection(2000.0, NOTCH_QUALITY, 48_000.0), 48_000.0);
+        let ratio = decay(audio_rejection(2000.0, 48_000.0), 48_000.0) / constant;
+        assert!((ratio - 1.1935).abs() < 0.001, "{ratio}");
     }
 }
