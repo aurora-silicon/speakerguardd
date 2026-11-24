@@ -28,7 +28,7 @@ def old_bundle(short=True):
 
 
 class FillRouting(unittest.TestCase):
-    def test_status_names_old_collection_and_route3_only_when_short(self):
+    def test_status_names_a_missing_readback_only_when_short(self):
         for short in (True, False):
             bundle = old_bundle(short)
             store = types.SimpleNamespace(state=lambda: {}, read_bundle=lambda: bundle, interface="unused")
@@ -39,25 +39,29 @@ class FillRouting(unittest.TestCase):
                 self.assertEqual(up.cmd_status(types.SimpleNamespace(store="unused")), 0)
             result = json.loads(output.getvalue())
             if short:
-                self.assertEqual(result["lsm2_fill"], "collected before the installer read the lsm2 fill")
-                self.assertIn("route 3", result["lsm2_fill_next"])
+                self.assertEqual(result["lsm2_fill"], "needed, not present")
+                self.assertIn("pinned build", result["lsm2_fill_next"])
             else:
                 self.assertEqual(result["lsm2_fill"], "not required")
 
-    def test_acquire_and_check_refuse_short_offline_bundle_with_route3_reason(self):
+    def test_acquire_and_check_refuse_a_short_bundle_without_a_readback(self):
         with tempfile.TemporaryDirectory() as scratch:
-            a = types.SimpleNamespace(route="1", chosen="unused", installer_dirs=[], scratch=scratch,
-                                      collection=None, adt=None, json=None)
+            a = types.SimpleNamespace(chosen="unused", installer_dirs=[], scratch=scratch, ipsw=None,
+                                      adt=None, json=None)
             identity = types.SimpleNamespace(unit="synthetic", board="synthetic", acoustic=901,
                                              matches_dt=lambda: True)
             with mock.patch.object(up, "speaker_id_source", return_value=(None, False, "none")), \
-                 mock.patch.object(up, "route1", return_value=(old_bundle(), {"source": "synthetic"})), \
+                 mock.patch.object(up, "from_ipsw", return_value=(old_bundle(), {"source": "synthetic"}, "0" * 64)), \
                  mock.patch.object(up.collect, "Identity", return_value=identity), \
                  mock.patch.object(up, "interface_mode", return_value=("none", None)), \
                  mock.patch.object(up, "say") as say:
                 with self.assertRaises(up.Refused) as error:
                     up.acquire(identity, a)
-                self.assertIn("collected before the installer read the lsm2 fill", str(error.exception))
-                self.assertIn("route 3", str(error.exception))
+                self.assertIn("parameter readback", str(error.exception))
+                self.assertIn("has none", str(error.exception))
                 self.assertEqual(up.cmd_check(a), up.EXIT_REFUSED)
-                self.assertTrue(any("route 3" in str(c) for c in say.call_args_list))
+                self.assertTrue(any("readback" in str(c) for c in say.call_args_list))
+
+
+if __name__ == "__main__":
+    unittest.main()

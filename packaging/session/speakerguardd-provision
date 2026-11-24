@@ -27,9 +27,9 @@ manual step, before the self-check and the supervisor start.
    installer recorded the unit compiles without its per-unit calibration
    (open loop at the base limits) and the journal says to collect it again.
    Automatic qualification requires the board and unit binding; older
-   unbound extractions must be recollected. Collecting again: the installer's firmware step on this Mac's macOS, or
-   tools/speaker-tuning/collect-macos.sh there and install-linux.sh here
-   (aurora-installer), then restart speakerguardd-provision.service.
+   unbound extractions must be recollected. Collecting again: sudo aurora-speaker-upgrade (the pinned restore
+   image), or the installer's firmware step, then restart
+   speakerguardd-provision.service.
 2. **Bind** the blob to the board, the unit (the unit ID of the device
    tree's `serial-number`, never the serial itself), the kernel release, the
    bundle's digest, the macOS build it was collected from, the device tree's

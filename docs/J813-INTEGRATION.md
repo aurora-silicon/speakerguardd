@@ -108,6 +108,7 @@ derives the stage the same way for every LSM2 tuning
 the constructed bank's tap count, look-ahead and controller buffering.
 Full-preset payload bytes are unaffected: their records agree.
 
-For an older collection, `aurora-speaker-upgrade status` and `--check` point
-to `aurora-speaker-upgrade guide` (route 3), since a mounted system volume or
-restore image cannot host the owner's running macOS AudioUnit.
+Without that readback, `aurora-speaker-upgrade status` and `--check` say so:
+a restore image cannot host the AudioUnit, so the readback comes only from
+this unit's installer bundle, and only when it was read from exactly the
+pinned restore image's files and AudioDSP component.

@@ -1,7 +1,8 @@
 {
-  "comment": "Public addresses of Apple's macOS restore images by build, for route 2 when Apple's IPSW feed no longer lists a build. Addresses only, no Apple data.",
-  "restore_images": {
-    "25G72": "https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-65618/10445B26-DE2C-43EC-9149-0A831602E74B/UniversalMac_26.6_25G72_Restore.ipsw",
-    "25G83": "https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw"
-  }
+  "comment": "The one source of per-model speaker tuning (Tunings, AudioDSP component): Apple's macOS 27.2 restore images, the speaker safety stack's pinned release, for every Mac whatever macOS it runs. In this order, the first image whose BuildManifest carries the Mac's board is used; its build must be listed here. Public addresses only, no Apple data.",
+  "macos": "27.2",
+  "restore_images": [
+    {"build": "26B123", "url": "https://updates.cdn-apple.com/2026FallFCS/c9671975-52db-4fb5-9af2-00217169ba8d/UniversalMac_27.2_26B123_Restore.ipsw"},
+    {"build": "26B8125", "url": "https://updates.cdn-apple.com/2026FallFCS/b83bb963-ebd8-4608-8b5d-fdc70cb24927/UniversalMac_27.2_26B8125_Restore.ipsw"}
+  ]
 }
