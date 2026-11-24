@@ -338,6 +338,12 @@ def collect(staged, identity, speaker_id, speaker_id_known):
     run = FakeRun(identity, build, speaker_id)
     c = audio_tuning.AudioTuningFWCollection.__new__(audio_tuning.AudioTuningFWCollection)
     c.fwfiles, c.bundle = [], {}
+    # The BuzzKill detector's quadrature matrix too: speakerguardd v2 reads
+    # it, and a tuning with a Buzz box does not compile without it. The
+    # collector reads it from the staged AudioDSP component; a component
+    # without it gives a bundle without the record (fine for a graph with
+    # no Buzz box; the compile refuses one that has it).
+    c.collect_buzzkill = True
     # load() directly: the constructor turns every failure into an empty
     # collection, and the caller needs the reason.
     c.load(os.path.join(staged, TUNINGS), run, os.path.join(staged, lsm2_lattice.AUDIODSP))
@@ -346,16 +352,50 @@ def collect(staged, identity, speaker_id, speaker_id_known):
     return c.bundle, build
 
 
+# The BuzzKill unit (`aufx/buzk`), as the tuning's strips and graphs name an
+# Audio Unit: a dictionary whose `type` and `subtype` are FourCCs, either as
+# integers or as four-character strings.
+BUZZ_UNIT = ("aufx", "buzk")
+
+
+def _fourcc(v):
+    if isinstance(v, int) and 0 <= v <= 0xFFFFFFFF:
+        return v.to_bytes(4, "big").decode("latin-1")
+    return v if isinstance(v, str) else None
+
+
+def has_buzz_unit(bundle):
+    """Whether any property list of the bundle names a BuzzKill unit: its
+    graph then needs the BuzzKill quadrature matrix to compile."""
+    def walk(n):
+        if isinstance(n, dict):
+            if (_fourcc(n.get("type")), _fourcc(n.get("subtype"))) == BUZZ_UNIT:
+                return True
+            return any(walk(v) for v in n.values())
+        if isinstance(n, list):
+            return any(walk(v) for v in n)
+        return False
+    for rel, data in bundle.items():
+        if rel == audio_tuning.MANIFEST or not data.startswith((b"bplist", b"<?xml", b"<plist")):
+            continue
+        try:
+            doc = plistlib.loads(data)
+        except Exception:
+            continue
+        if walk(doc):
+            return True
+    return False
+
+
 # Manifest records a newer installer writes that this speakerguardd does
 # not read yet, and the file each one names. Its tuning reader parses a
 # schema-2 manifest strictly: one key it does not know refuses the whole
 # bundle ("unknown field"), and the speakers stay at the kernel's floor.
-# The installer's collector on main wrote `buzzkill_quadrature` by default
-# from 2026-11-13 (aurora-installer#119) while no release read it
-# (speakerguardd#138 adds the reader); the vendored collector does not know
-# it either, so it keeps the record in the manifest but drops its file.
-# Remove an entry here once the tuning reader reads that record.
-UNREAD_RECORDS = {"buzzkill_quadrature": "buzzkill-quadrature.bin"}
+# Add an entry here when the installer's collector starts writing a record
+# before speakerguardd reads it; remove it once the reader does.
+# `buzzkill_quadrature` was the first (aurora-installer#119); speakerguardd
+# reads it since #244, so it is kept.
+UNREAD_RECORDS = {}
 
 
 def for_this_reader(bundle):

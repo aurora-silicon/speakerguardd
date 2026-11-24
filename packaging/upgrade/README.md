@@ -47,9 +47,13 @@ aurora-speaker-upgrade guide           # the macOS route, when Linux cannot read
    routes cannot manufacture this field; collect it on this Mac's running
    macOS with the current `tools/speaker-tuning/collect-macos.sh`. No tuning
    values are packaged or uploaded. Full presets need no fill.
-   A bundle that carries a record speakerguardd v2 does not read yet (today
-   `buzzkill_quadrature`, which the installer's collector wrote by default
-   from 2026-11-13; speakerguardd#138 adds its reader) is stored without that
+   Routes 1 and 2 also collect the BuzzKill detector's quadrature matrix
+   (`buzzkill_quadrature`) from that macOS's AudioDSP component; a tuning
+   with a BuzzKill unit does not compile without it. A route 0 bundle
+   collected before the installer read the matrix, for such a tuning, is
+   used only when routes 1 to 3 give nothing.
+   A bundle that carries a record speakerguardd v2 does not read yet
+   (`UNREAD_RECORDS` in `collect.py`; none today) is stored without that
    record and its file, and the tool says so: the tuning reader refuses any
    manifest key it does not know.
 2. **Storage.** The bundle goes to `/var/lib/aurora-speaker-upgrade/bundle`
