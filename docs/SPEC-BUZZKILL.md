@@ -16,7 +16,7 @@ m[k] = clamp(T[k] / A'[k], 1e-6, 1).
 
 Every over-threshold cell, from that snapshot, updates the cell record for the next decision: `c[k] *= m`, `c[k-1] *= sqrt(m)`, `c[k+1] *= sqrt(m)`.
 
-Candidates (the over-threshold cells whose refined frequency is in range) are then taken in the order of their released cell gain, deepest first, equal gains in ascending cell order. A candidate that lies inside one already taken by this decision (strictly above `0.9659363 * f_previous` and strictly below `1.035265 * f_previous`, i.e. within 1/20 octave) is the same line seen from a neighbouring cell: it has already deepened the cell record, but it installs or multiplies no second track.
+Candidates (the over-threshold cells whose refined frequency is in range) are then taken in the order of their released cell gain, deepest first, equal gains in ascending cell order. A candidate that lies inside one already taken by this decision (strictly above `0.9659363 * f_previous` and strictly below `1.035265 * f_previous`, i.e. within 1/20 octave) is the same line seen from a neighbouring cell: it has already deepened the cell record and installs or multiplies no second track, but the earlier candidate takes its multiplier when it is deeper (keeping its own frequency). (Black-box against the installed unit on the 25G83 parity gate: dropping the later cell cuts lines that fall between two cells, such as 160, 250 or 400 Hz, up to 1.1 dB less than macOS.)
 
 Candidate frequency is not the centre of the FFT bin. Let `X[k]` be the complex transform of the windowed signal and `D[k]` the transform of its windowed first difference. With `q = abs(D[k]) / (abs(X[k]) + 1e-40)`, the refined frequency is
 

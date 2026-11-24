@@ -51,6 +51,32 @@ fn analysed_cells(maximum_hz: f64) -> usize {
     (libm::floor(maximum_hz * FFT as f64 / ANALYSIS_RATE) as usize).min(FFT / 2)
 }
 
+/// Folds candidates (already in decision order) that see the same line:
+/// one inside an earlier candidate's duplicate band joins it, which keeps
+/// its own frequency but takes the deeper multiplier. Returns the number of
+/// lines, compacted to the front. (Black-box against the installed unit:
+/// dropping the later cell, or keeping the first cell's multiplier, cuts a
+/// line that falls between two cells less than macOS does, by up to
+/// 1.1 dB on the 25G83 parity gate; the deeper one matches.)
+fn merge_same_line(c: &mut [Candidate]) -> usize {
+    let mut lines = 0usize;
+    for i in 0..c.len() {
+        let next = c[i];
+        let f = next.frequency_hz;
+        match c[..lines]
+            .iter_mut()
+            .find(|a| f > a.frequency_hz * CANDIDATE_LOWER && f < a.frequency_hz * CANDIDATE_UPPER)
+        {
+            Some(line) => line.multiplier = line.multiplier.min(next.multiplier),
+            None => {
+                c[lines] = next;
+                lines += 1;
+            }
+        }
+    }
+    lines
+}
+
 fn analysis_lowpass(frequency_hz: f64, fs: f64) -> Section {
     let k = libm::tan(core::f64::consts::PI * frequency_hz / fs);
     let norm = 1.0 / (1.0 + core::f64::consts::SQRT_2 * k + k * k);
@@ -478,7 +504,8 @@ impl Run {
         // then taken in the order of their released cell gain (deepest
         // first; equal gains in ascending cell order), and one whose refined
         // frequency lies inside an earlier one's duplicate band is the same
-        // line: it moves no second track.
+        // line seen from a neighbouring cell: it moves no second track, but
+        // the earlier one takes its multiplier when it is deeper.
         // Fixed storage: the decision runs on the audio thread and never allocates.
         let mut cell_updates = [1.0f32; FFT / 2 + 1];
         let mut pending = [Candidate::default(); TRACKS];
@@ -515,17 +542,10 @@ impl Run {
                 j -= 1;
             }
         }
-        let mut accepted = [0.0f32; TRACKS];
-        let mut taken = 0usize;
+        let lines = merge_same_line(&mut pending[..count]);
         let mut used = [false; TRACKS];
-        for c in pending.into_iter().take(count) {
-            let f = c.frequency_hz;
-            if accepted[..taken].iter().any(|a| f > *a * CANDIDATE_LOWER && f < *a * CANDIDATE_UPPER) {
-                continue;
-            }
-            accepted[taken] = f;
-            taken += 1;
-            self.update_track(f as f64, c.multiplier as f64, &mut used);
+        for c in &pending[..lines] {
+            self.update_track(c.frequency_hz as f64, c.multiplier as f64, &mut used);
         }
         for (gain, update) in self.bin_gains.iter_mut().zip(cell_updates) {
             *gain *= update;
@@ -652,6 +672,26 @@ mod tests {
         assert!(g <= m * 1.000_001, "{g} {m}");
         assert!(r.bin_gains[k - 1] < 1.0 && r.bin_gains[k + 1] < 1.0);
         assert!(r.bin_gains.iter().all(|g| *g > 0.0 && *g <= 1.0));
+    }
+
+    #[test]
+    fn a_line_seen_from_two_cells_takes_the_deeper_multiplier() {
+        let c = |frequency_hz, multiplier, record_gain| Candidate { frequency_hz, multiplier, record_gain };
+        // decision order: 1000 Hz first; 1010 Hz is the same line (inside
+        // 1/20 octave) and deeper; 1100 Hz is another line
+        let mut v = [c(1000.0, 0.5, 0.2), c(1010.0, 0.3, 0.4), c(1100.0, 0.8, 0.9), c(990.0, 0.6, 1.0)];
+        let n = merge_same_line(&mut v);
+        assert_eq!(n, 2);
+        assert_eq!((v[0].frequency_hz, v[0].multiplier, v[0].record_gain), (1000.0, 0.3, 0.2));
+        assert_eq!((v[1].frequency_hz, v[1].multiplier), (1100.0, 0.8));
+        // a shallower same-line cell leaves the line's multiplier alone
+        let mut w = [c(500.0, 0.2, 0.5), c(505.0, 0.9, 0.6)];
+        assert_eq!(merge_same_line(&mut w), 1);
+        assert_eq!(w[0].multiplier, 0.2);
+        // the band edges are strict
+        let mut e = [c(1000.0, 0.5, 0.5), c(1000.0 * CANDIDATE_UPPER, 0.1, 0.6)];
+        assert_eq!(merge_same_line(&mut e), 2);
+        assert_eq!(e[0].multiplier, 0.5);
     }
 
     #[test]
