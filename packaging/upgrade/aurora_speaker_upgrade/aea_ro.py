@@ -26,6 +26,7 @@ the key (its URL, name or bytes) is ever printed or logged.
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -86,7 +87,10 @@ class Ranges:
                     raise AeaError("short range response")
                 self.fetched += n
                 return data
-            except (OSError, AeaError) as e:
+            except (OSError, AeaError, http.client.HTTPException) as e:
+                # HTTPException: a body cut short (IncompleteRead) is not
+                # an OSError either; it is retried and, after the last
+                # attempt, unavailability like any other transfer failure.
                 last = e
         raise AeaUnavailable(f"range fetch failed: {last}")
 
