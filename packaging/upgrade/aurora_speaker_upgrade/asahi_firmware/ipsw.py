@@ -143,10 +143,15 @@ def find(board, images, version=None, open_zip=remotezip.RemoteZip):
     raise IpswError(f"no restore image of macOS {version or ''} ({', '.join(seen)}) carries board {board}")
 
 
-def open_system(board, images, version=None, open_zip=remotezip.RemoteZip):
+def open_system(board, images, version=None, open_zip=remotezip.RemoteZip, require_aea=False):
     """(System volume, range fetcher, build, url) of the restore image for a
-    board (j413) among images."""
+    board (j413) among images. require_aea: only an Apple Encrypted Archive
+    root file system, whose every byte is authenticated against Apple's key,
+    is opened; the member checked is the member opened (one BuildManifest
+    fetch decides both)."""
     build, url, member = find(board, images, version, open_zip)
+    if require_aea and not member.endswith(".aea"):
+        raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
     try:
         return _open(board, build, url, member, open_zip)
     except (aea_ro.AeaUnavailable, remotezip.RemoteZipUnavailable, OSError) as e:

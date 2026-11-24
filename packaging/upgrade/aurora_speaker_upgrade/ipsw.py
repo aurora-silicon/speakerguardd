@@ -87,6 +87,15 @@ def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
 
 def open_system(board, images=None, url=None, open_zip=remotezip.RemoteZip):
     """(System volume, range fetcher, build, url) of the pinned restore image
-    for a board (j413)."""
-    build, u, _ = find(board, images, url, open_zip)
-    return reader.open_system(board, [(build, u)], (pin() if images is None else images)[0], open_zip)
+    for a board (j413). The shared reader finds the board's image and opens
+    exactly the member it checked (require_aea): one BuildManifest fetch
+    decides both, so nothing but an Apple Encrypted Archive is ever opened."""
+    release, pinned = pin() if images is None else images
+    builds = [b for b, _ in pinned]
+    if url:
+        got = mirror_build(url, open_zip)
+        if got not in builds:
+            raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
+                            f"({', '.join(builds)})")
+        pinned = [(got, url)]
+    return reader.open_system(board, pinned, release, open_zip, require_aea=True)
