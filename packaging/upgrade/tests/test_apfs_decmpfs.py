@@ -8,7 +8,7 @@ import types
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from aurora_speaker_upgrade import aea_ro, apfs_ro  # noqa: E402
+from aurora_speaker_upgrade.asahi_firmware import aea_ro, apfs_ro  # noqa: E402
 
 
 class Type9(unittest.TestCase):

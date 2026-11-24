@@ -6,34 +6,26 @@ downloading it.
 
 The pin (share/restore-images.json) names the release (macOS 27.2, the
 speaker safety stack's) and its restore images in order. The first one
-whose BuildManifest carries this Mac's board gives the root file system;
-aea_ro decodes it on demand and apfs_ro reads its System volume. The image
-must be exactly a pinned build. There is no other source: not the installed
-macOS, not an older bundle, not another build. If no pinned image carries
-the board, or one cannot be read, the tool refuses and the speakers stay
-as they are.
+whose BuildManifest carries this Mac's board gives the System volume. The
+reading itself is the installer's restore image reader
+(asahi_firmware.ipsw with aea_ro, apfs_ro and remotezip, vendored
+unchanged), the same code the installer's Linux tools use. On top of it
+this module adds only what the speaker tuning needs: the pin, and that the
+root file system is an Apple Encrypted Archive, whose every byte is
+authenticated against Apple's key, so a mirror (--ipsw) cannot serve an
+altered volume under a pinned build. There is no other source: not the
+installed macOS, not an older bundle, not another build.
 """
 import json
-import logging
 import os
 import plistlib
 
-from . import aea_ro, apfs_ro, remotezip
-
-log = logging.getLogger("aurora-speaker-upgrade")
+from .asahi_firmware import aea_ro, apfs_ro, remotezip
+from .asahi_firmware import ipsw as reader
 
 CATALOG = "/usr/share/aurora-speaker-upgrade/restore-images.json"
-MAX_MANIFEST = 64 << 20
-
-
-class IpswError(Exception):
-    pass
-
-
-class IpswUnavailable(IpswError):
-    """The restore image or Apple's key service cannot be reached now (no
-    network, a timeout, a server error): try again later. Every other
-    IpswError is the pinned image's answer."""
+IpswError = reader.IpswError
+IpswUnavailable = reader.IpswUnavailable
 
 
 def pin(paths=None):
@@ -62,64 +54,39 @@ def pin(paths=None):
     raise IpswError("no restore image pin is installed (restore-images.json)")
 
 
-def os_member(manifest, board):
-    """The root file system member a BuildManifest names for a board, or
-    None when the image does not carry it."""
-    paths = {bi["Manifest"]["OS"]["Info"]["Path"] for bi in manifest.get("BuildIdentities", [])
-             if bi.get("Info", {}).get("DeviceClass") == f"{board}ap" and "OS" in bi.get("Manifest", {})}
-    if len(paths) > 1:
-        raise IpswError(f"the restore image names {len(paths)} root file systems for {board}")
-    return paths.pop() if paths else None
-
-
-def _manifest(z):
-    m = z.members.get("BuildManifest.plist")
-    if m is None or m.usize > MAX_MANIFEST:
-        raise IpswError("the restore image has no usable BuildManifest")
-    return plistlib.loads(m.read(MAX_MANIFEST))
+def mirror_build(url, open_zip=remotezip.RemoteZip):
+    """The build a mirror (--ipsw) serves, from its BuildManifest."""
+    try:
+        m = open_zip(url).members.get("BuildManifest.plist")
+        if m is None or m.usize > reader.MAX_MANIFEST:
+            raise IpswError("the restore image has no usable BuildManifest")
+        return plistlib.loads(m.read(reader.MAX_MANIFEST)).get("ProductBuildVersion")
+    except (remotezip.RemoteZipUnavailable, OSError) as e:
+        raise IpswUnavailable(f"restore image {url}: {e}") from None
+    except (remotezip.RemoteZipError, ValueError) as e:
+        raise IpswError(f"restore image {url}: {e}") from None
 
 
 def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
-    """(build, url, BuildManifest, member) of the pinned image for a board.
-    url (--ipsw, e.g. a local mirror) replaces the addresses, never the pin:
-    its build must still be a pinned one."""
+    """(build, url, member) of the pinned image for a board. url (--ipsw,
+    e.g. a mirror) replaces the addresses, never the pin: its build must
+    still be a pinned one. Only an Apple Encrypted Archive is accepted."""
     release, pinned = pin() if images is None else images
     builds = [b for b, _ in pinned]
-    candidates = [(None, url)] if url else pinned
-    reasons = []
-    for build, u in candidates:
-        try:
-            bm = _manifest(open_zip(u))
-        except (remotezip.RemoteZipUnavailable, OSError) as e:
-            raise IpswUnavailable(f"macOS {release} restore image {build or u}: {e}") from None
-        except (IpswError, remotezip.RemoteZipError, ValueError) as e:
-            raise IpswError(f"macOS {release} restore image {build or u}: {e}") from None
-        got = bm.get("ProductBuildVersion")
-        if got not in builds or (build is not None and got != build):
+    if url:
+        got = mirror_build(url, open_zip)
+        if got not in builds:
             raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
                             f"({', '.join(builds)})")
-        member = os_member(bm, board)
-        if member is not None:
-            return got, u, bm, member
-        reasons.append(got)
-    raise IpswError(f"no pinned macOS {release} restore image ({', '.join(reasons)}) carries board {board}")
-
-
-def open_system(board, images=None, url=None):
-    """(System volume, range fetcher, build, url) of the pinned restore image
-    for a board (j413). Only an Apple Encrypted Archive is read: every byte
-    of it is authenticated against Apple's key, so a mirror (--ipsw) cannot
-    serve an altered volume under a pinned build."""
-    build, url, bm, member = find(board, images, url)
+        pinned = [(got, url)]
+    build, u, member = reader.find(board, pinned, release, open_zip)
     if not member.endswith(".aea"):
         raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
-    try:
-        a, rng, _ = aea_ro.open_member(url, member)
-        vols = [v for v in apfs_ro.Container(a).volumes() if v.role == apfs_ro.ROLE_SYSTEM]
-    except (aea_ro.AeaUnavailable, remotezip.RemoteZipUnavailable, OSError) as e:
-        raise IpswUnavailable(f"macOS {build} restore image: {e}") from None
-    except (aea_ro.AeaError, apfs_ro.ApfsError, remotezip.RemoteZipError) as e:
-        raise IpswError(f"macOS {build} restore image: {e}") from None
-    if len(vols) != 1:
-        raise IpswError("the root file system has no single System volume")
-    return vols[0], rng, build, url
+    return build, u, member
+
+
+def open_system(board, images=None, url=None, open_zip=remotezip.RemoteZip):
+    """(System volume, range fetcher, build, url) of the pinned restore image
+    for a board (j413)."""
+    build, u, _ = find(board, images, url, open_zip)
+    return reader.open_system(board, [(build, u)], (pin() if images is None else images)[0], open_zip)

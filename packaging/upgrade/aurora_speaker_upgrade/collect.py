@@ -21,7 +21,8 @@ import plistlib
 import shutil
 import subprocess
 
-from . import apfs_ro, unit
+from . import unit
+from .asahi_firmware import apfs_ro
 from .asahi_firmware import audio_tuning, lsm2_lattice, lsm2_fill
 
 log = logging.getLogger("aurora-speaker-upgrade")

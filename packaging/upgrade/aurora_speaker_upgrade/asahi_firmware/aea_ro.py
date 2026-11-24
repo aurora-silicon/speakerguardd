@@ -39,7 +39,7 @@ SEGMENT = 1 << 20
 CLUSTER_WIDTH = 256
 CLUSTER_HEADER = CLUSTER_WIDTH * 72 + 32
 MAX_METADATA = 1 << 20
-UA = "aurora-speaker-upgrade/1"
+UA = "aurora-firmware/1"
 KEY_HOSTS = ("wkms-public.apple.com", "fcs-keys-pub-prod.cdn-apple.com")
 KEY_PATH = re.compile(r"\A/fcs-keys/[A-Za-z0-9_-]{43}=\Z")
 
