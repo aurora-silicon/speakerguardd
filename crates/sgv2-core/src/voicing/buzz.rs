@@ -34,6 +34,13 @@ struct Candidate {
     multiplier: f32,
     /// The candidate cell's released record gain: the order key.
     record_gain: f32,
+    /// The cell's limit and its record-weighted amplitude; once merged, the
+    /// line's lowest limit and its head's (first candidate's) amplitude.
+    threshold: f32,
+    amplitude: f32,
+    /// What a line that starts a track starts at: `threshold / amplitude`.
+    /// (`multiplier` becomes the line's deepest cell multiplier once merged.)
+    start_multiplier: f32,
 }
 
 // The analysis path low-passes the linked program at the operation limit
@@ -57,7 +64,9 @@ fn analysed_cells(maximum_hz: f64) -> usize {
 /// lines, compacted to the front. (Black-box against the installed unit:
 /// dropping the later cell, or keeping the first cell's multiplier, cuts a
 /// line that falls between two cells less than macOS does, by up to
-/// 1.1 dB on the 25G83 parity gate; the deeper one matches.)
+/// 1.1 dB on the 25G83 parity gate; the deeper one matches.) Its start
+/// multiplier is the lowest limit over its cells against the head cell's
+/// amplitude.
 fn merge_same_line(c: &mut [Candidate]) -> usize {
     let mut lines = 0usize;
     for i in 0..c.len() {
@@ -67,7 +76,11 @@ fn merge_same_line(c: &mut [Candidate]) -> usize {
             .iter_mut()
             .find(|a| f > a.frequency_hz * CANDIDATE_LOWER && f < a.frequency_hz * CANDIDATE_UPPER)
         {
-            Some(line) => line.multiplier = line.multiplier.min(next.multiplier),
+            Some(line) => {
+                line.multiplier = line.multiplier.min(next.multiplier);
+                line.threshold = line.threshold.min(next.threshold);
+                line.start_multiplier = (line.threshold / line.amplitude).clamp(1.0e-6, 1.0);
+            }
             None => {
                 c[lines] = next;
                 lines += 1;
@@ -465,30 +478,55 @@ impl Run {
         t.audio_section = audio_rejection(t.frequency_hz as f64, self.fs);
     }
 
+    /// Moves one line's track. A track that is already cutting (gain below
+    /// one) within the match distance continues by the line's deepest cell
+    /// multiplier. A line that starts a track (it lands on an idle track, or
+    /// takes over a released one) starts at its start multiplier: its head
+    /// cell's amplitude against the lowest limit over its cells. Released
+    /// tracks are taken over most-released first, the nearest of equally
+    /// released ones, so idle tracks go before any that still cut.
+    ///
+    /// Black-box against the installed unit (offline renders of its BuzzKill
+    /// box, and the parity gate's own Buzz inputs against the unit's Buzz
+    /// output): a full-level tone that several cells see starts shallower
+    /// than its deepest cell and deepens decision by decision; starting at
+    /// the deepest attenuates up to 1.6 dB faster than the unit from 500 Hz
+    /// to 2 kHz, and up to 3.8 dB on a 1 kHz step up. A second line of the
+    /// same decision does not take over the track the first one has just
+    /// started (a two-line 2 kHz onset would end up 0.4-0.8 dB louder than
+    /// the unit), nor a released track that still cuts while an idle one is
+    /// free (a 250 Hz onset would end up to 1.7 dB louder). The head's own
+    /// limit alone starts a 250 Hz line whose deeper cell has the lower limit
+    /// too shallow (0.3 dB louder settled at a 0.7 volume slider).
     // The index also addresses self.tracks and self.redesign(), which an iterator over used cannot borrow.
     #[allow(clippy::needless_range_loop)]
-    fn update_track(&mut self, frequency_hz: f64, multiplier: f64, used: &mut [bool; TRACKS]) {
+    fn update_track(&mut self, frequency_hz: f64, multiplier: f64, start_multiplier: f64, used: &mut [bool; TRACKS]) {
         let mut replacement = None;
+        let mut replacement_gain = 0.0f32;
         let mut replacement_distance = f64::INFINITY;
         for i in 0..TRACKS {
             let distance = (frequency_hz - self.tracks[i].frequency_hz as f64).abs() / frequency_hz;
             if distance < MATCH_RELATIVE && !used[i] {
                 let t = &mut self.tracks[i];
                 t.frequency_hz = frequency_hz as f32;
-                t.gain = (t.gain * multiplier as f32).clamp(1.0e-6, 1.0);
+                let m = if t.gain < 1.0 { multiplier } else { start_multiplier };
+                t.gain = (t.gain * m as f32).clamp(1.0e-6, 1.0);
                 used[i] = true;
                 self.redesign(i);
                 return;
             }
-            if self.tracks[i].gain > REPLACE_GAIN as f32 && distance < replacement_distance {
+            let gain = self.tracks[i].gain;
+            let better = gain > replacement_gain || (gain == replacement_gain && distance < replacement_distance);
+            if gain > REPLACE_GAIN as f32 && better {
                 replacement = Some(i);
+                replacement_gain = gain;
                 replacement_distance = distance;
             }
         }
         if let Some(i) = replacement {
             let t = &mut self.tracks[i];
             t.frequency_hz = frequency_hz as f32;
-            t.gain = multiplier.clamp(1.0e-6, 1.0) as f32;
+            t.gain = start_multiplier.clamp(1.0e-6, 1.0) as f32;
             used[i] = true;
             self.redesign(i);
         }
@@ -546,7 +584,14 @@ impl Run {
                 continue;
             }
             if count < TRACKS {
-                pending[count] = Candidate { frequency_hz, multiplier, record_gain: self.bin_gains[bin] };
+                pending[count] = Candidate {
+                    frequency_hz,
+                    multiplier,
+                    record_gain: self.bin_gains[bin],
+                    threshold,
+                    amplitude,
+                    start_multiplier: multiplier,
+                };
                 count += 1;
             }
         }
@@ -561,7 +606,7 @@ impl Run {
         let lines = merge_same_line(&mut pending[..count]);
         let mut used = [false; TRACKS];
         for c in &pending[..lines] {
-            self.update_track(c.frequency_hz as f64, c.multiplier as f64, &mut used);
+            self.update_track(c.frequency_hz as f64, c.multiplier as f64, c.start_multiplier as f64, &mut used);
         }
         for (gain, update) in self.bin_gains.iter_mut().zip(cell_updates) {
             *gain *= update;
@@ -692,7 +737,14 @@ mod tests {
 
     #[test]
     fn a_line_seen_from_two_cells_takes_the_deeper_multiplier() {
-        let c = |frequency_hz, multiplier, record_gain| Candidate { frequency_hz, multiplier, record_gain };
+        let c = |frequency_hz, multiplier, record_gain| Candidate {
+            frequency_hz,
+            multiplier,
+            record_gain,
+            threshold: multiplier,
+            amplitude: 1.0,
+            start_multiplier: multiplier,
+        };
         // decision order: 1000 Hz first; 1010 Hz is the same line (inside
         // 1/20 octave) and deeper; 1100 Hz is another line
         let mut v = [c(1000.0, 0.5, 0.2), c(1010.0, 0.3, 0.4), c(1100.0, 0.8, 0.9), c(990.0, 0.6, 1.0)];
@@ -704,10 +756,79 @@ mod tests {
         let mut w = [c(500.0, 0.2, 0.5), c(505.0, 0.9, 0.6)];
         assert_eq!(merge_same_line(&mut w), 1);
         assert_eq!(w[0].multiplier, 0.2);
+        // the start multiplier: the lowest limit over the line's cells
+        // against the head cell's amplitude
+        let mut h = [
+            Candidate {
+                frequency_hz: 245.0,
+                multiplier: 0.8,
+                record_gain: 1.0,
+                threshold: 0.2,
+                amplitude: 0.25,
+                start_multiplier: 0.8,
+            },
+            Candidate {
+                frequency_hz: 250.0,
+                multiplier: 0.6,
+                record_gain: 1.0,
+                threshold: 0.18,
+                amplitude: 0.3,
+                start_multiplier: 0.6,
+            },
+        ];
+        assert_eq!(merge_same_line(&mut h), 1);
+        assert_eq!(h[0].multiplier, 0.6);
+        assert_eq!(h[0].start_multiplier, 0.18f32 / 0.25);
         // the band edges are strict
         let mut e = [c(1000.0, 0.5, 0.5), c(1000.0 * CANDIDATE_UPPER, 0.1, 0.6)];
         assert_eq!(merge_same_line(&mut e), 2);
         assert_eq!(e[0].multiplier, 0.5);
+    }
+
+    #[test]
+    fn a_line_starts_a_track_at_its_start_multiplier_and_deepens_a_cutting_one() {
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        let gain_at = |r: &Run, f: f32| r.tracks.iter().find(|t| t.frequency_hz == f).map(|t| t.gain);
+        // an idle track (gain one) within the match distance: the start multiplier
+        let mut used = [false; TRACKS];
+        r.update_track(1010.0, 0.3, 0.6, &mut used);
+        assert_eq!(gain_at(&r, 1010.0), Some(0.6));
+        // a line far from every track takes over a released one: the start multiplier too
+        r.update_track(3000.0, 0.2, 0.7, &mut used);
+        assert_eq!(gain_at(&r, 3000.0), Some(0.7));
+        // the next decision continues the cutting track by the deepest multiplier
+        let mut used = [false; TRACKS];
+        r.update_track(1000.0, 0.5, 0.9, &mut used);
+        assert_eq!(gain_at(&r, 1000.0), Some(0.3));
+        assert_eq!(r.tracks.iter().filter(|t| t.gain < 1.0).count(), 2);
+    }
+
+    #[test]
+    fn a_new_line_takes_an_idle_track_before_one_that_still_cuts() {
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        r.tracks[0].frequency_hz = 2000.0;
+        r.tracks[0].gain = 0.9;
+        // 1900 Hz is outside the match distance of 2000 Hz and nearer to it
+        // than to the idle 1000 Hz tracks; the released track still cuts
+        let mut used = [false; TRACKS];
+        r.update_track(1900.0, 0.5, 0.85, &mut used);
+        assert_eq!((r.tracks[0].frequency_hz, r.tracks[0].gain), (2000.0, 0.9));
+        let started = r.tracks.iter().position(|t| t.frequency_hz == 1900.0).expect("started");
+        assert_eq!(r.tracks[started].gain, 0.85);
+        // a second line of the same decision, just outside the match distance,
+        // leaves the just-started (still released-looking) track alone
+        r.update_track(1830.0, 0.4, 0.8, &mut used);
+        assert_eq!((r.tracks[started].frequency_hz, r.tracks[started].gain), (1900.0, 0.85));
+        assert_eq!((r.tracks[0].frequency_hz, r.tracks[0].gain), (2000.0, 0.9));
+        assert!(r.tracks.iter().any(|t| t.frequency_hz == 1830.0 && t.gain == 0.8));
+        // once no idle track is left, the most released one is taken over
+        for t in r.tracks.iter_mut().filter(|t| t.gain == 1.0) {
+            t.gain = 0.95;
+        }
+        r.tracks[7].gain = 0.97;
+        let mut used = [false; TRACKS];
+        r.update_track(5000.0, 0.5, 0.6, &mut used);
+        assert_eq!((r.tracks[7].frequency_hz, r.tracks[7].gain), (5000.0, 0.6));
     }
 
     #[test]
