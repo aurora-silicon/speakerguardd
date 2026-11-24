@@ -3,7 +3,8 @@ import base64, contextlib, hashlib, json, os, plistlib, struct, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from aurora_speaker_upgrade import aea_ro, collect  # noqa: E402
+from aurora_speaker_upgrade import collect  # noqa: E402
+from aurora_speaker_upgrade.asahi_firmware import aea_ro  # noqa: E402
 
 
 def fixture(name):

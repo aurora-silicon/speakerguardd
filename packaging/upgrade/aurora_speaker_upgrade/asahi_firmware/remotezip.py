@@ -13,7 +13,7 @@ import sys
 import urllib.request
 import zlib
 
-UA = "aurora-speaker-upgrade/1"
+UA = "aurora-firmware/1"
 
 
 class RemoteZipError(Exception):

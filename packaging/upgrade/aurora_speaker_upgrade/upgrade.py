@@ -41,7 +41,8 @@ import sys
 import tempfile
 import time
 
-from . import aea_ro, apfs_ro, collect, ipsw, unit
+from . import collect, ipsw, unit
+from .asahi_firmware import aea_ro, apfs_ro
 from .asahi_firmware import audio_tuning
 
 log = logging.getLogger("aurora-speaker-upgrade")

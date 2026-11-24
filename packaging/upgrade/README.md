@@ -25,7 +25,10 @@ sudo aurora-speaker-upgrade --revert   # back to the legacy protection (--purge 
    it by HTTP ranges, about 26 MB of a 19 GB image, and decrypts it with the
    key Apple publishes for it (a port of the installer's AEA range path,
    macos-firmware-extract@71b413af; `tests/` checks it against that
-   reference's vectors). `apfs_ro` reads its System volume: the Tunings
+   reference's vectors). The reader (`ipsw`, `aea_ro`, `apfs_ro`,
+   `remotezip`) is the installer's `asahi_firmware`, vendored unchanged, so
+   the installer's Linux tools and this tool read restore images with one
+   implementation. `apfs_ro` reads its System volume: the Tunings
    tree and the AudioDSP component (lsm2 lattice, BuzzKill quadrature
    matrix). `--ipsw URL` reads the same pinned image from a mirror.
    There is no other source: not the installed macOS, not an older bundle,

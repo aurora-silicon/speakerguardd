@@ -22,9 +22,9 @@ from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at, lsm2_fill 
 PIN = ("27.2", [("26B123", "https://example.invalid/a.ipsw"), ("26B8125", "https://example.invalid/b.ipsw")])
 
 
-def manifest(build, boards):
-    return plistlib.dumps({"ProductBuildVersion": build, "BuildIdentities": [
-        {"Info": {"DeviceClass": f"{b}ap"}, "Manifest": {"OS": {"Info": {"Path": f"{build}-{b}.dmg.aea"}}}}
+def manifest(build, boards, version="27.2", ext=".dmg.aea"):
+    return plistlib.dumps({"ProductBuildVersion": build, "ProductVersion": version, "BuildIdentities": [
+        {"Info": {"DeviceClass": f"{b}ap"}, "Manifest": {"OS": {"Info": {"Path": f"{build}-{b}{ext}"}}}}
         for b in boards]})
 
 
@@ -91,12 +91,42 @@ class Pin(unittest.TestCase):
         self.assertEqual(tried, ["https://example.invalid/a.ipsw"])
 
     def test_only_an_apple_encrypted_archive_is_read(self):
-        with mock.patch.object(ipsw, "find", return_value=("26B123", "https://m.invalid/x.ipsw", None,
-                                                          "root.dmg")), \
-                mock.patch.object(ipsw.aea_ro, "open_member") as om:
+        oz = zips({"https://m.invalid/x.ipsw": manifest("26B123", ["j473"], ext=".dmg")})
+        with mock.patch.object(ipsw.aea_ro, "open_member") as om, \
+                mock.patch.object(ipsw.reader, "_open") as opened:
             with self.assertRaisesRegex(ipsw.IpswError, "not an Apple Encrypted Archive"):
-                ipsw.open_system("j473", PIN, url="https://m.invalid/x.ipsw")
+                ipsw.open_system("j473", PIN, url="https://m.invalid/x.ipsw", open_zip=oz)
         om.assert_not_called()
+        opened.assert_not_called()
+
+    def test_a_manifest_that_changes_after_the_check_opens_nothing_else(self):
+        """A mirror serving an AEA manifest first and a plain one later: only
+        the checked .aea member is ever opened."""
+        served = [manifest("26B123", ["j473"]), manifest("26B123", ["j473"]),
+                  manifest("26B123", ["j473"], ext=".dmg")]
+        fetches = []
+
+        def oz(url):
+            data = served[min(len(fetches), len(served) - 1)]
+            fetches.append(url)
+            return types.SimpleNamespace(members={"BuildManifest.plist": types.SimpleNamespace(
+                usize=len(data), read=lambda n: data)})
+        opened = []
+        with mock.patch.object(ipsw.reader, "_open",
+                               side_effect=lambda *a: opened.append(a[3]) or ("vol", None, a[1], a[2])):
+            ipsw.open_system("j473", PIN, url="https://m.invalid/x.ipsw", open_zip=oz)
+            fetches.clear()
+            ipsw.open_system("j473", PIN, open_zip=oz)
+        self.assertTrue(opened)
+        self.assertTrue(all(m.endswith(".aea") for m in opened), opened)
+
+    def test_the_reader_is_the_installers(self):
+        from aurora_speaker_upgrade import asahi_firmware
+        self.assertIs(ipsw.reader, asahi_firmware.ipsw)
+        self.assertIs(ipsw.IpswUnavailable, asahi_firmware.ipsw.IpswUnavailable)
+        here = pathlib.Path(__file__).resolve().parents[1] / "aurora_speaker_upgrade"
+        for name in ("aea_ro.py", "apfs_ro.py", "remotezip.py"):
+            self.assertFalse((here / name).exists(), f"a second copy of {name}")
 
 
 class OfflineAtBoot(unittest.TestCase):
