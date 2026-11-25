@@ -251,7 +251,7 @@ def kernel_interface(wait, sysfs=SYSFS, dt=DT):
             return None, None
         if time.monotonic() >= deadline:
             return None, None
-        time.sleep(0.25)
+        time.sleep(0.025)
     waited = time.monotonic() - start
     if waited >= 0.5:
         log(f"the speaker card {card} registered after {waited:.1f} s")

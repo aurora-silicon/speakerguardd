@@ -11,7 +11,7 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/docs/NEW-P
 Before=speakerguardd-selfcheck.service speakerguardd.service
 # The speaker card (its PCM), and the ESP, where the tuning may only be in
 # the vendor firmware archive.
-After=systemd-udev-settle.service local-fs.target boot.mount boot-efi.mount efi.mount
+After=systemd-udev-settle.service sound.target local-fs.target boot.mount boot-efi.mount efi.mount
 ConditionPathExists=/proc/device-tree/compatible
 
 [Service]
