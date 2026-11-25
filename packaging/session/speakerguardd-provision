@@ -283,7 +283,7 @@ def find_card(hw, want, wait, dt=DT, sysfs="/sys/class/sound", proc="/proc/asoun
         if time.monotonic() >= deadline:
             raise Failed(f"no ALSA card bound to the device tree's {hw['sound']} node after {wait:.0f} s: "
                          "is the kernel's macaudio driver loaded?")
-        time.sleep(0.25)
+        time.sleep(0.025)
 
 
 def speaker_pcm(idx):
