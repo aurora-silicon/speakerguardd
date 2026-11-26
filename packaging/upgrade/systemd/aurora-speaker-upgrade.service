@@ -1,9 +1,11 @@
 [Unit]
 Description=Move the speakers to speakerguardd v2 with this Mac's own tuning
 Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/packaging/upgrade/README.md
-# Shipped disabled: users opt in (systemctl enable --now aurora-speaker-upgrade)
-# until the rollout is approved. Idempotent: a Mac already on v2 with its
-# bundle does nothing. Any failure leaves the legacy protection in charge.
+# Enabled by the distributions' preset. It moves a speaker only when its
+# protected playback rows are on record in speakerguardd v2's gate data, and
+# never a Mac reverted by hand (aurora-speaker-upgrade --revert). Idempotent:
+# a Mac already on v2 with its bundle does nothing. Any failure leaves the
+# legacy protection in charge.
 After=local-fs.target sound.target systemd-udev-settle.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/proc/device-tree/compatible

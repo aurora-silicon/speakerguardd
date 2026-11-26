@@ -893,6 +893,11 @@ def cmd_run(a):
     record = os.path.join(store.root, "refused.json")
     key = refusal_key(identity)
     if getattr(a, "at_boot", False):
+        opted = reverted_by_hand(store)
+        if opted is not None:
+            say(f"reverted by hand ({opted.get('when')}): the boot unit leaves the speakers on the legacy "
+                "protection ('aurora-speaker-upgrade run' switches again)")
+            return EXIT_OK
         try:
             with open(record) as f:
                 old = json.load(f)
@@ -916,7 +921,39 @@ def cmd_run(a):
     if code == EXIT_OK:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(record)
+        if not getattr(a, "at_boot", False):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(store.root, REVERTED))
     return code
+
+
+REVERTED = "reverted.json"
+
+
+def reverted_by_hand(store):
+    """The --revert record: a Mac reverted by hand stays on the legacy
+    protection across boots. Without it the boot unit, enabled by the
+    package preset, would move a speaker with playback rows back to v2 at
+    the next boot. A successful `run` by hand clears it."""
+    root = getattr(store, "root", None)
+    if not root:
+        return None
+    try:
+        with open(os.path.join(root, REVERTED)) as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        rec = {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def record_revert(store):
+    store.ensure()
+    fd = os.open(os.path.join(store.root, REVERTED), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"when": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 def v2_owns_speakers(mode, card):
@@ -973,17 +1010,22 @@ def cmd_revert(a):
     store = Store(a.store)
     state = store.state()
     if not state and not os.path.exists(store.root):
-        say("nothing to revert: this Mac was never upgraded")
+        record_revert(store)
+        say("nothing to revert: this Mac was never upgraded; the boot unit leaves it on the legacy protection "
+            "until 'aurora-speaker-upgrade run' switches")
         return EXIT_OK
     mode, card = interface_mode()
     back_to_legacy(store, state, mode, card)
     if a.purge:
         collect.rmtree(store.root)
-        say(f"reverted; {store.root} removed")
+        record_revert(store)
+        say(f"reverted; the stored tuning in {store.root} removed")
     else:
         state.pop("provision_conf_before", None)
         store.save(state)
+        record_revert(store)
         say("reverted: the legacy protection owns the speakers (the collected bundle is kept; --purge removes it)")
+    say("the boot unit leaves this Mac on the legacy protection until 'aurora-speaker-upgrade run' switches again")
     return EXIT_OK
 
 
@@ -1009,6 +1051,9 @@ def cmd_status(a):
 def boot_migration(a):
     """status: whether the boot unit would move this speaker (its playback
     rows are on record) or leaves it to a run by hand."""
+    opted = reverted_by_hand(Store(a.store)) if getattr(a, "store", None) else None
+    if opted is not None:
+        return f"off: reverted by hand ({opted.get('when')}); 'aurora-speaker-upgrade run' switches again"
     try:
         acoustic = collect.Identity(getattr(a, "adt", None)).acoustic
     except collect.CollectError:

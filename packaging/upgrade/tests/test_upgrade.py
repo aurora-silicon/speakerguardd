@@ -459,6 +459,101 @@ class BootRefusalRecord(unittest.TestCase):
         self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
 
 
+class RevertSticks(unittest.TestCase):
+    """--revert is a lasting choice: the boot unit (enabled by the package
+    preset) does not move a reverted Mac back to v2 at the next boot, also
+    after --purge or on a Mac that was never switched; a successful `run` by
+    hand clears the record; status says so."""
+
+    def setUp(self):
+        import tempfile, types
+        from unittest import mock
+        from aurora_speaker_upgrade import upgrade as up
+        self.up, self.types = up, types
+        self.dir = os.path.join(tempfile.mkdtemp(prefix="sgup-revert-"), "store")
+        self.calls = 0
+        test = self
+
+        def fake_run(a):
+            test.calls += 1
+            return up.EXIT_OK
+        self.patches = [mock.patch.object(up, "_cmd_run", fake_run),
+                        mock.patch.object(up.collect, "Identity",
+                                          lambda adt=None: types.SimpleNamespace(unit="u1", acoustic=21)),
+                        mock.patch.object(up, "refusal_key", lambda identity: "k1"),
+                        mock.patch.object(up.Store, "ensure",
+                                          lambda self: os.makedirs(self.root, mode=0o700, exist_ok=True)),
+                        mock.patch.object(up, "interface_mode", return_value=("v2-only", "AppleJ615")),
+                        mock.patch.object(up, "back_to_legacy", lambda *a: None),
+                        mock.patch.object(up, "playback_proof", return_value=[{"evidence": "x"}])]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        import shutil
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(os.path.dirname(self.dir), ignore_errors=True)
+
+    def a(self, boot=False, purge=False):
+        return self.types.SimpleNamespace(store=self.dir, adt=None, at_boot=boot, purge=purge)
+
+    def revert(self, purge=False):
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()):
+            return self.up.cmd_revert(self.a(purge=purge))
+
+    def boot(self):
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.up.cmd_run(self.a(boot=True))
+        return rc, err.getvalue()
+
+    def switched_store(self):
+        os.makedirs(self.dir, mode=0o700)
+        with open(os.path.join(self.dir, "state.json"), "w") as f:
+            json.dump({"switched": True}, f)
+
+    def test_boot_unit_leaves_a_reverted_mac_alone(self):
+        self.switched_store()
+        self.assertEqual(self.revert(), self.up.EXIT_OK)
+        rec = os.path.join(self.dir, "reverted.json")
+        self.assertEqual(oct(os.stat(rec).st_mode & 0o777), "0o600")
+        rc, err = self.boot()
+        self.assertEqual((rc, self.calls), (self.up.EXIT_OK, 0))
+        self.assertIn("reverted by hand", err)
+
+    def test_purge_keeps_the_choice(self):
+        self.switched_store()
+        with open(os.path.join(self.dir, "bundle"), "w") as f:
+            f.write("x")
+        self.revert(purge=True)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "bundle")))
+        self.assertEqual(self.boot()[0], self.up.EXIT_OK)
+        self.assertEqual(self.calls, 0)
+
+    def test_revert_before_any_switch_keeps_legacy(self):
+        self.revert()
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "reverted.json")))
+        self.boot()
+        self.assertEqual(self.calls, 0)
+
+    def test_run_by_hand_clears_the_choice(self):
+        self.switched_store()
+        self.revert()
+        self.assertEqual(self.up.cmd_run(self.a()), self.up.EXIT_OK)
+        self.assertEqual(self.calls, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "reverted.json")))
+        self.boot()
+        self.assertEqual(self.calls, 2)
+
+    def test_status_reports_it(self):
+        self.assertEqual(self.up.boot_migration(self.a()), "playback rows on record")
+        self.revert()
+        self.assertTrue(self.up.boot_migration(self.a()).startswith("off: reverted by hand"))
+
+
 class V2Umask(unittest.TestCase):
     def test_v2_programs_run_with_the_units_umask(self):
         """B4: v2's provisioning and self-check run as their units would

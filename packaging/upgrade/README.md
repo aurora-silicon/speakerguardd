@@ -2,8 +2,9 @@
 
 Moves an existing install's speakers from the legacy protection
 (speakersafetyd, speakerguardd 0.1) to speakerguardd v2 with the Mac's own
-tuning, and back. It ships **disabled**. Turning it on for users waits for
-the maintainers.
+tuning, and back. The distributions enable its boot unit by preset; the
+unit moves only a speaker whose protected playback rows are on record (see
+below).
 
 ```sh
 sudo aurora-speaker-upgrade            # collect, compile, self-check, switch (idempotent)
@@ -98,6 +99,13 @@ limited by the record (v2's provisioning still refuses a protection type
 the gate data holds for playback rows, LSID's static release), and `status`
 shows `boot_migration`. A new playback row makes the boot unit try a
 refused Mac again.
+
+`--revert` is a lasting choice: it records
+`/var/lib/aurora-speaker-upgrade/reverted.json` (kept by `--purge`, written
+also on a Mac that was never switched), and the boot unit leaves a reverted
+Mac on the legacy protection at every boot. `status` shows
+`boot_migration: off: reverted by hand`. A successful `run` by hand
+switches again and clears the record.
 
 Requirements: python3, python3-cryptography, liblzfse, alsa-utils,
 systemd, network access to Apple's CDN and key service, and speakerguardd
