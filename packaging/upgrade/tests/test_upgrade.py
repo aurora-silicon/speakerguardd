@@ -822,13 +822,14 @@ class BootMigrationNeedsPlaybackRows(unittest.TestCase):
 
     def test_reads_the_shipped_gate_data(self):
         # The source tree's gate.json (installed by speakerguardd-v2 as
-        # /usr/share/speakerguardd/gate.json): AID44 and AID21 are proven, AID37 not.
+        # /usr/share/speakerguardd/gate.json): AID44, AID21 and AID37 are proven, AID42 not.
         up = self.up
         paths = up.gate_paths()[1:]
         self.assertTrue(os.path.isfile(paths[0]), paths)
         self.assertTrue(up.playback_proof(44, paths=paths))
         self.assertTrue(up.playback_proof(21, paths=paths))
-        self.assertEqual(up.playback_proof(37, paths=paths), [])
+        self.assertTrue(up.playback_proof(37, paths=paths))
+        self.assertEqual(up.playback_proof(42, paths=paths), [])
 
 
 if __name__ == "__main__":
