@@ -42,7 +42,7 @@ class Pin(unittest.TestCase):
         release, images = ipsw.pin(paths=[str(pathlib.Path(__file__).resolve().parents[1]
                                               / "share" / "restore-images.json")])
         self.assertEqual(release, "27.2")
-        self.assertEqual([b for b, _ in images], ["26B123", "26B8125"])
+        self.assertEqual([b for b, _ in images], ["26B123", "26B131", "26B8125"])
         self.assertTrue(all(u.startswith("https://updates.cdn-apple.com/") for _, u in images))
 
     def test_malformed_or_missing_pin_refuses(self):
@@ -66,6 +66,26 @@ class Pin(unittest.TestCase):
         with self.assertRaises(ipsw.IpswError) as e:
             ipsw.find("j999", PIN, open_zip=oz)
         self.assertIn("carries board j999", str(e.exception))
+
+    def test_preferred_build_orders_matching_pinned_image_first(self):
+        pin3 = ("27.2", [
+            ("26B123", "https://example.invalid/123.ipsw"),
+            ("26B131", "https://example.invalid/131.ipsw", "27.2.1"),
+            ("26B8125", "https://example.invalid/8125.ipsw"),
+        ])
+        oz = zips({
+            "https://example.invalid/123.ipsw": manifest("26B123", ["j713"], version="27.2"),
+            "https://example.invalid/131.ipsw": manifest("26B131", ["j713"], version="27.2.1"),
+            "https://example.invalid/8125.ipsw": manifest("26B8125", ["k114c"], version="27.2"),
+        })
+        self.assertEqual(ipsw.find("j713", pin3, open_zip=oz)[0], "26B123")
+        self.assertEqual(ipsw.find("j713", pin3, open_zip=oz, preferred_build="26B131")[0], "26B131")
+        # Unpinned preferred_build is ignored and never overrides the pin.
+        self.assertEqual(ipsw.find("j713", pin3, open_zip=oz, preferred_build="26B999")[0], "26B123")
+        # Per-entry version mismatch still refuses.
+        bad = zips({"https://example.invalid/131.ipsw": manifest("26B131", ["j713"], version="27.2")})
+        with self.assertRaises(ipsw.IpswError):
+            ipsw.find("j713", pin3, open_zip=bad, preferred_build="26B131")
 
     def test_an_image_that_is_not_its_pinned_build_refuses(self):
         oz = zips({"https://example.invalid/a.ipsw": manifest("26B131", ["j473"]),
@@ -306,6 +326,19 @@ class UnitAllowList(unittest.TestCase):
             self.assertEqual(unit.speaker_id(ident, os.path.join(t, "none"), [b])[:2], (5, True))
             ident.unit = "x" * 64
             self.assertEqual(unit.speaker_id(ident, os.path.join(t, "none"), [b])[:2], (None, False))
+
+    def test_installer_fill_build_is_unit_bound(self):
+        ident = types.SimpleNamespace(unit="u" * 64)
+        with tempfile.TemporaryDirectory() as t:
+            b = os.path.join(t, "b")
+            os.makedirs(b)
+            with open(os.path.join(b, at.MANIFEST), "w") as f:
+                json.dump({"unit_id": "u" * 64, "aid": "AID37",
+                           "lsm2_param_fill": {"path": lsm2_fill.NAME, "macos_build": "26B131"}}, f)
+            self.assertEqual(unit.installer_fill_build(ident, "AID37", [b]), "26B131")
+            self.assertIsNone(unit.installer_fill_build(ident, "AID42", [b]))
+            ident.unit = "x" * 64
+            self.assertIsNone(unit.installer_fill_build(ident, "AID37", [b]))
 
     def test_only_unit_py_opens_machine_paths(self):
         here = pathlib.Path(__file__).resolve().parents[1] / "aurora_speaker_upgrade"

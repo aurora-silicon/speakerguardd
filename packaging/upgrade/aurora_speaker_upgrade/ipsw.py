@@ -28,9 +28,10 @@ IpswError = reader.IpswError
 IpswUnavailable = reader.IpswUnavailable
 
 
-def pin(paths=None):
-    """(release, [(build, url)]) from the packaged pin (or, uninstalled, the
-    one beside this package)."""
+def _pin_entries(paths=None):
+    """(release, [(build, url, version)]) from the packaged pin (or,
+    uninstalled, the one beside this package). An entry may set its own
+    'macos' version (e.g. a point release like 27.2.1); omitted uses release."""
     if paths is None:
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         paths = (CATALOG, os.path.join(here, "share", "restore-images.json"))
@@ -46,12 +47,21 @@ def pin(paths=None):
             raise IpswError(f"{path}: malformed restore image pin")
         out = []
         for i in images:
+            ver = i.get("macos", release) if isinstance(i, dict) else None
             if not (isinstance(i, dict) and isinstance(i.get("build"), str)
+                    and isinstance(ver, str)
                     and isinstance(i.get("url"), str) and i["url"].startswith("https://")):
                 raise IpswError(f"{path}: malformed restore image pin entry")
-            out.append((i["build"], i["url"]))
+            out.append((i["build"], i["url"], ver))
         return release, out
     raise IpswError("no restore image pin is installed (restore-images.json)")
+
+
+def pin(paths=None):
+    """(release, [(build, url)]) from the packaged pin (or, uninstalled, the
+    one beside this package)."""
+    release, entries = _pin_entries(paths)
+    return release, [(b, u) for b, u, _ in entries]
 
 
 def mirror_build(url, open_zip=remotezip.RemoteZip):
@@ -67,35 +77,76 @@ def mirror_build(url, open_zip=remotezip.RemoteZip):
         raise IpswError(f"restore image {url}: {e}") from None
 
 
-def find(board, images=None, url=None, open_zip=remotezip.RemoteZip):
+def _prefer(pinned, preferred_build):
+    """Move a pinned entry matching preferred_build to the front; ignore any
+    build that is not already in the pin."""
+    if not preferred_build:
+        return pinned
+    hit = [e for e in pinned if e[0] == preferred_build]
+    if not hit:
+        return pinned
+    return hit + [e for e in pinned if e[0] != preferred_build]
+
+
+def _resolve(images, url, open_zip, preferred_build):
+    if images is None:
+        release, entries = _pin_entries()
+    else:
+        release, raw = images
+        entries = [(e[0], e[1], e[2] if len(e) > 2 else release) for e in raw]
+    by_build = {b: v for b, _, v in entries}
+    builds = [b for b, _, _ in entries]
+    if url:
+        got = mirror_build(url, open_zip)
+        if got not in by_build:
+            raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
+                            f"({', '.join(builds)})")
+        return release, [(got, url, by_build[got])]
+    return release, _prefer(entries, preferred_build)
+
+
+def _find_entry(board, release, entries, open_zip):
+    seen = []
+    for build, u, ver in entries:
+        try:
+            bm = reader._manifest(open_zip(u))
+        except (remotezip.RemoteZipUnavailable, OSError) as e:
+            raise IpswUnavailable(f"restore image {build}: {e}") from None
+        except (IpswError, remotezip.RemoteZipError, ValueError) as e:
+            raise IpswError(f"restore image {build}: {e}") from None
+        got, gotv = bm.get("ProductBuildVersion"), bm.get("ProductVersion")
+        if got != build or (ver is not None and gotv != ver):
+            raise IpswError(f"the restore image listed as {build} is macOS {gotv} ({got})")
+        member = reader.os_member(bm, board)
+        if member is not None:
+            return build, u, member
+        seen.append(build)
+    raise IpswError(f"no restore image of macOS {release} ({', '.join(seen)}) carries board {board}")
+
+
+def find(board, images=None, url=None, open_zip=remotezip.RemoteZip, preferred_build=None):
     """(build, url, member) of the pinned image for a board. url (--ipsw,
     e.g. a mirror) replaces the addresses, never the pin: its build must
     still be a pinned one. Only an Apple Encrypted Archive is accepted."""
-    release, pinned = pin() if images is None else images
-    builds = [b for b, _ in pinned]
-    if url:
-        got = mirror_build(url, open_zip)
-        if got not in builds:
-            raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
-                            f"({', '.join(builds)})")
-        pinned = [(got, url)]
-    build, u, member = reader.find(board, pinned, release, open_zip)
+    release, entries = _resolve(images, url, open_zip, preferred_build)
+    build, u, member = _find_entry(board, release, entries, open_zip)
     if not member.endswith(".aea"):
         raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
     return build, u, member
 
 
-def open_system(board, images=None, url=None, open_zip=remotezip.RemoteZip):
+def open_system(board, images=None, url=None, open_zip=remotezip.RemoteZip, preferred_build=None):
     """(System volume, range fetcher, build, url) of the pinned restore image
     for a board (j413). The shared reader finds the board's image and opens
     exactly the member it checked (require_aea): one BuildManifest fetch
     decides both, so nothing but an Apple Encrypted Archive is ever opened."""
-    release, pinned = pin() if images is None else images
-    builds = [b for b, _ in pinned]
-    if url:
-        got = mirror_build(url, open_zip)
-        if got not in builds:
-            raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
-                            f"({', '.join(builds)})")
-        pinned = [(got, url)]
-    return reader.open_system(board, pinned, release, open_zip, require_aea=True)
+    release, entries = _resolve(images, url, open_zip, preferred_build)
+    build, u, member = _find_entry(board, release, entries, open_zip)
+    if not member.endswith(".aea"):
+        raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
+    try:
+        return reader._open(board, build, u, member, open_zip)
+    except (aea_ro.AeaUnavailable, remotezip.RemoteZipUnavailable, OSError) as e:
+        raise IpswUnavailable(f"restore image {build}: {e}") from None
+    except (aea_ro.AeaError, apfs_ro.ApfsError, remotezip.RemoteZipError) as e:
+        raise IpswError(f"restore image {build}: {e}") from None

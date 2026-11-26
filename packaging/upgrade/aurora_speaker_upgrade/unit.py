@@ -127,6 +127,19 @@ def speaker_id(identity, chosen=CHOSEN_SPID, dirs=INSTALLER_BUNDLES):
     return None, False, "none"
 
 
+def installer_fill_build(identity, aid, dirs=INSTALLER_BUNDLES):
+    """The macOS build recorded in this unit's installer lsm2 readback for
+    this AID, or None. Used only to prefer that build when it is already
+    in the pinned restore-image catalog."""
+    if not getattr(identity, "unit", None):
+        return None
+    for _, m in _own_manifests(identity, dirs):
+        fill = m.get("lsm2_param_fill")
+        if m.get("aid") == aid and isinstance(fill, dict) and isinstance(fill.get("macos_build"), str):
+            return fill["macos_build"]
+    return None
+
+
 def installer_fill(identity, aid, dirs=INSTALLER_BUNDLES):
     """[(directory, lsm2 readback bytes)] from this unit's installer bundles
     for this AID; collect.attach_fill decides whether one fits."""

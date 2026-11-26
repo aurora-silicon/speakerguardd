@@ -170,8 +170,11 @@ def from_ipsw(identity, a, spid, known, scratch):
     # Reaching Apple is not an answer: no network (a laptop whose Wi-Fi
     # connects only after login), a timeout or a server error is Retry, which
     # leaves no refusal record, so the next boot tries again.
+    preferred = unit.installer_fill_build(identity, f"AID{identity.acoustic}",
+                                          getattr(a, "installer_dirs", collect.INSTALLER_BUNDLES))
     try:
-        vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw)
+        kw = {"preferred_build": preferred} if preferred else {}
+        vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw, **kw)
     except ipsw.IpswUnavailable as e:
         raise Retry(f"the pinned restore image cannot be read now: {e}") from None
     except ipsw.IpswError as e:
