@@ -6,7 +6,10 @@
 //! - renew only on a clean observation (and the lease state machine's two
 //!   clean ticks before the first grant);
 //! - the kernel-side checks are part of every observation:
-//!   - the speaker mux selects the PCM the observer watches;
+//!   - the speaker mux selects the PCM the observer watches; a first grant
+//!     locks the mux, reads it again and grants only the route it read
+//!     under that lock, so no other file can re-route between the check
+//!     and the grant (under a live grant the kernel refuses re-routes);
 //!   - on amps with fault reporting, every amp has its fault control (a
 //!     missing or short list is a fault, never "no faults");
 //!   - the operating point (KERNEL.md 2.3): every amp's analog gain, read
@@ -200,20 +203,11 @@ impl Supervisor {
         let obs = Observation { route_ok: ok, amps_ok: ok, ..obs };
         let was_held = self.lease.held();
         match self.lease.tick(obs) {
-            Action::Renew => match kernel.renew() {
-                Ok(()) => Ok(if was_held { Event::Renewed } else { Event::Granted }),
-                Err(KernelError::Lapsed) => {
-                    // released, with this clean tick as the first of two
-                    self.lease.tick(Observation::default());
-                    self.lease.tick(obs);
-                    Ok(Event::Lapsed)
-                }
-                Err(KernelError::Sleeping) => {
-                    self.lease.tick(Observation::default());
-                    Ok(Event::StayedReleased)
-                }
-                Err(e) => Err(Fatal::Kernel(e)),
-            },
+            Action::Renew if was_held => {
+                let renewed = kernel.renew();
+                self.renewed(renewed, obs, Event::Renewed)
+            }
+            Action::Renew => self.first_grant(kernel, obs),
             Action::Release => {
                 kernel.release().map_err(Fatal::Kernel)?;
                 Ok(Event::Released { why: obs })
@@ -224,6 +218,54 @@ impl Supervisor {
             }
             Action::StayReleased => Ok(Event::StayedReleased),
         }
+    }
+
+    /// A grant on a released lease. The route was checked earlier in this
+    /// tick, but until a grant the kernel lets any file write the mux: lock
+    /// it, read it again, and grant only if it still selects the watched
+    /// PCM. No other file can re-route between that read and the grant, and
+    /// from the grant on the kernel refuses every re-route itself. A mux
+    /// that another file has locked cannot be held, so nothing is granted.
+    fn first_grant(&mut self, kernel: &mut dyn Kernel, obs: Observation) -> Result<Event, Fatal> {
+        if !kernel.hold_route().map_err(Fatal::Kernel)? {
+            return Ok(self.refuse("the speaker mux is locked by another file".into()));
+        }
+        let event = match kernel.speaker_route() {
+            Ok(Some(r)) if r == self.expect.route => {
+                let renewed = kernel.renew();
+                self.renewed(renewed, obs, Event::Granted)
+            }
+            Ok(r) => Ok(self.refuse(format!("the speaker mux selects {r:?}, not \"{}\"", self.expect.route))),
+            Err(e) => Err(Fatal::Kernel(e)),
+        };
+        let freed = kernel.free_route();
+        let event = event?;
+        freed.map_err(Fatal::Kernel)?;
+        Ok(event)
+    }
+
+    fn renewed(&mut self, renewed: Result<(), KernelError>, obs: Observation, ok: Event) -> Result<Event, Fatal> {
+        match renewed {
+            Ok(()) => Ok(ok),
+            Err(KernelError::Lapsed) => {
+                // released, with this clean tick as the first of two
+                self.lease.tick(Observation::default());
+                self.lease.tick(obs);
+                Ok(Event::Lapsed)
+            }
+            Err(KernelError::Sleeping) => {
+                self.lease.tick(Observation::default());
+                Ok(Event::StayedReleased)
+            }
+            Err(e) => Err(Fatal::Kernel(e)),
+        }
+    }
+
+    /// Grant nothing on this tick: the lease takes two clean ticks again.
+    fn refuse(&mut self, why: String) -> Event {
+        self.problem = Some(why);
+        self.lease.tick(Observation::default());
+        Event::StayedReleased
     }
 
     fn latch(&mut self, kernel: &mut dyn Kernel, why: String) -> Result<Event, Fatal> {
@@ -490,6 +532,78 @@ mod tests {
         assert!(!k.held);
     }
 
+    #[test]
+    fn a_reroute_between_the_route_check_and_the_grant_grants_nothing() {
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        // another file switches the mux right after this tick's route check
+        k.reroute = Some((1, "Primary".into()));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(k.route.as_deref(), Some("Primary"));
+        assert_eq!(k.renewals, 0);
+        assert!(s.problem().unwrap().contains("Primary"), "{:?}", s.problem());
+        assert!(!k.route_held);
+        for _ in 0..3 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        // switched back: granted on the second clean tick, on that route
+        k.route = Some("Secondary".into());
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert_eq!(k.renewed_routes, vec![Some("Secondary".to_owned())]);
+        assert!(!k.route_held);
+    }
+
+    #[test]
+    fn the_mux_is_held_from_the_last_route_read_to_the_grant() {
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        // the re-route lands while the grant holds the mux: refused
+        k.reroute = Some((2, "Primary".into()));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        assert_eq!(k.reroutes_refused, 1);
+        assert_eq!(k.route.as_deref(), Some("Secondary"));
+        assert_eq!((k.route_holds, k.route_held), (1, false));
+        // renewals under the live grant take no lock: the kernel holds the route
+        for _ in 0..3 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
+        }
+        assert_eq!(k.route_holds, 1);
+        assert!(k.renewed_routes.iter().all(|r| r.as_deref() == Some("Secondary")));
+    }
+
+    #[test]
+    fn a_mux_locked_by_another_file_grants_nothing() {
+        let mut k = Recorder::healthy(6);
+        k.route_locked_elsewhere = true;
+        let mut s = j316();
+        for _ in 0..4 {
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        }
+        assert_eq!(k.renewals, 0);
+        assert!(s.problem().unwrap().contains("locked by another file"), "{:?}", s.problem());
+        k.route_locked_elsewhere = false;
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+    }
+
+    #[test]
+    fn a_grant_the_kernel_refuses_after_a_reroute_waits_for_two_clean_ticks() {
+        // EBUSY on a first grant: a sleep, or the kernel saw another file
+        // write the mux since its last grant decision
+        let mut k = Recorder::healthy(6);
+        let mut s = j316();
+        s.tick(CLEAN, &mut k).unwrap();
+        k.refuse_next = Some(KernelError::Sleeping);
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert!(!s.granted());
+        assert!(!k.route_held);
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+    }
+
     struct OneOff(Recorder);
     impl Kernel for OneOff {
         fn renew(&mut self) -> Result<(), KernelError> {
@@ -513,6 +627,12 @@ mod tests {
         }
         fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
             self.0.speaker_route()
+        }
+        fn hold_route(&mut self) -> Result<bool, KernelError> {
+            self.0.hold_route()
+        }
+        fn free_route(&mut self) -> Result<(), KernelError> {
+            self.0.free_route()
         }
     }
 
@@ -612,6 +732,12 @@ mod tests {
             fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
                 self.0.speaker_route()
             }
+            fn hold_route(&mut self) -> Result<bool, KernelError> {
+                self.0.hold_route()
+            }
+            fn free_route(&mut self) -> Result<(), KernelError> {
+                self.0.free_route()
+            }
         }
         let mut k = OtherStep(Recorder::healthy(6));
         let mut s = j316();
@@ -670,6 +796,12 @@ mod tests {
         }
         fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
             self.0.speaker_route()
+        }
+        fn hold_route(&mut self) -> Result<bool, KernelError> {
+            self.0.hold_route()
+        }
+        fn free_route(&mut self) -> Result<(), KernelError> {
+            self.0.free_route()
         }
     }
 
@@ -740,6 +872,12 @@ mod tests {
         fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
             self.0.speaker_route()
         }
+        fn hold_route(&mut self) -> Result<bool, KernelError> {
+            self.0.hold_route()
+        }
+        fn free_route(&mut self) -> Result<(), KernelError> {
+            self.0.free_route()
+        }
     }
 
     #[test]
@@ -777,6 +915,12 @@ mod tests {
         }
         fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
             Ok(Some("Secondary".into()))
+        }
+        fn hold_route(&mut self) -> Result<bool, KernelError> {
+            Ok(true)
+        }
+        fn free_route(&mut self) -> Result<(), KernelError> {
+            Ok(())
         }
     }
 
