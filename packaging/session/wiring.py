@@ -132,14 +132,18 @@ TRANSPORTS = {
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": True},
-    # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
-    # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    # t8152_aop_audio.rs, T8142/T6050/T8152 configurations: ADMAC burst-residue
+    # DMA, S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    # Its sense is the audio node's "sense" DMA channel: a Mac whose AOP
+    # speaker stream carries none names no "sense" channel (transport_senses).
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
-                              "speaker_irq": False},
+                              "speaker_irq": False, "speaker_dma": "spkr", "sense_dma": "sense"},
 }
-# The T6050 (J714s) is the same driver's T6050 configuration: six amps on the
-# T8142 transport.
+# The T6050 (J714s) and T8152 (J804, J873g) bind the same t8152_aop_audio.rs
+# driver: PCM widths follow the link's amps and sense path, and the self-check
+# refuses a sensed wiring on a card with no sense PCM.
 TRANSPORTS["apple,t6050-aop-audio"] = TRANSPORTS["apple,t8142-aop-audio"]
+TRANSPORTS["apple,t8152-aop-audio"] = TRANSPORTS["apple,t8142-aop-audio"]
 # Newer device trees omit the generic MCA fallback. Both compatibles bind
 # mca.c; share the entry so back-ends using either name are the same driver.
 TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
