@@ -330,15 +330,30 @@ class UnitAllowList(unittest.TestCase):
     def test_installer_fill_build_is_unit_bound(self):
         ident = types.SimpleNamespace(unit="u" * 64)
         with tempfile.TemporaryDirectory() as t:
-            b = os.path.join(t, "b")
-            os.makedirs(b)
-            with open(os.path.join(b, at.MANIFEST), "w") as f:
+            b1 = os.path.join(t, "b1")
+            b2 = os.path.join(t, "b2")
+            os.makedirs(b1)
+            os.makedirs(b2)
+            with open(os.path.join(b1, at.MANIFEST), "w") as f:
+                json.dump({"unit_id": "u" * 64, "aid": "AID37",
+                           "lsm2_param_fill": {"path": lsm2_fill.NAME, "macos_build": "25G83"}}, f)
+            with open(os.path.join(b1, lsm2_fill.NAME), "wb") as f:
+                f.write(b"{}")
+            with open(os.path.join(b2, at.MANIFEST), "w") as f:
                 json.dump({"unit_id": "u" * 64, "aid": "AID37",
                            "lsm2_param_fill": {"path": lsm2_fill.NAME, "macos_build": "26B131"}}, f)
-            self.assertEqual(unit.installer_fill_build(ident, "AID37", [b]), "26B131")
-            self.assertIsNone(unit.installer_fill_build(ident, "AID42", [b]))
+            with open(os.path.join(b2, lsm2_fill.NAME), "wb") as f:
+                f.write(b"{}")
+            # Without pinned_builds, dirs order wins; with pinned_builds, the pinned bundle wins.
+            self.assertEqual(unit.installer_fill_build(ident, "AID37", [b1, b2]), "25G83")
+            self.assertEqual(unit.installer_fill_build(ident, "AID37", [b1, b2],
+                                                       pinned_builds=["26B123", "26B131"]), "26B131")
+            # Missing fill file is skipped.
+            os.remove(os.path.join(b2, lsm2_fill.NAME))
+            self.assertEqual(unit.installer_fill_build(ident, "AID37", [b2]), None)
+            self.assertIsNone(unit.installer_fill_build(ident, "AID42", [b1]))
             ident.unit = "x" * 64
-            self.assertIsNone(unit.installer_fill_build(ident, "AID37", [b]))
+            self.assertIsNone(unit.installer_fill_build(ident, "AID37", [b1]))
 
     def test_only_unit_py_opens_machine_paths(self):
         here = pathlib.Path(__file__).resolve().parents[1] / "aurora_speaker_upgrade"

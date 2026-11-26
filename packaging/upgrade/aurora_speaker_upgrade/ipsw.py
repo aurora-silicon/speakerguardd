@@ -77,18 +77,7 @@ def mirror_build(url, open_zip=remotezip.RemoteZip):
         raise IpswError(f"restore image {url}: {e}") from None
 
 
-def _prefer(pinned, preferred_build):
-    """Move a pinned entry matching preferred_build to the front; ignore any
-    build that is not already in the pin."""
-    if not preferred_build:
-        return pinned
-    hit = [e for e in pinned if e[0] == preferred_build]
-    if not hit:
-        return pinned
-    return hit + [e for e in pinned if e[0] != preferred_build]
-
-
-def _resolve(images, url, open_zip, preferred_build):
+def _resolve(images, url, open_zip):
     if images is None:
         release, entries = _pin_entries()
     else:
@@ -102,34 +91,16 @@ def _resolve(images, url, open_zip, preferred_build):
             raise IpswError(f"the restore image is macOS {got}, not a pinned macOS {release} build "
                             f"({', '.join(builds)})")
         return release, [(got, url, by_build[got])]
-    return release, _prefer(entries, preferred_build)
-
-
-def _find_entry(board, release, entries, open_zip):
-    seen = []
-    for build, u, ver in entries:
-        try:
-            bm = reader._manifest(open_zip(u))
-        except (remotezip.RemoteZipUnavailable, OSError) as e:
-            raise IpswUnavailable(f"restore image {build}: {e}") from None
-        except (IpswError, remotezip.RemoteZipError, ValueError) as e:
-            raise IpswError(f"restore image {build}: {e}") from None
-        got, gotv = bm.get("ProductBuildVersion"), bm.get("ProductVersion")
-        if got != build or (ver is not None and gotv != ver):
-            raise IpswError(f"the restore image listed as {build} is macOS {gotv} ({got})")
-        member = reader.os_member(bm, board)
-        if member is not None:
-            return build, u, member
-        seen.append(build)
-    raise IpswError(f"no restore image of macOS {release} ({', '.join(seen)}) carries board {board}")
+    return release, entries
 
 
 def find(board, images=None, url=None, open_zip=remotezip.RemoteZip, preferred_build=None):
     """(build, url, member) of the pinned image for a board. url (--ipsw,
     e.g. a mirror) replaces the addresses, never the pin: its build must
     still be a pinned one. Only an Apple Encrypted Archive is accepted."""
-    release, entries = _resolve(images, url, open_zip, preferred_build)
-    build, u, member = _find_entry(board, release, entries, open_zip)
+    release, entries = _resolve(images, url, open_zip)
+    build, u, member = reader.find(board, entries, release, open_zip,
+                                   preferred_build=None if url else preferred_build)
     if not member.endswith(".aea"):
         raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
     return build, u, member
@@ -140,13 +111,7 @@ def open_system(board, images=None, url=None, open_zip=remotezip.RemoteZip, pref
     for a board (j413). The shared reader finds the board's image and opens
     exactly the member it checked (require_aea): one BuildManifest fetch
     decides both, so nothing but an Apple Encrypted Archive is ever opened."""
-    release, entries = _resolve(images, url, open_zip, preferred_build)
-    build, u, member = _find_entry(board, release, entries, open_zip)
-    if not member.endswith(".aea"):
-        raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
-    try:
-        return reader._open(board, build, u, member, open_zip)
-    except (aea_ro.AeaUnavailable, remotezip.RemoteZipUnavailable, OSError) as e:
-        raise IpswUnavailable(f"restore image {build}: {e}") from None
-    except (aea_ro.AeaError, apfs_ro.ApfsError, remotezip.RemoteZipError) as e:
-        raise IpswError(f"restore image {build}: {e}") from None
+    release, entries = _resolve(images, url, open_zip)
+    return reader.open_system(board, entries, release, open_zip,
+                              require_aea=True,
+                              preferred_build=None if url else preferred_build)

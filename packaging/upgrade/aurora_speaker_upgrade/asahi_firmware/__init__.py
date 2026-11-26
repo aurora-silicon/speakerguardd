@@ -4,4 +4,4 @@
 # cpio.py, and the restore image reader ipsw.py, aea_ro.py, apfs_ro.py,
 # remotezip.py, udif_ro.py) at the commit below. Refresh by copying them again
 # from a newer installer commit and updating VENDORED_FROM; never edit them here.
-VENDORED_FROM = "aurora-silicon/aurora-installer@0ae733bb9f1e2a05cff392e4481fa8edbf73aeed"
+VENDORED_FROM = "aurora-silicon/aurora-installer@03d8c976be17fdb7c5d0fc4fdd5a65cfd3976e5f"
