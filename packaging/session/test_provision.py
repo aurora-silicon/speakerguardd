@@ -1801,7 +1801,7 @@ class Gate(Base):
         # Keyed by the speaker identity the bundle names, not the board: the
         # same board compiles for a proven speaker and fails for one without
         # rows. A graph without LSID needs no row (AID21 has none).
-        for aid, lsid, ok in (("AID37", True, False), ("AID42", True, False), ("AID44", True, True),
+        for aid, lsid, ok in (("AID37", True, True), ("AID42", True, False), ("AID44", True, True),
                               ("AID21", False, True)):
             with self.subTest(aid=aid):
                 self.board("j713")
@@ -1882,8 +1882,8 @@ class Gate(Base):
                 self.assertTrue(r["board"] and r["what"] and r["evidence"], aid)
                 self.assertLessEqual(set(r["covers"]), set(g["playback_covers"]), aid)
             self.assertTrue(gen.playback_rows(aid, g), aid)
-        # The four-lane LSID speakers have no loud row yet.
-        self.assertNotIn("AID37", g["playback_rows"])
+        # AID37 (J713) has a loud/thermal-ramp row; AID42 (J813) has none yet.
+        self.assertIn("AID37", g["playback_rows"])
         self.assertNotIn("AID42", g["playback_rows"])
 
 
