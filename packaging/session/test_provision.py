@@ -1882,8 +1882,9 @@ class Gate(Base):
                 self.assertTrue(r["board"] and r["what"] and r["evidence"], aid)
                 self.assertLessEqual(set(r["covers"]), set(g["playback_covers"]), aid)
             self.assertTrue(gen.playback_rows(aid, g), aid)
-        # AID21 (J615, spp3) and AID37 (J713, LSID) have their loud/thermal-ramp
-        # rows; AID42 (J813) has none yet.
+        # AID12 (J473, atsp), AID21 (J615, spp3) and AID37 (J713, LSID) have
+        # their loud/thermal-ramp rows; AID42 (J813) has none yet.
+        self.assertIn("AID12", g["playback_rows"])
         self.assertIn("AID21", g["playback_rows"])
         self.assertIn("AID37", g["playback_rows"])
         self.assertNotIn("AID42", g["playback_rows"])

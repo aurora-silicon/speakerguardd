@@ -18,6 +18,18 @@
   "playback_covers": ["loud-step", "thermal-ramp"],
   "units_need_playback_rows": ["lsid"],
   "playback_rows": {
+    "AID12": [
+      {
+        "date": "2026-11-25",
+        "board": "j473",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 288 s (pink noise, -18 dBFS), supervisor kill -9 at 150 s of 1.0, v2 thermal readback every second and V/I sense capture; speakerguardd-v2 0.59 (6c714e3b) with the speakerguardd#262 session helper on the fleet89 kernel (AID12 tuning from the macOS 27.2 26B123 restore image via aurora-speaker-upgrade)",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j473 ladder 2026-11-25 09:10-09:33 AEDT (https://gist.github.com/RyanTheTide/c008e4a963ba607de990a168560128cf): granted at every step, no protection event; sense I / V RMS -39.8 / -39.9, -29.6 / -29.5, -22.6 / -21.8 dBFS at 0.3 / 0.6 / 1.0; coil / magnet rise +44 / +52 K by the end of 1.0 with the thermal hold engaging (slow gain -0.1 dB from ~240 s, -0.37 dB at 288 s); kill -9: protection withdrawn 22 ms later, re-granted 1.1 s after the kill with the thermal state carried"
+      }
+    ],
     "AID9": [
       {
         "date": "2026-11-07",
