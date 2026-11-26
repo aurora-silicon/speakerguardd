@@ -14,7 +14,7 @@
   "_voicing_pre_lowpass_doc": "Keyed by the bundle's speaker identity (AID<n>), like voicing_pre_bound_db (2026-11-21). Interim never-louder band limit, not a macOS law. {hz, order}: an even-order Butterworth low-pass built from PipeWire bq_lowpass sections in FRONT of the voicing plugin. History: 2026-11-07, J700 only: v2's AID44 ControlFreak lacked the AU's reconstruction low-pass, so above ~17 kHz the box was up to +23 dB (+30 dB at 0 dBFS) louder than macOS and its saturation aliased a loud high-frequency input into 9-16.5 kHz; the lane trim could hold neither. 17.4 kHz order 8 (with the J700 trim): AID44 box rig (installed AU, 362 tones/pink/steps incl. 16-23.75 kHz probes) 0 louder cases, worst -0.58 dB; full AID44 voicing VLS 30 Hz-19.5 kHz 0 louder bands, worst -0.03 dB; cost at 16 kHz -0.1 dB. 2026-11-08: the AID44 ControlFreak saturation, reconstruction and drive laws are exact on the box rig (steady and 20 kHz), so no speaker carries the low-pass; the mechanism stays for a future open law.",
   "voicing_pre_lowpass": {},
   "units_at_parity": ["spp3", "lsm2", "atsp", "lsid"],
-  "_playback_rows_doc": "Protected playback rows on record, by the tuning bundle's speaker identity (AID<n>, as identify names it). A row is sound played through speakerguardd v2's protection on that speaker and measured with V/I sense and the Mac's own microphone. covers: 'loud-step' = a step to full volume (slider 1.0); 'thermal-ramp' = a sustained hold long enough for the thermal model to climb (minutes), with the protection's temperatures and gain recorded. A speaker is proven when its rows (each with evidence) cover playback_covers; a silent self-check pass is not a playback row. Two users: provisioning refuses a graph with a protection type in units_need_playback_rows on a speaker that is not proven (LSID's static release, which runs the four-lane J713/J813 tunings open loop on their LSM2 model, so AID37/AID42 stay muted as before their LSID release until rows exist), and aurora-speaker-upgrade's boot unit moves no unproven speaker from the older daemons to v2 (by hand, `run` still can). Low-level rows only (AID21, AID37) and no rows (AID42) are not proof. Add a row only with its evidence.",
+  "_playback_rows_doc": "Protected playback rows on record, by the tuning bundle's speaker identity (AID<n>, as identify names it). A row is sound played through speakerguardd v2's protection on that speaker and measured with V/I sense and the Mac's own microphone. covers: 'loud-step' = a step to full volume (slider 1.0); 'thermal-ramp' = a sustained hold long enough for the thermal model to climb (minutes), with the protection's temperatures and gain recorded. A speaker is proven when its rows (each with evidence) cover playback_covers; a silent self-check pass is not a playback row. Two users: provisioning refuses a graph with a protection type in units_need_playback_rows on a speaker that is not proven (LSID's static release, which runs the four-lane J713/J813 tunings open loop on their LSM2 model, so AID37/AID42 stay muted as before their LSID release until rows exist), and aurora-speaker-upgrade's boot unit moves no unproven speaker from the older daemons to v2 (by hand, `run` still can). Low-level rows only (AID37) and no rows (AID42) are not proof. Add a row only with its evidence.",
   "playback_covers": ["loud-step", "thermal-ramp"],
   "units_need_playback_rows": ["lsid"],
   "playback_rows": {
@@ -40,6 +40,18 @@
           "thermal-ramp"
         ],
         "evidence": "lab row 2026-11-07 18:34 (m2 ladder, fleet20): no amp or TDM fault; woofer temperature model reached 139.5 / 141.5 C and the limiter held -3.29 dB"
+      }
+    ],
+    "AID21": [
+      {
+        "date": "2026-11-26",
+        "board": "j615",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s (pink noise, -18 dBFS RMS), built-in mic capture; speakerguardd-v2 0.58 (b3aaa4a7) on the fleet85 kernel (AID21 tuning from the macOS 27.2 26B123 restore image via aurora-speaker-upgrade)",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j615 ladder 2026-11-26 07:57 UTC (https://gist.github.com/RyanTheTide/cbdd315bdd7929e147ecbd7de5be12d1): 40,732 engine records, lost 0, health_or 0x0, gain 0 dB, 0 amp faults on all 6 amps; closed-loop woofer DCR 3.93-4.19 ohm at 0.3 (= calibration) rising to 4.72-4.81 ohm; coil closed-loop max 103.4 C, open-loop model max 118.2 C, limiter not needed; mic -20 / -10 / -2 dBFS"
       }
     ],
     "AID35": [
