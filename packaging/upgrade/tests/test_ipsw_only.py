@@ -42,7 +42,7 @@ class Pin(unittest.TestCase):
         release, images = ipsw.pin(paths=[str(pathlib.Path(__file__).resolve().parents[1]
                                               / "share" / "restore-images.json")])
         self.assertEqual(release, "27.2")
-        self.assertEqual([b for b, _ in images], ["26B123", "26B8125"])
+        self.assertEqual([b for b, _ in images], ["26B123", "26B7124", "26B8125"])
         self.assertTrue(all(u.startswith("https://updates.cdn-apple.com/") for _, u in images))
 
     def test_malformed_or_missing_pin_refuses(self):
