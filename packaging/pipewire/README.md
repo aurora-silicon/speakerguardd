@@ -97,3 +97,7 @@ compile refuses (no blob) when a stage is not characterised;
 `--allow-partial` carries the stages documented as transparent or
 attenuating as identity and flags the blob partial. Session wiring,
 provisioning and WirePlumber priorities are not part of this example.
+The artifact is versioned and the plugin refuses another version (a
+version-1 blob from the first mic release gives silence and health 1 with
+the current plugin), so whatever provisions the blob must recompile it
+when the plugin changes instead of keeping a stale one.
