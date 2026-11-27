@@ -34,11 +34,12 @@
 //! | `reblocker`, `dead` | nothing (structure) | structural |
 //! | `fft` pair | the short-time transform, quadrant window, frame phase 0 (black-box exact) | exact |
 //! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
-//! | `aufx/sens` | the noise-floor suppressor (`sgv2_core::mic::sens`): the strip's global parameters and the property-1000 noise profile; artifact step fitted, TODO(SPEC). Placed after the analysis (frequency domain, before the beam) it is carried before the transform: black-box equal there, one block later than the unit, so only together with the trackpad block below | approximate |
-//! | trackpad block (`aufx/nnet` bypassed, `delay` set from its latency, `adif`, `dbgn`, `asum`) | one block of delay (black-box exact), which the frequency-placed suppressor's block carries; the unit not bypassed, or the block alone, refuses | exact |
+//! | `aufx/sens` | the noise-floor suppressor (`sgv2_core::mic::sens`): the strip's global parameters and the property-1000 noise profile; artifact step fitted, TODO(SPEC) | approximate |
 //! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, unmeasured, so partial blobs only until measured, TODO(SPEC) | uncharacterised |
 //! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
 //! | bypassed in the strip | nothing | bypassed |
+//! | `aufx/sens` after the analysis (frequency domain, before the beam) | the same suppressor carried before the transform: black-box equal there, one block later than the unit, so only together with the trackpad block | approximate |
+//! | trackpad block (`aufx/nnet` bypassed, `delay` set from its latency, `adif`, `dbgn`, `asum`) | one block of delay (black-box exact), which the frequency-placed suppressor's block carries; the unit not bypassed, or the block alone, refuses | exact |
 //! | anything else | refused, partial or not | refused |
 //!
 //! **Refusal.** The default compile refuses, and writes no blob, when any
