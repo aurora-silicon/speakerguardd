@@ -488,7 +488,8 @@ fn tone_nodes(bx: &GraphBox, e: &Effect, width: usize, overrides: &[(u32, f64)],
             (get(at + 2).unwrap_or(f64::NAN), get(at + 3).unwrap_or(f64::NAN), get(at + 4).unwrap_or(f64::NAN));
         let (mask, group) = (get(at + 7).unwrap_or(0.0), get(at + 9).unwrap_or(0.0));
         if gain != 0.0
-            || q.is_nan() || q <= 0.0
+            || q.is_nan()
+            || q <= 0.0
             || !(f0 > 0.0 && f0 < fs / 2.0)
             || group.fract() != 0.0
             || !(0.0..10.0).contains(&group)
