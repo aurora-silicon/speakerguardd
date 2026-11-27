@@ -61,15 +61,11 @@ fn be(v: &[f32]) -> Value {
 /// A beam file: one beam, `mics` microphones, real weights `w[m]` on
 /// every bin.
 fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
-    beam_file_n(mics, w, BINS)
-}
-
-fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
     let mut re = Vec::new();
     let mut im = Vec::new();
     for (m, wm) in w.iter().enumerate().take(mics) {
-        re.push((format!("Mic{m}"), be(&vec![*wm; bins])));
-        im.push((format!("Mic{m}"), be(&vec![0.0; bins])));
+        re.push((format!("Mic{m}"), be(&vec![*wm; BINS])));
+        im.push((format!("Mic{m}"), be(&vec![0.0; BINS])));
     }
     let as_dict = |v: Vec<(String, Value)>| {
         let mut d = aurora_speaker_tuning::plist::Dict::new();
@@ -82,7 +78,7 @@ fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
         ("Azimuth", r(0.0)),
         ("Description", s("Beam0")),
         ("Distance", r(1.0)),
-        ("EQSelection", be(&vec![1.0; bins])),
+        ("EQSelection", be(&vec![1.0; BINS])),
         ("Elevation", r(90.0)),
         ("ImagCoefficients", as_dict(im)),
         ("NonZeroMics", be(&vec![1.0; mics])),
@@ -92,7 +88,7 @@ fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
         ("Beam0", beam0),
         ("SampleRate", i(48_000)),
         ("nBeams", i(1)),
-        ("nCoefficients", i(bins as i128)),
+        ("nCoefficients", i(BINS as i128)),
         ("nMicsUsed", i(mics as i128)),
     ]))
 }
@@ -331,6 +327,40 @@ impl Fixture {
 
 fn partial() -> mic::Options {
     mic::Options { allow_partial: true, ..Default::default() }
+}
+
+/// [`beam_file`] at `bins` bins (the trackpad block needs block 480).
+fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
+    let mut re = Vec::new();
+    let mut im = Vec::new();
+    for (m, wm) in w.iter().enumerate().take(mics) {
+        re.push((format!("Mic{m}"), be(&vec![*wm; bins])));
+        im.push((format!("Mic{m}"), be(&vec![0.0; bins])));
+    }
+    let as_dict = |v: Vec<(String, Value)>| {
+        let mut d = aurora_speaker_tuning::plist::Dict::new();
+        for (k, x) in v {
+            d.insert_unique(k, x);
+        }
+        Value::Dict(d)
+    };
+    let beam0 = dict(vec![
+        ("Azimuth", r(0.0)),
+        ("Description", s("Beam0")),
+        ("Distance", r(1.0)),
+        ("EQSelection", be(&vec![1.0; bins])),
+        ("Elevation", r(90.0)),
+        ("ImagCoefficients", as_dict(im)),
+        ("NonZeroMics", be(&vec![1.0; mics])),
+        ("RealCoefficients", as_dict(re)),
+    ]);
+    binary::write(&dict(vec![
+        ("Beam0", beam0),
+        ("SampleRate", i(48_000)),
+        ("nBeams", i(1)),
+        ("nCoefficients", i(bins as i128)),
+        ("nMicsUsed", i(mics as i128)),
+    ]))
 }
 
 /// The base graph with the suppressor and pre-gain moved after the analysis
