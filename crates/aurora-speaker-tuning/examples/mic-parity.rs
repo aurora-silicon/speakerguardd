@@ -9,14 +9,21 @@
 //!            [--out OUT.f32] [--window sine|vorbis] [--half-offset] [--frame-phase P]
 //!            [--beam-eq] [--drop-tone-types 6,20]
 //! mic-parity probe --kind id|delay|bin48 --stim IN.f32 --oracle REF.f32 [transform options]
+//! mic-parity sens  --tunings-root DIR --aid N --stim IN.f32 --oracle REF.f32 [--sens-order N]
+//! mic-parity beam  --tunings-root DIR --aid N --stim IN.f32 --oracle REF.f32 [transform options]
 //! ```
+//!
+//! `sens` runs the AID's noise-floor suppressor alone on every channel of
+//! `IN.f32` (as a standalone render of the unit with the AID's preset and
+//! profile) and compares each output channel; `beam` runs the AID's
+//! beamformer alone (the analysis, its fixed beam, the synthesis).
 //!
 //! `chain` compiles the AID's microphone chain (`aurora_speaker_tuning::mic`)
 //! and renders `IN.f32` (interleaved float32, one channel per microphone);
 //! `probe` renders a one-microphone transform with a synthetic beam (unit,
-//! a 100-sample delay, or bin 48 alone). Both print one JSON object:
-//! latency-aligned difference SNR, output levels, and for `chain` the
-//! 1/3-octave magnitude deviation. `--drop-tone-types` switches off filter
+//! a 100-sample delay, or bin 48 alone). Each prints one JSON object:
+//! latency-aligned difference SNR (whole and from 0.25 s), output levels,
+//! and for `chain`, `beam` and `sens` the 1/3-octave magnitude deviation. `--drop-tone-types` switches off filter
 //! slots of the listed types (development analysis: such a chain is refused
 //! for a blob). No input or reference data is part of this repository.
 
@@ -29,12 +36,16 @@ use std::path::PathBuf;
 
 /// Widest latency difference searched, frames.
 const MAX_LAG: i64 = 1200;
+/// Where the steady-state difference starts, frames.
+const STEADY: usize = 12_000;
 
 fn usage() -> ! {
     eprintln!(
         "usage: mic-parity chain --tunings-root DIR --aid N --stim IN.f32 --oracle REF.f32 [--out OUT.f32] [opts]\n       \
          mic-parity probe --kind id|delay|bin48 --stim IN.f32 --oracle REF.f32 [opts]\n       \
-         opts: --window sine|vorbis --half-offset --frame-phase P --beam-eq --drop-tone-types A,B"
+         mic-parity sens|beam --tunings-root DIR --aid N --stim IN.f32 --oracle REF.f32 [opts]\n       \
+         opts: --window sine|vorbis|quadrant --half-offset --frame-phase P --beam-eq --drop-tone-types A,B\n       \
+               --sens-order N --dccb-ramp-ms MS"
     );
     std::process::exit(2)
 }
@@ -133,6 +144,64 @@ fn third_octaves(x: &[f64], fs: f64) -> Vec<(f64, f64)> {
     out
 }
 
+/// Latency-aligned comparison of `y` against the oracle `r`.
+fn compare(y: &[f32], r: &[f32], bands: bool) -> serde_json::Map<String, serde_json::Value> {
+    let mut report = serde_json::Map::new();
+    let n = y.len().min(r.len());
+    let lag = align(&y[..n], &r[..n], MAX_LAG);
+    let skip = MAX_LAG as usize;
+    let idx: Vec<usize> = (skip..n - skip).collect();
+    let ours: Vec<f64> = idx.iter().map(|&i| f64::from(y[(i as i64 + lag) as usize])).collect();
+    let refr: Vec<f64> = idx.iter().map(|&i| f64::from(r[i])).collect();
+    let diff: Vec<f64> = ours.iter().zip(&refr).map(|(a, b)| a - b).collect();
+    let (lo, lr, ld) = (rms_db(&ours), rms_db(&refr), rms_db(&diff));
+    let peak_ref = refr.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let peak_err = diff.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let g =
+        ours.iter().zip(&refr).map(|(a, b)| a * b).sum::<f64>() / ours.iter().map(|a| a * a).sum::<f64>().max(1e-30);
+    let diff_g: Vec<f64> = ours.iter().zip(&refr).map(|(a, b)| g * a - b).collect();
+    report.insert("lag".into(), serde_json::json!(lag));
+    report.insert("level_ours_dbfs".into(), serde_json::json!(lo));
+    report.insert("level_oracle_dbfs".into(), serde_json::json!(lr));
+    report.insert("level_diff_db".into(), serde_json::json!(lo - lr));
+    report.insert("diff_snr_db".into(), serde_json::json!(lr - ld));
+    report.insert("diff_snr_gain_fit_db".into(), serde_json::json!(lr - rms_db(&diff_g)));
+    // past the start transients (the DC blocker's ramp, the smoothers):
+    // from 0.25 s
+    let st = STEADY.saturating_sub(skip).min(diff.len());
+    report.insert("diff_snr_steady_db".into(), serde_json::json!(rms_db(&refr[st..]) - rms_db(&diff[st..])));
+    report.insert("gain_fit_db".into(), serde_json::json!(20.0 * g.abs().max(1e-30).log10()));
+    report.insert("max_abs_err_rel".into(), serde_json::json!(peak_err / peak_ref.max(1e-30)));
+    if bands {
+        let (bo, br) = (third_octaves(&ours, 48_000.0), third_octaves(&refr, 48_000.0));
+        let bands: Vec<(f64, f64)> = bo
+            .iter()
+            .zip(&br)
+            .filter(|(a, b)| a.1 > 0.0 && b.1 > 0.0)
+            .map(|(a, b)| ((a.0 * 10.0).round() / 10.0, 10.0 * (a.1 / b.1).log10()))
+            .collect();
+        let worst = bands.iter().fold(0.0f64, |m, b| m.max(b.1.abs()));
+        let mean_abs = bands.iter().map(|b| b.1.abs()).sum::<f64>() / bands.len().max(1) as f64;
+        report.insert("third_octave_max_abs_dev_db".into(), serde_json::json!(worst));
+        report.insert("third_octave_mean_abs_dev_db".into(), serde_json::json!(mean_abs));
+        report.insert("third_octave_dev_db".into(), serde_json::json!(bands));
+    }
+    report
+}
+
+fn bundle(o: &Opt) -> Bundle {
+    Bundle::from_tunings_root(&o.root.clone().unwrap_or_else(|| usage()), o.aid.unwrap_or_else(|| usage()))
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        })
+}
+
+fn deinterleave(raw: &[f32], ch: usize) -> Vec<Vec<f32>> {
+    let frames = raw.len() / ch;
+    (0..ch).map(|m| (0..frames).map(|i| raw[i * ch + m]).collect()).collect()
+}
+
 struct Opt {
     cmd: String,
     root: Option<PathBuf>,
@@ -170,12 +239,15 @@ fn parse() -> Opt {
                 o.mopts.window = match v().as_str() {
                     "sine" => Window::Sine,
                     "vorbis" => Window::Vorbis,
+                    "quadrant" => Window::Quadrant,
                     _ => usage(),
                 }
             }
             "--half-offset" => o.mopts.half_offset = true,
             "--frame-phase" => o.mopts.frame_phase = v().parse().unwrap_or_else(|_| usage()),
             "--beam-eq" => o.mopts.beam_eq = true,
+            "--sens-order" => o.mopts.sens_order = v().parse().unwrap_or_else(|_| usage()),
+            "--dccb-ramp-ms" => o.mopts.dev_dccb_ramp_ms = Some(v().parse().unwrap_or_else(|_| usage())),
             "--drop-tone-types" => {
                 for t in v().split(',') {
                     let t: u32 = t.parse().unwrap_or_else(|_| usage());
@@ -207,6 +279,8 @@ fn probe_params(kind: &str, m: &mic::Options) -> Params {
         pre: Vec::new(),
         stft: Stft { hop, size: 2 * hop, window: m.window, half_offset: m.half_offset, frame_phase: m.frame_phase },
         beam: Beam { mics: 1, bins, weights, eq: None },
+        refs: Vec::new(),
+        freq: Vec::new(),
         post: Vec::new(),
         partial: false,
     }
@@ -217,19 +291,84 @@ fn main() {
     let (stim, oracle) = (o.stim.clone().unwrap_or_else(|| usage()), o.oracle.clone().unwrap_or_else(|| usage()));
     let mut report = serde_json::Map::new();
     let params = match o.cmd.as_str() {
+        // the suppressor alone, every channel
+        "sens" => {
+            let b = bundle(&o);
+            let sp = mic::stage_sens(&b, &o.mopts, &mut Diagnostics::default()).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            });
+            let mics = sp.mics;
+            let x = deinterleave(&read_f32(&stim), mics);
+            let r = deinterleave(&read_f32(&oracle), mics);
+            let mut run = sgv2_core::mic::sens::Run::new(&sp, 48_000.0).unwrap();
+            let hop = sp.hop;
+            let mut y: Vec<Vec<f32>> = x.iter().map(|c| vec![0.0; c.len()]).collect();
+            let mut blk = vec![vec![0.0f32; hop]; mics];
+            let t0 = std::time::Instant::now();
+            for at in (0..x[0].len() / hop).map(|i| i * hop) {
+                for (bb, c) in blk.iter_mut().zip(&x) {
+                    bb.copy_from_slice(&c[at..at + hop]);
+                }
+                run.process(&mut blk);
+                for (yc, bb) in y.iter_mut().zip(&blk) {
+                    yc[at..at + hop].copy_from_slice(bb);
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            report.insert("realtime_factor".into(), serde_json::json!(secs / (x[0].len() as f64 / 48_000.0)));
+            let per: Vec<_> = y.iter().zip(&r).map(|(a, b)| serde_json::Value::Object(compare(a, b, true))).collect();
+            for key in [
+                "diff_snr_db",
+                "diff_snr_steady_db",
+                "level_diff_db",
+                "third_octave_max_abs_dev_db",
+                "diff_snr_gain_fit_db",
+            ] {
+                let v: Vec<f64> = per.iter().filter_map(|p| p[key].as_f64()).collect();
+                report.insert(format!("mean_{key}"), serde_json::json!(v.iter().sum::<f64>() / v.len() as f64));
+            }
+            report.insert("channels".into(), serde_json::json!(per));
+            if let Some(out) = &o.out {
+                let mut bytes = Vec::with_capacity(4 * mics * y[0].len());
+                for i in 0..y[0].len() {
+                    for c in &y {
+                        bytes.extend_from_slice(&c[i].to_le_bytes());
+                    }
+                }
+                std::fs::write(out, bytes).unwrap();
+            }
+            println!("{}", serde_json::Value::Object(report));
+            return;
+        }
+        // the beamformer alone
+        "beam" => {
+            let b = bundle(&o);
+            let mut d = Diagnostics::default();
+            let mut opts = o.mopts;
+            opts.allow_partial = true;
+            let c = mic::compile(&b, &opts, &mut d).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            });
+            let full = c.params.unwrap_or_else(|| {
+                eprintln!("no chain: {:?}", c.report.refusals);
+                std::process::exit(1)
+            });
+            let mut p = probe_params("id", &o.mopts);
+            p.mics = full.mics;
+            p.beam = full.beam;
+            p
+        }
         "chain" => {
-            let b =
-                Bundle::from_tunings_root(&o.root.clone().unwrap_or_else(|| usage()), o.aid.unwrap_or_else(|| usage()))
-                    .unwrap_or_else(|e| {
-                        eprintln!("{e}");
-                        std::process::exit(1)
-                    });
+            let b = bundle(&o);
             let mut d = Diagnostics::default();
             let c = mic::compile(&b, &o.mopts, &mut d).unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(1)
             });
             report.insert("refusals".into(), serde_json::json!(c.report.refusals));
+            report.insert("latency".into(), serde_json::json!(c.report.latency_frames));
             report.insert(
                 "stages".into(),
                 serde_json::json!(c
@@ -270,55 +409,22 @@ fn main() {
         _ => usage(),
     };
     let mics = params.mics;
-    let raw = read_f32(&stim);
-    let frames = raw.len() / mics;
-    let x: Vec<Vec<f32>> = (0..mics).map(|m| (0..frames).map(|i| raw[i * mics + m]).collect()).collect();
+    let x = deinterleave(&read_f32(&stim), mics);
     let mut e = Engine::new(params).unwrap_or_else(|| {
         eprintln!("the engine refuses the parameters");
         std::process::exit(1)
     });
+    let t0 = std::time::Instant::now();
     let y = render(&mut e, &x);
+    report.insert(
+        "realtime_factor".into(),
+        serde_json::json!(t0.elapsed().as_secs_f64() / (x[0].len() as f64 / 48_000.0)),
+    );
     if let Some(p) = &o.out {
         let bytes: Vec<u8> = y.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(p, bytes).unwrap();
     }
     let r = read_f32(&oracle);
-    let n = y.len().min(r.len());
-    let lag = align(&y[..n], &r[..n], MAX_LAG);
-    // ours shifted by the lag, both over the common span
-    let skip = MAX_LAG as usize;
-    let idx: Vec<usize> = (skip..n - skip).collect();
-    let ours: Vec<f64> = idx.iter().map(|&i| f64::from(y[(i as i64 + lag) as usize])).collect();
-    let refr: Vec<f64> = idx.iter().map(|&i| f64::from(r[i])).collect();
-    let diff: Vec<f64> = ours.iter().zip(&refr).map(|(a, b)| a - b).collect();
-    let (lo, lr, ld) = (rms_db(&ours), rms_db(&refr), rms_db(&diff));
-    let peak_ref = refr.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    let peak_err = diff.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    // the best single gain, to separate level from shape
-    let g =
-        ours.iter().zip(&refr).map(|(a, b)| a * b).sum::<f64>() / ours.iter().map(|a| a * a).sum::<f64>().max(1e-30);
-    let diff_g: Vec<f64> = ours.iter().zip(&refr).map(|(a, b)| g * a - b).collect();
-    report.insert("lag".into(), serde_json::json!(lag));
-    report.insert("level_ours_dbfs".into(), serde_json::json!(lo));
-    report.insert("level_oracle_dbfs".into(), serde_json::json!(lr));
-    report.insert("level_diff_db".into(), serde_json::json!(lo - lr));
-    report.insert("diff_snr_db".into(), serde_json::json!(lr - ld));
-    report.insert("diff_snr_gain_fit_db".into(), serde_json::json!(lr - rms_db(&diff_g)));
-    report.insert("gain_fit_db".into(), serde_json::json!(20.0 * g.abs().max(1e-30).log10()));
-    report.insert("max_abs_err_rel".into(), serde_json::json!(peak_err / peak_ref.max(1e-30)));
-    if o.cmd == "chain" {
-        let (bo, br) = (third_octaves(&ours, 48_000.0), third_octaves(&refr, 48_000.0));
-        let bands: Vec<(f64, f64)> = bo
-            .iter()
-            .zip(&br)
-            .filter(|(a, b)| a.1 > 0.0 && b.1 > 0.0)
-            .map(|(a, b)| ((a.0 * 10.0).round() / 10.0, 10.0 * (a.1 / b.1).log10()))
-            .collect();
-        let worst = bands.iter().fold(0.0f64, |m, b| m.max(b.1.abs()));
-        let mean_abs = bands.iter().map(|b| b.1.abs()).sum::<f64>() / bands.len().max(1) as f64;
-        report.insert("third_octave_max_abs_dev_db".into(), serde_json::json!(worst));
-        report.insert("third_octave_mean_abs_dev_db".into(), serde_json::json!(mean_abs));
-        report.insert("third_octave_dev_db".into(), serde_json::json!(bands));
-    }
+    report.extend(compare(&y, &r, o.cmd == "chain" || o.cmd == "beam"));
     println!("{}", serde_json::Value::Object(report));
 }
