@@ -196,6 +196,31 @@ def voicing_bound(aid, gate=None):
     return [float(x) for x in b]
 
 
+def operating_volume_cap_db(board, gate=None):
+    """gate.json's cap on `board`'s operating volume, in dB on the volume
+    control's own TLV, or None (no entry: no cap below 0 dB). The operating
+    volume itself is the machine's: the ceiling the card reports under the
+    grant (every amp volume's TLV maximum: 0 dB, or on a machine whose
+    speaker only a lease may lift, macaudio's spk_fixed_ceiling, its
+    ceiling). The cap can only lower it: the supervisor grants only at the
+    card's ceiling, and only while that is at or below the cap; a card that
+    reports no ceiling is never granted, cap or not. The self-check records
+    the cap. Anything malformed, above 0 dB or below -40 dB refuses the
+    board.
+    """
+    if gate is None:
+        gate = load_gate()
+    table = gate.get("operating_volume_cap_db", {})
+    if not isinstance(table, dict):
+        raise wiring.Refused("malformed operating_volume_cap_db")
+    v = table.get(board)
+    if v is None:
+        return None
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not -40.0 <= v <= 0.0:
+        raise wiring.Refused(f"operating_volume_cap_db for {board}: want a volume in dB from -40 to 0")
+    return float(v)
+
+
 LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
 
 
