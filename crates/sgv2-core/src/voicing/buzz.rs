@@ -313,6 +313,12 @@ pub struct Run {
     delay: Box<[f32]>,
     delay_at: usize,
     history: [f32; FFT],
+    /// Precomputed symmetric analysis window (`w[n] = (1 - cos(2*pi*n/511)) / (2*511)`).
+    window: [f32; FFT],
+    /// Precomputed radix-2 twiddle factors `exp(-j * 2*pi*k / FFT)` for `k in 0..FFT/2`.
+    fft_twiddles: [(f32, f32); FFT / 2],
+    /// Per-cell minimum threshold, constant once the Kill bands are configured.
+    cell_thresholds: [f32; FFT / 2 + 1],
     /// Per-cell gain record of the detector: what the moving sections have
     /// removed from each transform cell, as the analyser sees it.
     bin_gains: [f32; FFT / 2 + 1],
@@ -326,6 +332,7 @@ pub struct Run {
     quadrature_state: [FilterState; QUADRATURE_SECTIONS],
     threshold_db: f64,
     threshold_shape: [Section; BANDS],
+    audio_wet_section: Section,
     tracks: Vec<Track>,
     release: f32,
     warmup: u32,
@@ -345,7 +352,14 @@ impl Run {
         // frames.  Keep those two counts distinct.
         let release = (1.0 - libm::exp(-(ANALYSIS_HOP as f64) / (0.050 * fs))) as f32;
         let maximum_hz = MAX_HZ[p.operation_frequency.min(4) as usize].min(0.49 * fs);
-        Run {
+        let window = core::array::from_fn(|n| {
+            0.5f32 * (1.0 - libm::cosf(2.0 * core::f32::consts::PI * n as f32 / (FFT - 1) as f32)) / (FFT - 1) as f32
+        });
+        let fft_twiddles = core::array::from_fn(|k| {
+            let angle = -2.0 * core::f64::consts::PI * k as f64 / FFT as f64;
+            (libm::cos(angle) as f32, libm::sin(angle) as f32)
+        });
+        let mut run = Run {
             channels,
             fs,
             maximum_hz,
@@ -353,6 +367,9 @@ impl Run {
             delay: vec![0.0; lookahead * channels].into_boxed_slice(),
             delay_at: 0,
             history: [0.0; FFT],
+            window,
+            fft_twiddles,
+            cell_thresholds: [0.0; FFT / 2 + 1],
             bin_gains: [1.0; FFT / 2 + 1],
             history_at: 0,
             history_len: 0,
@@ -377,10 +394,15 @@ impl Run {
                     Section::IDENTITY
                 }
             }),
+            audio_wet_section: wet_smoother(fs),
             tracks: vec![Track::default(); TRACKS],
             release,
             warmup: WARMUP_DECISIONS,
+        };
+        for bin in 0..=FFT / 2 {
+            run.cell_thresholds[bin] = run.cell_threshold(bin) as f32;
         }
+        run
     }
 
     pub fn reset(&mut self) {
@@ -432,37 +454,88 @@ impl Run {
         minimum
     }
 
-    fn spectrum(&self, bin: usize) -> (f64, f64) {
-        let centre = bin as f32;
+    /// Computes doubled positive-frequency amplitudes and first-difference
+    /// refined frequencies for bins `0..=last_bin` in a single 512-point
+    /// radix-2 complex FFT by packing the windowed signal in the real lane
+    /// and its windowed first difference in the imaginary lane.
+    fn spectra(&self, last_bin: usize, amplitudes: &mut [f64; FFT / 2 + 1], frequencies: &mut [f64; FFT / 2 + 1]) {
+        let last_bin = last_bin.min(FFT / 2);
         if self.history_len == 0 {
-            return (0.0, centre as f64 * ANALYSIS_RATE / FFT as f64);
+            for bin in 0..=last_bin {
+                amplitudes[bin] = 0.0;
+                frequencies[bin] = bin as f64 * ANALYSIS_RATE / FFT as f64;
+            }
+            return;
         }
-        let step = 2.0f32 * core::f32::consts::PI * centre / FFT as f32;
-        let (ss, cc) = (libm::sinf(step), libm::cosf(step));
-        let (mut s, mut c, mut re, mut im, mut dre, mut dim) = (0.0f32, 1.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        const SHIFT: u32 = u16::BITS - FFT.trailing_zeros();
+        let mut re = [0.0f32; FFT];
+        let mut im = [0.0f32; FFT];
         for n in 0..FFT {
-            let window = 0.5f32 * (1.0 - libm::cosf(2.0 * core::f32::consts::PI * n as f32 / (FFT - 1) as f32))
-                / (FFT - 1) as f32;
-            let at = (self.history_at + n) % FFT;
-            let previous = (at + FFT - 1) % FFT;
+            let at = (self.history_at + n) & (FFT - 1);
+            let previous = (at + FFT - 1) & (FFT - 1);
             let raw = self.history[at];
-            let x = raw * window;
-            let difference = (raw - self.history[previous]) * window;
-            re += x * c;
-            im -= x * s;
-            dre += difference * c;
-            dim -= difference * s;
-            (s, c) = (s * cc + c * ss, c * cc - s * ss);
+            let w = self.window[n];
+            let rev = ((n as u16).reverse_bits() >> SHIFT) as usize;
+            re[rev] = raw * w;
+            im[rev] = (raw - self.history[previous]) * w;
         }
-        let magnitude = libm::sqrtf(re * re + im * im);
-        let q = libm::sqrtf(dre * dre + dim * dim) / (magnitude + 1.0e-40f32);
-        // Discrete first-difference magnitude identity: |1 - e^{-j w}| = 2 sin(w / 2).
-        let frequency_hz =
-            (ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * q as f64).clamp(-1.0, 1.0))) as f32;
-        // The analyser compares the doubled positive-frequency magnitude
-        // published by its real-input transform.  This is a peak-domain
-        // comparison; it does not convert the doubled line to RMS.
-        ((2.0f32 * magnitude) as f64, frequency_hz as f64)
+        let mut half = 1usize;
+        while half < FFT {
+            let len = half << 1;
+            let step = FFT / len;
+            let mut base = 0usize;
+            while base < FFT {
+                for j in 0..half {
+                    let (wr, wi) = self.fft_twiddles[j * step];
+                    let even = base + j;
+                    let odd = even + half;
+                    let or = re[odd];
+                    let oi = im[odd];
+                    let tr = wr * or - wi * oi;
+                    let ti = wr * oi + wi * or;
+                    let er = re[even];
+                    let ei = im[even];
+                    re[even] = er + tr;
+                    im[even] = ei + ti;
+                    re[odd] = er - tr;
+                    im[odd] = ei - ti;
+                }
+                base += len;
+            }
+            half = len;
+        }
+        // DC (bin 0): X[0] = re[0], D[0] = im[0].
+        let dc_mag = re[0].abs();
+        let dc_q = im[0].abs() / (dc_mag + 1.0e-40f32);
+        amplitudes[0] = (2.0f32 * dc_mag) as f64;
+        frequencies[0] =
+            (ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * dc_q as f64).clamp(-1.0, 1.0))) as f32 as f64;
+        for bin in 1..=last_bin {
+            let nk = FFT - bin;
+            let (x_re, x_im, d_re, d_im) = if bin == FFT / 2 {
+                (re[bin], 0.0, im[bin], 0.0)
+            } else {
+                (0.5 * (re[bin] + re[nk]), 0.5 * (im[bin] - im[nk]), 0.5 * (im[bin] + im[nk]), 0.5 * (re[nk] - re[bin]))
+            };
+            let magnitude = libm::sqrtf(x_re * x_re + x_im * x_im);
+            let q = libm::sqrtf(d_re * d_re + d_im * d_im) / (magnitude + 1.0e-40f32);
+            // Discrete first-difference magnitude identity: |1 - e^{-j w}| = 2 sin(w / 2).
+            let frequency_hz =
+                (ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * q as f64).clamp(-1.0, 1.0))) as f32;
+            // The analyser compares the doubled positive-frequency magnitude
+            // published by its real-input transform.  This is a peak-domain
+            // comparison; it does not convert the doubled line to RMS.
+            amplitudes[bin] = (2.0f32 * magnitude) as f64;
+            frequencies[bin] = frequency_hz as f64;
+        }
+    }
+
+    #[cfg(test)]
+    fn spectrum(&self, bin: usize) -> (f64, f64) {
+        let mut amplitudes = [0.0; FFT / 2 + 1];
+        let mut frequencies = [0.0; FFT / 2 + 1];
+        self.spectra(bin, &mut amplitudes, &mut frequencies);
+        (amplitudes[bin], frequencies[bin])
     }
 
     fn redesign(&mut self, index: usize) {
@@ -554,11 +627,8 @@ impl Run {
     }
 
     fn analyse(&mut self) {
-        for i in 0..TRACKS {
-            self.tracks[i].gain += self.release * (1.0 - self.tracks[i].gain);
-            if self.tracks[i].frequency_hz > 0.0 {
-                self.redesign(i);
-            }
+        for track in &mut self.tracks {
+            track.gain += self.release * (1.0 - track.gain);
         }
         // The transformed program uses integer DFT cells; retain one extra
         // cell for candidate neighbour work.
@@ -566,11 +636,7 @@ impl Run {
         let max_bin = bin_count.saturating_sub(1);
         let mut amplitudes = [0.0; FFT / 2 + 1];
         let mut frequencies = [0.0; FFT / 2 + 1];
-        for (bin, value) in amplitudes.iter_mut().enumerate().take(max_bin + 2) {
-            let (amplitude, frequency) = self.spectrum(bin);
-            *value = amplitude;
-            frequencies[bin] = frequency;
-        }
+        self.spectra(max_bin + 1, &mut amplitudes, &mut frequencies);
         // The detector's cell record releases toward one like a track.
         for gain in &mut self.bin_gains {
             *gain += self.release * (1.0 - *gain);
@@ -588,7 +654,7 @@ impl Run {
         let mut pending = [Candidate::default(); TRACKS];
         let mut count = 0usize;
         for bin in 1..=max_bin {
-            let threshold = self.cell_threshold(bin) as f32;
+            let threshold = self.cell_thresholds[bin];
             // The transform reads the dry program; what the sections remove
             // reaches the comparison through the cell record.
             let amplitude = amplitudes[bin] as f32 * self.bin_gains[bin];
@@ -692,7 +758,7 @@ impl Run {
                 }
                 self.hop = HOST_HOP;
             }
-            let audio_wet_section = wet_smoother(self.fs);
+            let audio_wet_section = self.audio_wet_section;
             for frame in at..at + count {
                 for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
                     let mut delayed = buffer[frame];
@@ -938,6 +1004,47 @@ mod tests {
         let bin = libm::round(2000.0 * FFT as f64 / ANALYSIS_RATE) as usize;
         let (_amp, freq) = r.spectrum(bin);
         assert!((freq - 2000.0).abs() < 1.0, "expected ~2000 Hz, got {freq}");
+    }
+
+    #[test]
+    fn packed_fft_spectra_matches_direct_dft() {
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        for n in 0..FFT {
+            let t = n as f64 / ANALYSIS_RATE;
+            r.history[n] = (0.6 * libm::sin(2.0 * core::f64::consts::PI * 333.0 * t)
+                + 0.35 * libm::cos(2.0 * core::f64::consts::PI * 1777.0 * t + 0.4)
+                + 0.15 * libm::sin(2.0 * core::f64::consts::PI * 4123.0 * t)) as f32;
+        }
+        r.history_at = 73;
+        r.history_len = FFT;
+        let mut amps = [0.0; FFT / 2 + 1];
+        let mut freqs = [0.0; FFT / 2 + 1];
+        r.spectra(FFT / 2, &mut amps, &mut freqs);
+        for bin in 0..=FFT / 2 {
+            let (mut re, mut im, mut dre, mut dim) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for n in 0..FFT {
+                let at = (r.history_at + n) % FFT;
+                let prev = (at + FFT - 1) % FFT;
+                let w = r.window[n] as f64;
+                let raw = r.history[at] as f64;
+                let x = raw * w;
+                let d = (raw - r.history[prev] as f64) * w;
+                let ang = 2.0 * core::f64::consts::PI * (bin * n) as f64 / FFT as f64;
+                let (s, c) = (libm::sin(ang), libm::cos(ang));
+                re += x * c;
+                im -= x * s;
+                dre += d * c;
+                dim -= d * s;
+            }
+            let mag = libm::sqrt(re * re + im * im);
+            let exp_amp = 2.0 * mag;
+            assert!((amps[bin] - exp_amp).abs() < 1.0e-5, "bin {bin}: {} vs {exp_amp}", amps[bin]);
+            if exp_amp > 1.0e-3 {
+                let q = libm::sqrt(dre * dre + dim * dim) / (mag + 1.0e-40);
+                let exp_freq = ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * q).clamp(-1.0, 1.0));
+                assert!((freqs[bin] - exp_freq).abs() < 0.05, "bin {bin}: {} vs {exp_freq}", freqs[bin]);
+            }
+        }
     }
 
     #[test]
