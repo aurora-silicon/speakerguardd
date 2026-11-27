@@ -403,15 +403,30 @@ mod linux {
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
     }
 
-    /// A watch on the helper's directory (and its ancestors for move/delete):
-    /// a new report renamed into place wakes the idle loop at once. If the
-    /// directory or any ancestor is removed, moved or the queue overflows,
-    /// the watch drops to inactive so the loop keeps its 10 ms tick until
-    /// `rearm()` binds the replacement directory.
+    const WATCH_RETRY_NS: u64 = 1_000_000_000;
+
+    fn libc_inotify_add_watch(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+        // SAFETY: plain inotify syscall on a descriptor and NUL-terminated path we own.
+        unsafe { libc::inotify_add_watch(fd, path, mask) }
+    }
+
+    /// A watch on the helper's directory and its ancestors up to the
+    /// supervisor's own runtime root (so system directories like `/run` are
+    /// never watched under SELinux): a new report renamed into place wakes the
+    /// idle loop at once. Ancestors above the runtime root still have their
+    /// `(dev, ino)` identity checked on every tick. If any watched or checked
+    /// directory is removed, moved, or the queue overflows, the watch drops to
+    /// inactive so the loop keeps its 10 ms tick until `rearm()` binds the
+    /// replacement directory. Failed rearm attempts back off to at most once
+    /// per second (`WATCH_RETRY_NS`).
     struct ReportWatch {
         dir: PathBuf,
+        stop_at: PathBuf,
         fd: Option<i32>,
         watched: Vec<(PathBuf, (u64, u64))>,
+        checked: Vec<(PathBuf, (u64, u64))>,
+        retry_after_ns: u64,
+        add_watch: fn(i32, *const libc::c_char, u32) -> i32,
     }
 
     fn dir_identity(dir: &Path) -> Option<(u64, u64)> {
@@ -475,9 +490,19 @@ mod linux {
     }
 
     impl ReportWatch {
-        fn new(dir: PathBuf) -> Self {
-            let mut w = Self { dir, fd: None, watched: Vec::new() };
-            let _ = w.rearm();
+        fn new(dir: PathBuf, stop_at: PathBuf) -> Self {
+            Self::with_add_watch(dir, stop_at, libc_inotify_add_watch, now_ns())
+        }
+
+        fn with_add_watch(
+            dir: PathBuf,
+            stop_at: PathBuf,
+            add_watch: fn(i32, *const libc::c_char, u32) -> i32,
+            now: u64,
+        ) -> Self {
+            let mut w =
+                Self { dir, stop_at, fd: None, watched: Vec::new(), checked: Vec::new(), retry_after_ns: 0, add_watch };
+            let _ = w.rearm(now);
             w
         }
 
@@ -491,59 +516,92 @@ mod linux {
                 unsafe { libc::close(fd) };
             }
             self.watched.clear();
+            self.checked.clear();
         }
 
         fn valid(&self) -> bool {
             self.fd.is_some()
                 && !self.watched.is_empty()
-                && self.watched.iter().all(|(d, id)| dir_identity(d) == Some(*id))
+                && self.checked.iter().all(|(d, id)| dir_identity(d) == Some(*id))
         }
 
-        fn rearm(&mut self) -> WatchState {
+        fn rearm(&mut self, now: u64) -> WatchState {
             use std::os::unix::ffi::OsStrExt;
             if self.valid() {
+                self.retry_after_ns = 0;
                 return WatchState::Retained;
             }
             self.close();
-            if !self.dir.is_absolute() || self.dir.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            if now < self.retry_after_ns {
                 return WatchState::Down;
             }
-            let mut dirs = Vec::new();
-            let mut seen_ids = Vec::new();
+            let fail = |w: &mut Self| -> WatchState {
+                w.retry_after_ns = now.saturating_add(WATCH_RETRY_NS);
+                WatchState::Down
+            };
+            if !self.dir.is_absolute()
+                || !self.stop_at.is_absolute()
+                || self.stop_at == Path::new("/")
+                || !self.dir.starts_with(&self.stop_at)
+                || self.dir.components().any(|c| matches!(c, std::path::Component::ParentDir))
+                || self.stop_at.components().any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return fail(self);
+            }
+            let mut watched = Vec::new();
+            let mut seen_watched = Vec::new();
+            let mut checked = Vec::new();
+            let mut seen_checked = Vec::new();
+            let mut past_stop = false;
             for anc in self.dir.ancestors() {
                 if anc.as_os_str().is_empty() || anc == Path::new("/") {
                     break;
                 }
-                let Some(id) = dir_identity(anc) else { return WatchState::Down };
-                if !seen_ids.contains(&id) {
-                    seen_ids.push(id);
-                    dirs.push((anc.to_path_buf(), id));
+                let Some(id) = dir_identity(anc) else { return fail(self) };
+                if !seen_checked.contains(&id) {
+                    seen_checked.push(id);
+                    checked.push((anc.to_path_buf(), id));
+                }
+                if !past_stop {
+                    if !seen_watched.contains(&id) {
+                        seen_watched.push(id);
+                        watched.push((anc.to_path_buf(), id));
+                    }
+                    if anc == self.stop_at {
+                        past_stop = true;
+                    }
                 }
             }
-            if dirs.is_empty() {
-                return WatchState::Down;
+            if !past_stop || watched.is_empty() {
+                return fail(self);
             }
             // SAFETY: plain inotify syscalls on descriptors we own.
             unsafe {
                 let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
                 if fd < 0 {
-                    return WatchState::Down;
+                    return fail(self);
                 }
                 let leaf_mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
                 let anc_mask = libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
-                for (i, (dir, id)) in dirs.iter().enumerate() {
+                for (i, (dir, id)) in watched.iter().enumerate() {
                     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
                         libc::close(fd);
-                        return WatchState::Down;
+                        return fail(self);
                     };
                     let mask = if i == 0 { leaf_mask } else { anc_mask };
-                    if libc::inotify_add_watch(fd, path.as_ptr(), mask) < 0 || dir_identity(dir) != Some(*id) {
+                    if (self.add_watch)(fd, path.as_ptr(), mask) < 0 || dir_identity(dir) != Some(*id) {
                         libc::close(fd);
-                        return WatchState::Down;
+                        return fail(self);
                     }
                 }
+                if !checked.iter().all(|(d, id)| dir_identity(d) == Some(*id)) {
+                    libc::close(fd);
+                    return fail(self);
+                }
                 self.fd = Some(fd);
-                self.watched = dirs;
+                self.watched = watched;
+                self.checked = checked;
+                self.retry_after_ns = 0;
                 WatchState::Rebuilt
             }
         }
@@ -1304,7 +1362,7 @@ mod linux {
                 return EX_UNAVAILABLE;
             }
         };
-        let mut reports = ReportWatch::new(helper.clone());
+        let mut reports = ReportWatch::new(helper.clone(), run_dir.to_path_buf());
         if reports.fd().is_none() {
             eprintln!("cannot watch {}: the loop keeps its 10 ms tick while idle", helper.display());
         }
@@ -1564,7 +1622,7 @@ mod linux {
                 eprintln!("protection ready: every check holds; the protect stage idles until a stream starts");
                 idle_ready_said = true;
             }
-            let watch_state = reports.rearm();
+            let watch_state = reports.rearm(now_ns());
             let watch_live = watch_state != WatchState::Down;
             let rearmed = watch_state == WatchState::Rebuilt;
             let slow = pace.idle() && watch_live;
@@ -1706,29 +1764,33 @@ mod linux {
         #[test]
         fn report_watch_invalidates_on_dir_replace_and_rearms() {
             let base = std::env::temp_dir().join(format!("sgv2-repwatch-{}", std::process::id()));
-            let helper = base.join("helper");
+            let uid_dir = base.join("1000");
+            let helper = uid_dir.join("helper");
             let _ = std::fs::remove_dir_all(&base);
             std::fs::create_dir_all(&helper).unwrap();
-            let mut w = ReportWatch::new(helper.clone());
+            let mut t = 10_000_000_000u64;
+            let mut w = ReportWatch::with_add_watch(helper.clone(), base.clone(), libc_inotify_add_watch, t);
             assert!(w.fd().is_some());
-            assert_eq!(w.rearm(), WatchState::Retained);
+            assert_eq!(w.rearm(t), WatchState::Retained);
             // Same-tick directory replacement (without an intervening drain)
-            // must report WatchState::Rebuilt so the loop rereads immediately.
-            let old = base.join("helper.old");
+            // must report WatchState::Rebuilt immediately so the loop rereads.
+            let old = uid_dir.join("helper.old");
             std::fs::rename(&helper, &old).unwrap();
             std::fs::create_dir_all(&helper).unwrap();
-            assert_eq!(w.rearm(), WatchState::Rebuilt);
-            assert_eq!(w.rearm(), WatchState::Retained);
+            assert_eq!(w.rearm(t), WatchState::Rebuilt);
+            assert_eq!(w.rearm(t), WatchState::Retained);
             // Removing the helper directory invalidates the watch so the loop
             // drops back to the 10 ms tick until it exists again.
             std::fs::remove_dir_all(&helper).unwrap();
             w.drain();
             assert!(w.fd().is_none());
-            assert_eq!(w.rearm(), WatchState::Down);
-            // Recreating the directory allows rearm(), and a renamed report
-            // wakes wait_until immediately.
+            assert_eq!(w.rearm(t), WatchState::Down);
+            // Recreating the directory stays backed off until WATCH_RETRY_NS
+            // has elapsed, then re-arms and wakes wait_until on rename.
             std::fs::create_dir_all(&helper).unwrap();
-            assert_eq!(w.rearm(), WatchState::Rebuilt);
+            assert_eq!(w.rearm(t + 10_000_000), WatchState::Down);
+            t += WATCH_RETRY_NS;
+            assert_eq!(w.rearm(t), WatchState::Rebuilt);
             assert!(w.fd().is_some());
             let tmp = helper.join(".session.tmp");
             std::fs::write(&tmp, b"play=1\n").unwrap();
@@ -1737,6 +1799,81 @@ mod linux {
             assert!(wake >= 0);
             assert!(w.wait_until(now_ns() + 200_000_000, wake));
             unsafe { libc::close(wake) };
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn report_watch_stops_at_runtime_root_and_backs_off_on_failure() {
+            use std::sync::Mutex;
+            static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+            static FAIL_WATCH: AtomicBool = AtomicBool::new(false);
+
+            fn spy_add_watch(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+                // SAFETY: `path` is a valid NUL-terminated string from `ReportWatch`.
+                let cstr = unsafe { std::ffi::CStr::from_ptr(path) };
+                let p = PathBuf::from(cstr.to_string_lossy().into_owned());
+                RECORDED.lock().unwrap().push(p);
+                if FAIL_WATCH.load(Ordering::Acquire) {
+                    return -1;
+                }
+                libc_inotify_add_watch(fd, path, mask)
+            }
+
+            let base = std::env::temp_dir().join(format!("sgv2-repwatch-stop-{}", std::process::id()));
+            let uid_dir = base.join("1000");
+            let helper = uid_dir.join("helper");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&helper).unwrap();
+
+            // 1. Ancestor walk stops at `stop_at` (`base`) and never watches
+            // system parents like `/tmp` or `/run`.
+            RECORDED.lock().unwrap().clear();
+            FAIL_WATCH.store(false, Ordering::Release);
+            let t0 = 20_000_000_000u64;
+            let w = ReportWatch::with_add_watch(helper.clone(), base.clone(), spy_add_watch, t0);
+            assert!(w.fd().is_some());
+            assert_eq!(*RECORDED.lock().unwrap(), vec![helper.clone(), uid_dir.clone(), base.clone()]);
+            drop(w);
+
+            // 2. When `inotify_add_watch` fails on an ancestor (e.g. SELinux
+            // denial on the last ancestor after earlier watches succeeded),
+            // partial watches are closed, the watch stays Down, and retries
+            // happen at most once per WATCH_RETRY_NS.
+            fn spy_fail_last_ancestor(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+                // SAFETY: `path` is a valid NUL-terminated string from `ReportWatch`.
+                let cstr = unsafe { std::ffi::CStr::from_ptr(path) };
+                let p = PathBuf::from(cstr.to_string_lossy().into_owned());
+                RECORDED.lock().unwrap().push(p.clone());
+                if FAIL_WATCH.load(Ordering::Acquire)
+                    && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sgv2-repwatch-stop-"))
+                {
+                    return -1;
+                }
+                libc_inotify_add_watch(fd, path, mask)
+            }
+
+            RECORDED.lock().unwrap().clear();
+            FAIL_WATCH.store(true, Ordering::Release);
+            let mut w = ReportWatch::with_add_watch(helper.clone(), base.clone(), spy_fail_last_ancestor, t0);
+            assert!(w.fd().is_none());
+            // All three watches (helper, uid_dir, base) were attempted before
+            // failing on `base` and closing the fd.
+            assert_eq!(RECORDED.lock().unwrap().len(), 3);
+            // 99 ticks inside the 1 s backoff window make zero extra syscalls.
+            for step in 1..100u64 {
+                assert_eq!(w.rearm(t0 + step * TICK_NS), WatchState::Down);
+            }
+            assert_eq!(RECORDED.lock().unwrap().len(), 3);
+            // At t0 + WATCH_RETRY_NS, one retry runs and backs off again.
+            assert_eq!(w.rearm(t0 + WATCH_RETRY_NS), WatchState::Down);
+            assert_eq!(RECORDED.lock().unwrap().len(), 6);
+            assert_eq!(w.rearm(t0 + WATCH_RETRY_NS + TICK_NS), WatchState::Down);
+            assert_eq!(RECORDED.lock().unwrap().len(), 6);
+            // Once the failure clears, the next due retry succeeds.
+            FAIL_WATCH.store(false, Ordering::Release);
+            assert_eq!(w.rearm(t0 + 2 * WATCH_RETRY_NS), WatchState::Rebuilt);
+            assert!(w.fd().is_some());
+            drop(w);
             let _ = std::fs::remove_dir_all(&base);
         }
 

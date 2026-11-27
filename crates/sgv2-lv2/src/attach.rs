@@ -57,6 +57,8 @@ struct Shared {
     /// The mapped file's (device, inode), and pages swapped out but not yet
     /// unmapped, with `calls_done` at the swap. Watcher side only.
     state: Mutex<WatchState>,
+    #[cfg(test)]
+    checks: AtomicU64,
 }
 
 #[derive(Default)]
@@ -227,6 +229,9 @@ mod linux_watch {
         let mut ifd: i32 = -1;
         let mut watched: WatchedDirs = Vec::new();
         let poll_ms = WATCH_PERIOD.as_millis().min(i32::MAX as u128) as i32;
+        // Bounded backstop while settled (0.5 Hz) catches mount-over-directory
+        // transitions that produce no inotify event.
+        const SETTLED_POLL_MS: i32 = 2_000;
         loop {
             if s.stop.load(Ordering::Acquire) {
                 break;
@@ -247,14 +252,14 @@ mod linux_watch {
                     }
                 }
             }
-            // Enter the indefinite wait only when the watches cover a
+            // Enter the slow inotify wait only when the watches cover a
             // symlink-free live path, no retired mapping waits to unmap, and
             // the current regular file identifies the page we actually mapped.
             let current = plain_file_id(&s.path);
             let settled = ifd >= 0
                 && current.is_some()
                 && s.state.lock().map(|st| st.retired.is_empty() && st.id == current).unwrap_or(false);
-            let timeout = if settled { -1 } else { poll_ms };
+            let timeout = if settled { SETTLED_POLL_MS } else { poll_ms };
             let mut pfds = [
                 libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: ifd, events: libc::POLLIN, revents: 0 },
@@ -283,6 +288,8 @@ mod linux_watch {
 impl Shared {
     /// One look at the path: re-attach if it names another page.
     fn check(&self) -> bool {
+        #[cfg(test)]
+        self.checks.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut attached = false;
         if let Some(id) = file_id(&self.path) {
@@ -330,6 +337,7 @@ impl Attach {
             calls_done: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             state: Mutex::new(WatchState::default()),
+            checks: AtomicU64::new(0),
         });
         shared.check();
         Attach {
@@ -338,6 +346,11 @@ impl Attach {
             #[cfg(target_os = "linux")]
             wake_fd: -1,
         }
+    }
+
+    #[cfg(test)]
+    fn check_count(&self) -> u64 {
+        self.shared.checks.load(Ordering::Relaxed)
     }
 
     /// Map the page at `path` if there is one, and start the watcher.
@@ -350,6 +363,8 @@ impl Attach {
             calls_done: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             state: Mutex::new(WatchState::default()),
+            #[cfg(test)]
+            checks: AtomicU64::new(0),
         });
         shared.check();
         let s = shared.clone();
@@ -637,6 +652,47 @@ mod tests {
         }
         beat(&a, 1);
         assert_eq!(second.header().seq.load(Ordering::Acquire), 1);
+        drop(a);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Pin the inotify wakeup path: once settled into `poll(SETTLED_POLL_MS)`
+    /// (2 s), the watcher makes zero idle `check()` calls across 450 ms (which
+    /// would fire 4-5 times on the 100 ms fallback), and replacing the page
+    /// delivers a beat to the new mapping well below the 2 s settled poll.
+    #[test]
+    fn the_watcher_reattaches_via_inotify_well_below_settled_poll() {
+        let base = std::env::temp_dir().join(format!("sgv2-attach-inotify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("engine").to_string_lossy().into_owned();
+        let _first = EnginePage::create(&path).unwrap();
+        let a = Attach::new(path.clone(), H);
+        // Wait for the watcher thread's post-watch check() so it enters poll(2000).
+        let setup_t0 = std::time::Instant::now();
+        while a.check_count() < 2 {
+            assert!(setup_t0.elapsed() < Duration::from_secs(2), "watcher did not initialize");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let idle_before = a.check_count();
+        std::thread::sleep(Duration::from_millis(450));
+        assert_eq!(a.check_count(), idle_before, "watcher polled while settled instead of blocking on inotify");
+        std::fs::remove_file(&path).unwrap();
+        let t0 = std::time::Instant::now();
+        let second = EnginePage::create(&path).unwrap();
+        loop {
+            beat(&a, 1);
+            if second.header().seq.load(Ordering::Acquire) >= 1 {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_millis(500),
+                "re-attach took {:?}; inotify did not wake the settled poll",
+                t0.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(a);
         let _ = std::fs::remove_dir_all(&base);
     }
