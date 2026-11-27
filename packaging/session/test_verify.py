@@ -118,6 +118,23 @@ class Verify(unittest.TestCase):
         # the tuning source comes from the units' configuration
         self.assertEqual(self.tool_cmd[-2:], ["--bundle", "/x"])
         self.assertIn("no session PipeWire", out["steps"][-1]["detail"])
+        # the microphone's verdict is beside the result: no blob here
+        self.assertEqual(out["mic"]["result"], "absent")
+
+    def test_the_microphone_verdict_never_changes_the_speakers(self):
+        self.bind()
+        self.graph_conf()
+        for mic in ("refused", "pass"):
+            with mock.patch.object(sgsc, "mic_verdict", lambda blob, dt="/proc/device-tree", _m=mic: {"result": _m, "detail": "x"}) as _:
+                code, out = self.run_verify(voicing())
+            self.assertEqual((code, out["result"], out["mic"]["result"]), (0, "pass", mic), out)
+            self.assertEqual([s["name"] for s in out["steps"]], ["kernel", "hardware", "voicing", "graph"])
+        # and a speaker step that cannot run is not rescued by it
+        os.unlink(os.path.join(self.state, "selfcheck.bind"))
+        with mock.patch.object(sgsc, "mic_verdict", lambda blob, dt="/proc/device-tree": {"result": "pass", "detail": "x"}):
+            code, out = self.run_verify(voicing())
+        self.assertNotEqual((code, out["result"]), (0, "pass"))
+        self.assertEqual(out["mic"]["result"], "pass")
 
     def test_j414s_like_tuning_is_refused(self):
         self.bind()
