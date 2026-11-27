@@ -1271,6 +1271,11 @@ ATTESTATIONS = (os.path.join(HERE, "parity.json"), "/usr/share/speakerguardd/par
 QUANTUM = 512
 PILOT_STARTS = 5
 PILOT_S = 0.6
+# The pilot is a stereo float32 client of the voicing sink. Bound its
+# in-memory payload independently of the rate declared by the tuning.
+PILOT_CHANNELS = 2
+PILOT_SAMPLE_BYTES = 4
+PILOT_MAX_BYTES = 8 * 1024 * 1024
 
 
 class Cannot(Exception):
@@ -1468,14 +1473,20 @@ def verify_graph(args):
         raise wiring.Refused("the speaker graph has xrun since it started: "
                              + ", ".join(f"{k} {v} beyond one per start" for k, v in sorted(started.items())))
     sink = f"sgv2.voicing.{m}"
-    zeros = bytes(int(48000 * PILOT_S) * 2 * 4)
+    # Provisioning checks this rate against the tuning used to generate
+    # the graph and to open the hardware PCMs.
+    rate = blob_rate(args.params)
+    size = int(rate * PILOT_S) * PILOT_CHANNELS * PILOT_SAMPLE_BYTES
+    if not 0 < size <= PILOT_MAX_BYTES:
+        raise wiring.Refused(f"the parameter rate {rate} Hz gives an invalid pilot payload size")
+    zeros = bytes(size)
     # the first pilot wakes the path (if it is powered down); the counted
     # starts follow it while the amps stay up
-    _pilot(uid, sink, zeros)
+    _pilot(uid, sink, rate, zeros)
     time.sleep(0.3)
     before = pw_errors(uid, nodes) or before
     for _ in range(PILOT_STARTS):
-        _pilot(uid, sink, zeros)
+        _pilot(uid, sink, rate, zeros)
         time.sleep(0.3)
     time.sleep(0.5)
     after = pw_errors(uid, nodes) or {}
@@ -1488,13 +1499,13 @@ def verify_graph(args):
     return f"{QUANTUM}-frame quantum locked; {PILOT_STARTS} silent pilot starts, no xrun on {', '.join(sorted(grew))}"
 
 
-def _pilot(uid, sink, zeros):
+def _pilot(uid, sink, rate, zeros):
     """One zero-sample stream into the voicing input: start, play, stop."""
     import pwd as _pwd
     name = _pwd.getpwuid(uid).pw_name
     pre = [] if os.getuid() == uid else ["runuser", "-u", name, "--"]
     cmd = pre + ["env", f"XDG_RUNTIME_DIR=/run/user/{uid}", "pw-cat", "--playback", "--raw", "--target", sink,
-                 "--rate", "48000", "--channels", "2", "--format", "f32", "-"]
+                 "--rate", str(rate), "--channels", str(PILOT_CHANNELS), "--format", "f32", "-"]
     p = subprocess.run(cmd, input=zeros, capture_output=True, timeout=15)
     if p.returncode:
         raise Cannot(f"the silent pilot stream did not run: {p.stderr.decode(errors='replace').strip()[-200:]}")
