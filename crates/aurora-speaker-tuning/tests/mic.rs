@@ -767,3 +767,46 @@ fn the_phase_companion_is_a_butterworth_allpass() {
     assert!((s.a1 - (-2.0 * w0.cos() / a0)).abs() < 1e-9 && (s.a2 - (1.0 - alpha) / a0).abs() < 1e-9, "{s:?}");
     assert!((s.b0 - s.a2).abs() < 1e-12 && (s.b1 - s.a1).abs() < 1e-12 && (s.b2 - 1.0).abs() < 1e-12);
 }
+
+#[test]
+fn per_microphone_trims_between_a_split_and_a_join_are_carried() {
+    let tone = |e: &mut Engine| {
+        let n = 48_000;
+        let x: Vec<f32> =
+            (0..n).map(|k| 0.1 * (2.0 * std::f64::consts::PI * 1000.0 * k as f64 / 48_000.0).sin() as f32).collect();
+        let mut y = vec![0.0f32; n];
+        for at in (0..n).step_by(128) {
+            e.process(&[&x[at..at + 128], &x[at..at + 128]], &mut y[at..at + 128], 128);
+        }
+        let tail = &y[24_000..24_000 + 48 * 400];
+        (tail.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / tail.len() as f64).sqrt()
+    };
+    let base = Fixture::new().tree("mic-trim-base");
+    let p0 = mic::compile(&base, &mic::Options::default(), &mut Diagnostics::default()).unwrap().params.unwrap();
+    let r0 = tone(&mut Engine::new(p0).unwrap());
+
+    let mut f = Fixture::new();
+    f.graph = graph(None)
+        .replace(
+            "wire Rb Sens ([fs] [numChansIn] [blockSize])\n",
+            "wire Rb Sp ([fs] [numChansIn] [blockSize])\n\
+             wire (Sp 0) T0 ([fs] 1 [blockSize])\n\
+             wire (Sp 1) T1 ([fs] 1 [blockSize])\n\
+             wire T0 (Jn 0) ([fs] 1 [blockSize])\n\
+             wire T1 (Jn 1) ([fs] 1 [blockSize])\n\
+             wire Jn Sens ([fs] [numChansIn] [blockSize])\n",
+        )
+        .replace(
+            "box Eq (aufx tmst appl) 1 1\n",
+            "box Eq (aufx tmst appl) 1 1\nbox Sp split 1 2\nbox Jn join 2 1\nbox T0 dbgn 1 1\nbox T1 dbgn 1 1\n",
+        );
+    let six = 20.0 * 2f64.log10();
+    f.effects.push(unit_effect("T0", "dbgn", &state(&[(0, six as f32), (1, 0.0)]), false, Some("dbgain")));
+    f.effects.push(unit_effect("T1", "dbgn", &state(&[(0, six as f32), (1, 0.0)]), false, Some("dbgain")));
+    let b = f.tree("mic-trim");
+    let c = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    assert!(c.report.stages.iter().any(|s| s.name == "Sp" && s.status == Status::Exact), "{:?}", c.report.stages);
+    let r1 = tone(&mut Engine::new(c.params.unwrap()).unwrap());
+    assert!((r1 / r0 - 2.0).abs() < 2e-3, "trimmed {r1} vs base {r0}");
+}
