@@ -19,12 +19,15 @@
 //! `machine` is the board the speaker blob names (`crate::blob::machine_field`),
 //! `unit` the raw SHA-256 the speaker bundle's `unit_id` spells in hex
 //! (zero when the bundle names no unit). The payload holds the pre stages,
-//! the transform, the beam and the post stages. A [`Stage::Graph`] is the
+//! the transform, the beam, the reference beams, the frequency stages and
+//! the post stages. A [`Stage::Graph`] is the
 //! subset of a voicing chain Spec the microphone compiler emits: filter
 //! nodes at a fixed state (sections, gain, level-dependent slots; no
 //! volume automation) and sum nodes, with no graph links or relays.
 
-use super::{Beam, Params, Stage, Stft, Window, MAX_MICS, MAX_STAGES};
+use super::blend::BlendLaw;
+use super::sens::Sens;
+use super::{Beam, FreqStage, Params, Stage, Stft, Window, MAX_MICS, MAX_STAGES};
 use crate::blob::{crc32, BlobError, MACHINE_LEN};
 use crate::prestage::{Channel, DynamicAt, DynamicFilter, DynamicKind, Section, MAX_DYNAMIC_FILTERS, MAX_SECTIONS};
 use crate::voicing::chain::{Kind, NodeSpec, Source, Spec, Tone, MAX_NODES};
@@ -32,7 +35,9 @@ use crate::MAX_CHANNELS;
 use alloc::vec::Vec;
 
 pub const MAGIC: [u8; 8] = *b"SGV2MIC\0";
-pub const VERSION: u32 = 1;
+/// 2: the suppressor stage, the quadrant window, reference beams and
+/// frequency stages.
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 76;
 pub const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const FLAG_PARTIAL: u32 = 1;
@@ -293,6 +298,24 @@ fn put_stages(o: &mut Vec<u8>, stages: &[Stage]) {
                 put_u32(o, 4);
                 o.extend_from_slice(code);
             }
+            Stage::Sens(s) => {
+                put_u32(o, 5);
+                put_u32(o, s.mics as u32);
+                put_u32(o, s.hop as u32);
+                put_u32(o, s.bypass as u32);
+                put_u32(o, s.order as u32);
+                for v in [s.signal_ms, s.gain_ms, s.output_db, s.floor_db, s.multiplier] {
+                    put_f64(o, v);
+                }
+                put_u32(o, s.artifact as u32);
+                put_f64(o, s.threshold);
+                put_f64(o, s.scale);
+                put_u32(o, s.min_len as u32);
+                put_u32(o, s.aggressive as u32);
+                for v in &s.profile {
+                    put_f64(o, *v);
+                }
+            }
         }
     }
 }
@@ -309,21 +332,69 @@ fn get_stages(r: &mut Reader<'_>, fs: f64) -> Result<Vec<Stage>> {
                 let b = r.bytes(4)?;
                 Stage::Identity([b[0], b[1], b[2], b[3]])
             }
+            5 => {
+                let mics = r.count(MAX_MICS)?;
+                let hop = r.count(super::MAX_HOP)?;
+                let bypass = r.bool()?;
+                let order = r.count(super::sens::MAX_ORDER)?;
+                let (signal_ms, gain_ms, output_db, floor_db, multiplier) =
+                    (r.f64()?, r.f64()?, r.f64()?, r.f64()?, r.f64()?);
+                let artifact = r.bool()?;
+                let (threshold, scale) = (r.f64()?, r.f64()?);
+                let min_len = r.count(super::MAX_HOP)?;
+                let aggressive = r.bool()?;
+                let mut profile = Vec::with_capacity(mics * (hop + 1));
+                for _ in 0..mics * (hop + 1) {
+                    profile.push(r.f64()?);
+                }
+                Stage::Sens(Sens {
+                    mics,
+                    hop,
+                    bypass,
+                    order,
+                    signal_ms,
+                    gain_ms,
+                    output_db,
+                    floor_db,
+                    multiplier,
+                    artifact,
+                    threshold,
+                    scale,
+                    min_len,
+                    aggressive,
+                    profile,
+                })
+            }
             _ => return Err(BlobError::Length),
         });
     }
     Ok(out)
 }
 
-fn put_payload(o: &mut Vec<u8>, p: &Params) {
-    put_stages(o, &p.pre);
-    let s = &p.stft;
-    put_u32(o, s.hop as u32);
-    put_u32(o, s.size as u32);
-    put_u32(o, s.window as u32);
-    put_u32(o, s.half_offset as u32);
-    put_u32(o, s.frame_phase as u32);
-    let b = &p.beam;
+const LAW_REALS: usize = 16;
+
+fn law_reals(l: &BlendLaw) -> [f64; LAW_REALS] {
+    [
+        l.cutoff_hz,
+        l.detect_db,
+        l.max_boost_db,
+        l.scale_floor_db,
+        l.scale_smooth_s,
+        l.threshold_db,
+        l.xover_max_hz,
+        l.attack_s,
+        l.release_s,
+        l.hold_s,
+        l.xover_smooth_s,
+        l.xover_min_hz,
+        l.abs_floor_db,
+        l.wind_attack_s,
+        l.wind_release_s,
+        l.slope,
+    ]
+}
+
+fn put_beam(o: &mut Vec<u8>, b: &Beam) {
     put_u32(o, b.mics as u32);
     put_u32(o, b.bins as u32);
     for w in &b.weights {
@@ -334,6 +405,46 @@ fn put_payload(o: &mut Vec<u8>, p: &Params) {
     if let Some(eq) = &b.eq {
         for v in eq {
             put_f64(o, *v);
+        }
+    }
+}
+
+fn get_beam(r: &mut Reader<'_>, mics_want: usize, bins_want: usize) -> Result<Beam> {
+    let mics = r.count(MAX_MICS)?;
+    let bins = r.count(super::MAX_HOP + 1)?;
+    if mics != mics_want || bins != bins_want {
+        return Err(BlobError::Channels);
+    }
+    let mut weights = Vec::with_capacity(mics * bins);
+    for _ in 0..mics * bins {
+        weights.push([r.f64()?, r.f64()?]);
+    }
+    let eq = if r.bool()? { Some((0..bins).map(|_| r.f64()).collect::<Result<Vec<_>>>()?) } else { None };
+    Ok(Beam { mics, bins, weights, eq })
+}
+
+fn put_payload(o: &mut Vec<u8>, p: &Params) {
+    put_stages(o, &p.pre);
+    let s = &p.stft;
+    put_u32(o, s.hop as u32);
+    put_u32(o, s.size as u32);
+    put_u32(o, s.window as u32);
+    put_u32(o, s.half_offset as u32);
+    put_u32(o, s.frame_phase as u32);
+    put_beam(o, &p.beam);
+    put_u32(o, p.refs.len() as u32);
+    for b in &p.refs {
+        put_beam(o, b);
+    }
+    put_u32(o, p.freq.len() as u32);
+    for f in &p.freq {
+        let FreqStage::LowBand { compare, blend, law } = f;
+        put_u32(o, 1);
+        put_u32(o, *compare as u32);
+        put_u32(o, *blend as u32);
+        put_u32(o, law.boost_limit as u32);
+        for v in law_reals(law) {
+            put_f64(o, v);
         }
     }
     put_stages(o, &p.post);
@@ -347,23 +458,53 @@ fn get_payload(r: &mut Reader<'_>, h: &Header) -> Result<Params> {
     let window = Window::from_u32(r.u32()?).ok_or(BlobError::Length)?;
     let half_offset = r.bool()?;
     let frame_phase = r.count(super::MAX_HOP)?;
-    let mics = r.count(MAX_MICS)?;
-    let bins = r.count(super::MAX_HOP + 1)?;
-    if mics != h.mics as usize || bins != size / 2 + 1 {
-        return Err(BlobError::Channels);
+    let (mics, bins) = (h.mics as usize, size / 2 + 1);
+    let beam = get_beam(r, mics, bins)?;
+    let nrefs = r.count(MAX_MICS)?;
+    let refs = (0..nrefs).map(|_| get_beam(r, mics, bins)).collect::<Result<Vec<_>>>()?;
+    let nfreq = r.count(MAX_STAGES)?;
+    let mut freq = Vec::with_capacity(nfreq);
+    for _ in 0..nfreq {
+        if r.u32()? != 1 {
+            return Err(BlobError::Length);
+        }
+        let compare = r.count(MAX_MICS)?;
+        let blend = r.count(MAX_MICS)?;
+        let boost_limit = r.bool()?;
+        let mut v = [0.0; LAW_REALS];
+        for x in v.iter_mut() {
+            *x = r.f64()?;
+        }
+        let law = BlendLaw {
+            boost_limit,
+            cutoff_hz: v[0],
+            detect_db: v[1],
+            max_boost_db: v[2],
+            scale_floor_db: v[3],
+            scale_smooth_s: v[4],
+            threshold_db: v[5],
+            xover_max_hz: v[6],
+            attack_s: v[7],
+            release_s: v[8],
+            hold_s: v[9],
+            xover_smooth_s: v[10],
+            xover_min_hz: v[11],
+            abs_floor_db: v[12],
+            wind_attack_s: v[13],
+            wind_release_s: v[14],
+            slope: v[15],
+        };
+        freq.push(FreqStage::LowBand { compare, blend, law });
     }
-    let mut weights = Vec::with_capacity(mics * bins);
-    for _ in 0..mics * bins {
-        weights.push([r.f64()?, r.f64()?]);
-    }
-    let eq = if r.bool()? { Some((0..bins).map(|_| r.f64()).collect::<Result<Vec<_>>>()?) } else { None };
     let post = get_stages(r, fs)?;
     Ok(Params {
         sample_rate: h.sample_rate,
         mics,
         pre,
         stft: Stft { hop, size, window, half_offset, frame_phase },
-        beam: Beam { mics, bins, weights, eq },
+        beam,
+        refs,
+        freq,
         post,
         partial: h.flags & FLAG_PARTIAL != 0,
     })
@@ -529,6 +670,33 @@ mod tests {
         };
         p.pre.insert(0, Stage::Graph(nest));
         p.beam.eq = Some(vec![0.5; 481]);
+        p.pre.push(Stage::Sens(super::super::sens::tests::params(3, 480)));
+        let mut r = p.beam.clone();
+        r.eq = None;
+        p.refs.push(r);
+        p.freq.push(FreqStage::LowBand {
+            compare: 0,
+            blend: 0,
+            law: BlendLaw {
+                boost_limit: true,
+                cutoff_hz: 3500.0,
+                detect_db: 1.0,
+                max_boost_db: 2.0,
+                scale_floor_db: -80.0,
+                scale_smooth_s: 0.02,
+                threshold_db: -15.0,
+                xover_max_hz: 1100.0,
+                attack_s: 0.2,
+                release_s: 0.8,
+                hold_s: 1.2,
+                xover_smooth_s: 0.3,
+                xover_min_hz: 300.0,
+                abs_floor_db: -85.0,
+                wind_attack_s: 0.15,
+                wind_release_s: 0.35,
+                slope: 0.6,
+            },
+        });
         p
     }
 
@@ -546,7 +714,7 @@ mod tests {
         assert_eq!(h.binding.machine(), Some("j000"));
         assert!(h.binding.unit_bound());
         assert_eq!(h.flags, FLAG_PARTIAL);
-        assert_eq!(h.latency, 959);
+        assert_eq!(h.latency, 959 + 480);
         assert!(super::super::Engine::new(q).is_some());
     }
 

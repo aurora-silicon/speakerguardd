@@ -84,8 +84,10 @@ fn params() -> Params {
         sample_rate: 48_000,
         mics,
         pre: vec![Stage::DcBlock { cutoff_hz: 40.0, ramp_ms: 5.0, gain_db: 0.0 }, Stage::Gain { db: 9.0 }],
-        stft: Stft { hop, size: 2 * hop, window: Window::Vorbis, half_offset: false, frame_phase: 0 },
+        stft: Stft { hop, size: 2 * hop, window: Window::Quadrant, half_offset: false, frame_phase: 0 },
         beam: Beam { mics, bins, weights, eq: None },
+        refs: Vec::new(),
+        freq: Vec::new(),
         post: vec![Stage::Gain { db: -2.0 }, Stage::Graph(tone())],
         partial: false,
     }

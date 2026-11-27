@@ -93,6 +93,56 @@ fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
     ]))
 }
 
+/// A suppressor profile file: `mics` profiles of `BINS` powers.
+fn sens_file(mics: usize, power: f32, block: f64) -> Vec<u8> {
+    let mut kv = vec![("BlockSize", r(block)), ("NumberOfChannels", i(mics as i128)), ("SampleRate", r(48_000.0))];
+    let names: Vec<String> = (0..mics).map(|m| format!("NoiseProfile{m}")).collect();
+    for n in &names {
+        kv.push((n.as_str(), be(&vec![power; BINS])));
+    }
+    binary::write(&dict(kv))
+}
+
+/// A suppressor preset: every global parameter, made-up values.
+fn sens_state(mode: f32) -> ParamState {
+    state(&[
+        (0, 0.0),
+        (1, mode),
+        (2, 0.0),
+        (3, 8.0),
+        (4, 4.0),
+        (5, 0.0),
+        (6, -10.0),
+        (7, 1.2),
+        (8, 0.0),
+        (9, 1.0),
+        (10, 0.3),
+        (11, 8.0),
+        (12, 4.0),
+        (13, 0.0),
+    ])
+}
+
+/// A beamformer preset in the fixed-beam mode (made-up blend controls).
+fn beam_state(fixed: bool) -> ParamState {
+    let sel = if fixed { 1.0 } else { 0.0 };
+    state(&[
+        (0, 0.0),
+        (1, 1.0 - sel),
+        (2, sel),
+        (3, 0.0),
+        (4, 0.0),
+        (5, 0.0),
+        (21, 0.0),
+        (22, 0.0),
+        (23, 0.0),
+        (31, -10.0),
+        (32, 900.0),
+        (37, 150.0),
+        (42, 0.0),
+    ])
+}
+
 fn graph(extra_box: Option<&str>) -> String {
     let (decl, path) = match extra_box {
         Some(kind) => {
@@ -181,6 +231,10 @@ struct Fixture {
     graph: String,
     effects: Vec<Value>,
     beam: Vec<u8>,
+    sens: Vec<u8>,
+    /// Extra property strip boxes and files.
+    props: Vec<(String, i128, String)>,
+    files: Vec<(String, Vec<u8>)>,
 }
 
 impl Fixture {
@@ -189,14 +243,18 @@ impl Fixture {
             graph: graph(None),
             effects: vec![
                 unit_effect("Dc", "dccb", &state(&[(0, 25.0), (1, 0.0), (2, 0.0)]), false, None),
-                unit_effect("Sens", "sens", &state(&[(0, 0.0), (5, 0.0)]), false, None),
+                unit_effect("Sens", "sens", &sens_state(6.0), false, None),
                 unit_effect("Pre", "gain", &state(&[(0, 2.0), (1, 0.0)]), false, Some("gain")),
-                unit_effect("Beam", "bmfd", &state(&[(0, 0.0), (2, 1.0)]), false, None),
+                unit_effect("Beam", "bmfd", &beam_state(true), false, None),
                 unit_effect("Ns", "ocns", &state(&[(0, -6.0)]), true, None),
                 unit_effect("Eq", "tmst", &tone_state(-3.0, 1000.0, 1.0), false, None),
                 unit_effect("Vol", "dbgn", &state(&[(0, 0.0), (1, 0.0)]), false, Some("dbgain")),
             ],
             beam: beam_file(2, &[0.5, 0.5]),
+            // no noise: the suppressor passes everything
+            sens: sens_file(2, 0.0, HOP as f64),
+            props: Vec::new(),
+            files: Vec::new(),
         }
     }
 
@@ -229,11 +287,19 @@ impl Fixture {
             format!("{AID}/DSP/Strips/mic_general.propstrip"),
             binary::write(&dict(vec![(
                 "Boxes",
-                Value::Array(vec![prop("Beam", 4630, "mic_beam.plist"), prop("Sens", 1000, "mic_sens.plist")]),
+                Value::Array(
+                    [prop("Beam", 4630, "mic_beam.plist"), prop("Sens", 1000, "mic_sens.plist")]
+                        .into_iter()
+                        .chain(self.props.iter().map(|(b, n, f)| prop(b, *n, f)))
+                        .collect(),
+                ),
             )])),
         );
         f.insert(format!("{AID}/DSP/Strips/mic_beam.plist"), self.beam.clone());
-        f.insert(format!("{AID}/DSP/Strips/mic_sens.plist"), binary::write(&dict(vec![("BlockSize", r(240.0))])));
+        f.insert(format!("{AID}/DSP/Strips/mic_sens.plist"), self.sens.clone());
+        for (n, d) in &self.files {
+            f.insert(format!("{AID}/DSP/Strips/{n}"), d.clone());
+        }
         f
     }
 
@@ -267,7 +333,8 @@ fn partial() -> mic::Options {
 fn compiles_the_synthetic_chain_with_every_stage_reported() {
     let b = Fixture::new().tree("mic-compile");
     let mut d = Diagnostics::default();
-    let c = mic::compile(&b, &partial(), &mut d).unwrap();
+    // every stage is carried: the default compile takes it
+    let c = mic::compile(&b, &mic::Options::default(), &mut d).unwrap();
     assert!(c.report.refusals.is_empty(), "{:?}", c.report.refusals);
     let st: Vec<(&str, &Status)> = c.report.stages.iter().map(|s| (s.name.as_str(), &s.status)).collect();
     assert_eq!(
@@ -275,35 +342,42 @@ fn compiles_the_synthetic_chain_with_every_stage_reported() {
         vec![
             ("Dc", &Status::Approximate),
             ("Rb", &Status::Structural),
-            ("Sens", &Status::Uncharacterised),
+            ("Sens", &Status::Approximate),
             ("Pre", &Status::Exact),
-            ("A", &Status::Approximate),
-            ("Beam", &Status::Approximate),
+            ("A", &Status::Exact),
+            ("Beam", &Status::Exact),
             ("Ns", &Status::Bypassed),
-            ("S", &Status::Approximate),
+            ("S", &Status::Exact),
             ("Eq", &Status::Exact),
             ("Vol", &Status::Exact),
         ]
     );
     assert_eq!(c.report.configuration.as_deref(), Some("48k - General"));
-    assert!(c.report.partial);
+    assert!(!c.report.partial);
+    assert!(!c.refused());
     let p = c.params.unwrap();
     assert_eq!((p.mics, p.stft.hop, p.stft.size, p.beam.bins), (2, HOP, 2 * HOP, BINS));
-    assert!(p.partial);
-    assert!(matches!(p.pre[1], Stage::Identity(c) if &c == b"sens"));
+    assert!(!p.partial);
+    assert_eq!(p.stft.window, sgv2_core::mic::Window::Quadrant);
+    // the suppressor: the global parameters, a hop of latency
+    let Stage::Sens(sp) = &p.pre[1] else { panic!("{:?}", p.pre[1]) };
+    assert_eq!((sp.mics, sp.hop, sp.min_len, sp.aggressive), (2, HOP, 4, false));
+    assert_eq!((sp.signal_ms, sp.gain_ms, sp.floor_db, sp.multiplier), (8.0, 4.0, -10.0, 1.2f32 as f64));
+    assert_eq!(c.report.latency_frames, 2 * HOP - 1 + HOP);
     // the gain builtin's parameter 0 is a linear factor: 2.0 = +6.02 dB
     match p.pre[2] {
         Stage::Gain { db } => assert!((db - 20.0 * 2f64.log10()).abs() < 1e-9),
         ref o => panic!("{o:?}"),
     }
-    // every stage on the report carries what it still depends on
-    assert!(c.report.stages.iter().find(|s| s.name == "Beam").unwrap().todo.iter().any(|t| t.contains("adaptive")));
+    // every approximate stage on the report carries what it still depends on
+    assert!(c.report.stages.iter().find(|s| s.name == "Sens").unwrap().todo.iter().any(|t| t.contains("artifact")));
+    assert!(c.report.stages.iter().filter(|s| s.status == Status::Exact).all(|s| s.todo.is_empty()));
 }
 
 #[test]
 fn the_compiled_chain_renders_the_stated_laws() {
     let b = Fixture::new().tree("mic-render");
-    let p = mic::compile(&b, &partial(), &mut Diagnostics::default()).unwrap().params.unwrap();
+    let p = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap().params.unwrap();
     let mut e = Engine::new(p).unwrap();
     // the same 1 kHz tone on both microphones: the beam averages them,
     // the gain doubles, the peak cuts 3 dB at its centre, the DC blocker
@@ -328,10 +402,17 @@ fn the_compiled_chain_renders_the_stated_laws() {
 
 #[test]
 fn default_compile_refuses_uncharacterised_stages() {
-    let b = Fixture::new().tree("mic-refuse-default");
+    // the noise suppressor not bypassed: uncharacterised
+    let mut f = Fixture::new();
+    f.effects[4] = unit_effect("Ns", "ocns", &state(&[(0, -6.0)]), false, None);
+    let b = f.tree("mic-refuse-default");
     let c = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
     assert!(c.refused());
-    assert!(c.report.refusals.iter().any(|r| r.contains("Sens")));
+    assert!(c.report.refusals.iter().any(|r| r.contains("Ns")));
+    // a partial compile carries it as identity and flags the chain
+    let c = mic::compile(&b, &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    assert!(c.report.partial && c.params.unwrap().partial);
     let (blob, _) = mic::compile_blob(
         &b,
         &Machine::new("j999").unwrap(),
@@ -386,7 +467,8 @@ fn the_blob_is_bound_to_the_board_and_unit() {
     assert_eq!(h.binding.machine(), Some("j999"));
     assert_eq!(h.binding.acoustic_id, ACOUSTIC_ID);
     assert!(h.binding.unit_bound());
-    assert_eq!(h.flags & artifact::FLAG_PARTIAL, artifact::FLAG_PARTIAL);
+    assert_eq!(h.flags & artifact::FLAG_PARTIAL, 0);
+    assert_eq!(h.version, artifact::VERSION);
     assert_eq!(h.latency as usize, report.latency_frames);
     assert_eq!(p.mics, 2);
     // another board, another unit: no blob
@@ -527,5 +609,134 @@ fn notch_slots_are_carried_ahead_of_the_filter_box() {
     g.push((26, 2.0));
     f.effects[5] = unit_effect("Eq", "tmst", &st, false, None);
     let c = mic::compile(&f.tree("mic-notch-gain"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(c.refused());
+}
+
+#[test]
+fn suppressor_modes_and_profiles_that_do_not_fit_refuse() {
+    // another processing mode
+    let mut f = Fixture::new();
+    f.effects[1] = unit_effect("Sens", "sens", &sens_state(3.0), false, None);
+    let c = mic::compile(&f.tree("mic-sens-mode"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(c.refused());
+    assert!(c.report.refusals.iter().any(|r| r.contains("processing mode")), "{:?}", c.report.refusals);
+    // a profile for another block size or microphone count
+    for (name, file) in [("mic-sens-block", sens_file(2, 0.0, 480.0)), ("mic-sens-mics", sens_file(3, 0.0, HOP as f64))]
+    {
+        let mut f = Fixture::new();
+        f.sens = file;
+        let c = mic::compile(&f.tree(name), &partial(), &mut Diagnostics::default()).unwrap();
+        assert!(c.refused(), "{name}");
+        assert!(c.report.stages.iter().any(|s| s.name == "Sens" && s.status == Status::Refused));
+    }
+}
+
+#[test]
+fn a_beamformer_outside_the_fixed_beam_mode_refuses() {
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &beam_state(false), false, None);
+    let c = mic::compile(&f.tree("mic-beam-mode"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(c.refused());
+    assert!(c.report.refusals.iter().any(|r| r.contains("fixed-beam mode")), "{:?}", c.report.refusals);
+}
+
+/// The fixture's graph with a second beamformer (a delay-and-sum on the
+/// analysis) and a low-frequency blend unit after the main beam.
+fn blend_graph() -> String {
+    graph(None)
+        .replace(
+            "box Beam (aufx bmfd appl) 2 4\n",
+            "box Beam (aufx bmfd appl) 2 4\nbox Das (aufx bmfd appl) 1 1\nbox Lw ( aufx lwbo appl ) 3 1\n",
+        )
+        .replace(
+            "wire (Beam 0) Ns (freq [fs] 1 [blockSize])\n",
+            "wire A Das (freq [fs] [numChansIn] [blockSize])\nwire (Beam 0) (Lw 0) (freq [fs] 1 [blockSize])\n\
+             wire Das (Lw 1) (freq [fs] 1 [blockSize])\nwire Das (Lw 2) (freq [fs] 1 [blockSize])\n\
+             wire Lw Ns (freq [fs] 1 [blockSize])\n",
+        )
+}
+
+fn lwbo_state(reference: f32) -> ParamState {
+    state(&[
+        (0, reference),
+        (1, 3000.0),
+        (2, 0.0),
+        (3, 0.0),
+        (5, -90.0),
+        (6, 0.0),
+        (7, -110.0),
+        (8, 0.0),
+        (9, 0.0),
+        (10, 0.0),
+        (11, 0.0),
+        (12, 0.0),
+        (13, 0.0),
+        (14, -180.0),
+        (15, 0.0),
+        (16, 0.0),
+        (17, 0.0),
+    ])
+}
+
+#[test]
+fn a_low_frequency_blend_after_two_beamformers_compiles_and_runs() {
+    let mut f = Fixture::new();
+    f.graph = blend_graph();
+    f.effects.push(unit_effect("Das", "bmfd", &beam_state(true), false, None));
+    f.effects.push(unit_effect("Lw", "lwbo", &lwbo_state(1.0), false, None));
+    f.props.push(("Das".into(), 4630, "mic_das.plist".into()));
+    // the reference: microphone 0 alone; the main beam: twice the mean
+    f.files.push(("mic_das.plist".into(), beam_file(2, &[1.0, 0.0])));
+    f.beam = beam_file(2, &[1.0, 1.0]);
+    let b = f.tree("mic-lwbo");
+    let c = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    let st: Vec<(&str, &Status)> = c.report.stages.iter().map(|s| (s.name.as_str(), &s.status)).collect();
+    assert!(st.contains(&("Das", &Status::Exact)) && st.contains(&("Lw", &Status::Approximate)), "{st:?}");
+    let p = c.params.unwrap();
+    assert_eq!(p.refs.len(), 1);
+    assert!(matches!(p.freq[0], sgv2_core::mic::FreqStage::LowBand { compare: 0, blend: 0, .. }));
+    // it encodes, decodes and runs: under 3 kHz the beam (2 x) is limited
+    // to the reference (1 x); far over it, it passes
+    let unit = common::test_unit();
+    let blob = mic::compile_blob(
+        &f.installed("mic-lwbo-blob", "j999", &unit),
+        &Machine::with_unit("j999", &unit).unwrap(),
+        &mic::Options::default(),
+        false,
+        &mut Diagnostics::default(),
+    )
+    .unwrap()
+    .0
+    .expect("a blob");
+    let (_, q) = artifact::decode(&blob).unwrap();
+    assert_eq!(q, p);
+    let amp = |hz: f64| {
+        let mut e = Engine::new(q.clone()).unwrap();
+        let n = 24_000;
+        let x: Vec<f32> =
+            (0..n).map(|k| 0.1 * (2.0 * std::f64::consts::PI * hz * k as f64 / 48_000.0).sin() as f32).collect();
+        let mut y = vec![0.0f32; n];
+        for at in (0..n).step_by(240) {
+            e.process(&[&x[at..at + 240], &x[at..at + 240]], &mut y[at..at + 240], 240);
+        }
+        let tail = &y[12_000..];
+        (tail.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / tail.len() as f64).sqrt() * 2f64.sqrt()
+    };
+    let fs = 48_000.0;
+    let eq = |hz: f64| sgv2_core::voicing::tone::peak(-3.0, 1000.0, 1.0, fs).magnitude(hz, fs);
+    let gain = 2.0; // the Pre gain box
+    let low = amp(500.0) / (0.1 * gain * eq(500.0));
+    let high = amp(8000.0) / (0.1 * gain * eq(8000.0));
+    assert!((low - 1.0).abs() < 0.02, "500 Hz: {low}");
+    assert!((high - 2.0).abs() < 0.04, "8 kHz: {high}");
+    // another reference channel is not characterised
+    let mut f2 = Fixture::new();
+    f2.graph = blend_graph();
+    f2.effects.push(unit_effect("Das", "bmfd", &beam_state(true), false, None));
+    f2.effects.push(unit_effect("Lw", "lwbo", &lwbo_state(2.0), false, None));
+    f2.props.push(("Das".into(), 4630, "mic_das.plist".into()));
+    f2.files.push(("mic_das.plist".into(), beam_file(2, &[1.0, 0.0])));
+    let c = mic::compile(&f2.tree("mic-lwbo-ref"), &partial(), &mut Diagnostics::default()).unwrap();
     assert!(c.refused());
 }
