@@ -9,7 +9,7 @@ hand-written template and with nobody at the machine.
 
 | Item | Automatic? | What a new Mac needs |
 |---|---|---|
-| Protection unit | per type | spp3, atsp and lsm2 are at parity in the shipped policy; LSID is pending. |
+| Protection unit | per type | spp3, atsp, lsm2 and LSID's static class are at parity in the shipped policy. |
 | Kernel driver | no | A `macaudio` match entry and a device tree for the board. |
 | Tuning | yes | The installer collects the Mac's tuning bundle. |
 | Parameter blob | yes | Compiled and bound at boot by `speakerguardd-provision`. The compiler has no table of boards. |
@@ -168,8 +168,10 @@ both, so exactly one stack runs on a board:
 - the older daemons run only on kernels without that interface. On a v2
   kernel, an unqualified board stays muted at the kernel's floor.
 
-The primary unit and any LSID companion are checked separately: `lsid` is
-not at parity, so K114/K116 (AID49/50) remain muted. Parity is a property of
+The primary unit and any LSID companion are checked separately: `lsid` is at
+parity only where the compiler releases the companion on its static model
+(the four-lane J713/J813 and the six-lane K114/K116 tunings, docs/LSID.md);
+any other companion compiles muted and fails provisioning. Parity is a property of
 the unit implementation in the build, never of a board. There is no board
 allowlist. `denied_boards` and `board_overrides` (`allow` or `deny`) are
 policy data; deny wins, and an explicit allow cannot bypass any proof.

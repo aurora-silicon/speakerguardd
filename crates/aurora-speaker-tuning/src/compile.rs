@@ -668,10 +668,25 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     // so the unit never runs its estimator; beside the complete model checked
     // above it is released on that static model, which is the unit's own mode
     // when it holds no valid estimate (lsm2::companion::Companion::is_static).
+    // A six-lane companion is released the same way, its topology dropped so
+    // that no estimator is built, when none of its appended fields asks for a
+    // mechanism the static model leaves out; otherwise it stays muted.
     // Every mechanism of that model must then be representable, exactly as
     // without a companion; only the two the companion owns (system
     // identification and closed-loop temperature) are left to it, unrun.
-    let static_release = guarded && n != 6;
+    let six_lane_refusals =
+        if guarded && n == 6 { lsm2::companion::six_lane_static_refusals(&g.params) } else { Vec::new() };
+    if !six_lane_refusals.is_empty() {
+        diags.warn(
+            "lsid-six-lane-unqualified",
+            "compile",
+            format!(
+                "the six-lane model enables {}: no law for it, so the companion stays muted",
+                six_lane_refusals.join(", ")
+            ),
+        );
+    }
+    let static_release = guarded && six_lane_refusals.is_empty();
     let control_power = get(id::controller(id::C_CONTROL_POWER))? != 0.0;
 
     let flag = |i: u32| -> Result<u32> { Ok((get(i)? != 0.0) as u32) };
@@ -822,6 +837,11 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         power_soft_limit_pct: [0.0; 4],
         // spec 6.1: a legacy payload without the field maps it to 1
         power_budgets_scale: g.get(id::controller(id::C_POWER_BUDGETS_SCALE)).unwrap_or(1.0),
+        // the six-lane schema's appended controller field 27; absent from
+        // the base schema, where the temperature candidate has no floor
+        temperature_rate_factor: g
+            .get(id::controller(lsm2::companion::extension::CONTROLLER_TEMPERATURE_RATE_FACTOR))
+            .unwrap_or(0.0),
         max_power_attenuation_db: get(id::amp0(id::A_MAX_ATTENUATION))?,
         low_rail_idle_power_w: 0.0,
         low_rail_power_ratio: 0.0,
@@ -1008,17 +1028,29 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
                 get(id::model(src, ty, id::M_LR2_LE))?,
                 get(id::model(src, ty, id::M_LR2_L2))?,
             ];
-            if !lr2_omission_is_conservative(&x, branch, rate) {
+            let Some(bound) = lr2_admittance_bound(&x, branch, rate) else {
                 return Err(bad(format!(
-                    "channel {c}'s admittance inductance would raise the modeled power above the model without it, \
-                     which the current model cannot represent"
+                    "channel {c}'s admittance inductance is not a passive resistive-inductive branch, \
+                     which the current model cannot bound"
                 )));
+            };
+            x.admittance_bound = bound;
+            if bound == 1.0 {
+                diags.info(
+                    "lsm2-lr2-bounded",
+                    "compile",
+                    format!("channel {c}: the current model leaves out the admittance inductance, which only lowers the power it models"),
+                );
+            } else {
+                diags.info(
+                    "lsm2-lr2-bounded",
+                    "compile",
+                    format!(
+                        "channel {c}: the current model leaves out the admittance inductance, which would raise the power \
+                         by up to a factor {bound}: the current model is scaled by it, so the modeled power stays at or above"
+                    ),
+                );
             }
-            diags.info(
-                "lsm2-lr2-bounded",
-                "compile",
-                format!("channel {c}: the current model leaves out the admittance inductance, which only lowers the power it models"),
-            );
         }
         arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
         arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
@@ -1048,17 +1080,21 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     finish_lsm2(t, b, diags, p, static_release)
 }
 
-/// Whether running the current model without its inductive branch keeps
-/// the modeled electrical power at or above the model with it. The power
-/// path integrates `u * i` with `i` from the admittance model, so for any
-/// signal it is enough that `Re Y` without the branch is not below `Re Y`
-/// with it at any frequency up to Nyquist. The branch is
-/// `Z = j w Le + (R2 * j w L2) / (R2 + j w L2)` in series with `Rdc` and the
-/// first resonator's motional impedance `Bl^2 / (Rms + j w Mms + Kms / (j w))`.
-fn lr2_omission_is_conservative(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3], rate: u32) -> bool {
+/// The admittance bound for a current model that leaves out its inductive
+/// branch: the smallest binary32 factor `k >= 1` with `k Re Y` of the model
+/// without the branch at or above `Re Y` with it at every frequency up to
+/// Nyquist; `None` for a branch that is not passive (a negative or
+/// non-finite field). The power path integrates `u * i` with `i` from the
+/// admittance model, so for any signal scaling the current model by `k`
+/// keeps the modeled electrical power at or above the full model's. `k` is
+/// exactly 1 where leaving the branch out already only lowers `Re Y`. The
+/// branch is `Z = j w Le + (R2 * j w L2) / (R2 + j w L2)` in series with
+/// `Rdc` and the first resonator's motional impedance
+/// `Bl^2 / (Rms + j w Mms + Kms / (j w))`.
+fn lr2_admittance_bound(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3], rate: u32) -> Option<f32> {
     let (r2, le, l2) = (f64::from(r2), f64::from(le), f64::from(l2));
     if ![r2, le, l2].iter().all(|v| v.is_finite() && *v >= 0.0) {
-        return false;
+        return None;
     }
     let (rdc, bl, m, rms, k) =
         (f64::from(c.rdc), f64::from(c.bl), f64::from(c.mms_kg), f64::from(c.rms), f64::from(c.kms));
@@ -1066,19 +1102,48 @@ fn lr2_omission_is_conservative(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3],
         let n = c * c + d * d;
         ((a * c + b * d) / n, (b * c - a * d) / n)
     };
-    const POINTS: usize = 4096;
-    let (lo, hi) = (1.0f64, f64::from(rate) / 2.0);
-    (0..POINTS).all(|j| {
-        let f = lo * (hi / lo).powf(j as f64 / (POINTS - 1) as f64);
-        let w = 2.0 * core::f64::consts::PI * f;
+    // Re Y with the branch over Re Y without it, at log10 frequency x
+    let ratio = |x: f64| {
+        let w = 2.0 * core::f64::consts::PI * 10f64.powf(x);
         let motional = div((bl * bl, 0.0), (rms, w * m - k / w));
         let base = (rdc + motional.0, motional.1);
         let parallel = if r2 == 0.0 || l2 == 0.0 { (0.0, 0.0) } else { div((0.0, r2 * w * l2), (r2, w * l2)) };
         let full = (base.0 + parallel.0, base.1 + w * le + parallel.1);
-        let y_base = div((1.0, 0.0), base).0;
-        let y_full = div((1.0, 0.0), full).0;
-        y_full <= y_base * (1.0 + 1e-9)
-    })
+        div((1.0, 0.0), full).0 / div((1.0, 0.0), base).0
+    };
+    const POINTS: usize = 4096;
+    let (lo, hi) = (0.0f64, (f64::from(rate) / 2.0).log10());
+    let x = |j: usize| lo + (hi - lo) * j as f64 / (POINTS - 1) as f64;
+    let (mut best, mut at) = (f64::NEG_INFINITY, 0);
+    for j in 0..POINTS {
+        let r = ratio(x(j));
+        if !r.is_finite() {
+            return None;
+        }
+        if r > best {
+            (best, at) = (r, j);
+        }
+    }
+    // the grid's largest point, refined between its neighbours (the ratio
+    // is smooth and has one maximum there)
+    let (mut a, mut b) = (x(at.saturating_sub(1)), x((at + 1).min(POINTS - 1)));
+    for _ in 0..100 {
+        let (m1, m2) = (a + (b - a) / 3.0, b - (b - a) / 3.0);
+        if ratio(m1) < ratio(m2) {
+            a = m1;
+        } else {
+            b = m2;
+        }
+    }
+    let best = best.max(ratio(0.5 * (a + b)));
+    if best <= 1.0 + 1e-9 {
+        return Some(1.0);
+    }
+    let mut bound = best as f32;
+    if f64::from(bound) < best {
+        bound = f32::from_bits(bound.to_bits() + 1);
+    }
+    Some(bound)
 }
 
 fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params, release: bool) -> Result<Compiled> {
@@ -1119,7 +1184,8 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params, 
             channels: n as u32,
             lsm2_records: g.params.clone(),
             lsid_records: lsid.state.global().ok_or_else(|| bad("LSID global state missing"))?.params.clone(),
-            topology: lsid.topology,
+            // a released companion's estimator is never built: no topology
+            topology: if release { None } else { lsid.topology },
             flow: flow.map(|f| crate::plist::binary::write(&f.value)).unwrap_or_default(),
             property_64004,
             flow_roles: if n == 6 { Companion::six_flow_roles() } else { [[0; 2]; 6] },

@@ -95,17 +95,92 @@ pub fn extension_ids() -> Vec<u32> {
     }
     out.push(21512);
     out.extend(24576..24584);
-    for b in [25600, 26624, 27648] {
+    for b in WATERMARK_BLOCKS {
         out.extend(b..b + 4);
     }
     out.extend(1048599..1048604);
     for c in 0..8 {
         out.push(1058849 + 1024 * c);
     }
-    out.extend(1067008..1067020);
-    out.extend(1068032..1068044);
+    for b in SYSTEM_BLOCKS {
+        out.extend(b..b + 12);
+    }
     out
 }
+/// The appended six-lane fields that ask for a mechanism the static model
+/// would leave out, by name; empty when every one is inert. Fields that
+/// belong to the unrun estimator (the system-ID FFT size, the Rdc tolerance,
+/// sensitivity pairing), and parameters of a disabled mechanism, are
+/// carried and not interpreted. Anything else enabled is refused rather
+/// than dropped:
+/// - sensitivity control, MIMO compensation, the high-impedance watermark,
+///   adaptive release and power groups (laws not implemented);
+/// - a nonzero reserved pilot-tone channel selector (the pilot reserve
+///   would select an unknown block);
+/// - a thermal type with other than one speaker per channel;
+/// - the per-system power limits while the power axis is controlled (with
+///   it off and no power groups they change no gain).
+///
+/// Two appended mechanisms are run or provably dormant, so they are not
+/// refused: the temperature response-rate factor (controller field 27) is
+/// part of the temperature candidate the unit runs
+/// ([`super::Params::temperature_rate_factor`]); the displacement and
+/// velocity release times belong to adaptive release and change nothing
+/// while it is off (refused above when on).
+pub fn six_lane_static_refusals(records: &[(u32, f32)]) -> Vec<&'static str> {
+    use extension as x;
+    let get = |id: u32| records.iter().find(|r| r.0 == id).map(|r| r.1);
+    let set = |id: u32| get(id).is_some_and(|v| v != 0.0);
+    let mut out = Vec::new();
+    let mut push = |why: &'static str| {
+        if !out.contains(&why) {
+            out.push(why);
+        }
+    };
+    for manager in 0..5 {
+        for ty in 0..3 {
+            if set(ids::model(manager, ty, x::M_SENSITIVITY_ENABLE)) {
+                push("sensitivity control");
+            }
+            if set(ids::model(manager, ty, x::M_MIMO_COMPENSATION_ENABLE)) {
+                push("MIMO compensation");
+            }
+        }
+    }
+    for block in WATERMARK_BLOCKS {
+        if set(block) {
+            push("high-impedance watermark");
+        }
+    }
+    if set(ids::controller(x::CONTROLLER_ADAPTIVE_RELEASE_ENABLE)) {
+        push("adaptive release");
+    }
+    if set(ids::controller(x::CONTROLLER_NUM_POWER_GROUPS))
+        || (0..MAX_CHANNELS as u32).any(|c| set(ids::channel(c, x::CHANNEL_POWER_GROUP_NUMBER)))
+    {
+        push("power groups");
+    }
+    if set(x::PILOT_TUNING_RESERVED) {
+        push("reserved pilot-tone channel selector");
+    }
+    if (0..3).any(|ty| get(ids::thermal(ty, x::T_NUM_PARALLEL_SPEAKERS)).is_some_and(|v| v != 0.0 && v != 1.0)) {
+        push("parallel speakers per thermal type");
+    }
+    if set(ids::controller(ids::C_CONTROL_POWER)) && SYSTEM_BLOCKS.iter().any(|&b| (b..b + 12).any(&set)) {
+        push("per-system power limits");
+    }
+    if get(ids::controller(x::CONTROLLER_TEMPERATURE_RATE_FACTOR)).is_some_and(|v| !v.is_finite()) {
+        push("temperature response-rate factor");
+    }
+    out
+}
+
+/// The enable records of the three type A/B/C high-impedance watermark
+/// blocks.
+const WATERMARK_BLOCKS: [u32; 3] = [25600, 26624, 27648];
+/// The two 12-field per-system power blocks.
+const SYSTEM_BLOCKS: [u32; 2] = [1067008, 1068032];
+
 pub fn schema_ids() -> Vec<u32> {
     let mut ids = base_ids();
     ids.extend(extension_ids());
@@ -171,11 +246,16 @@ impl Companion {
         }
         validate_records(&self.lsm2_records, self.channels == 6)?;
         if self.channels == 6 {
-            if self.gates & UNQUALIFIED_FLOW == 0 || self.property_64004 != 1 || self.flow.is_empty() {
+            // A released six-lane companion is static (checked above): no
+            // topology. A gated one keeps its topology and flow gate.
+            let released = self.gates == 0;
+            if (!released && self.gates & UNQUALIFIED_FLOW == 0) || self.property_64004 != 1 || self.flow.is_empty() {
                 return Err(BlobError::Version);
             }
             lsid::Preset::decode(&self.lsid_records).map_err(|_| BlobError::Version)?;
-            self.topology.ok_or(BlobError::Channels)?.validate().map_err(|_| BlobError::Channels)?;
+            if !released {
+                self.topology.ok_or(BlobError::Channels)?.validate().map_err(|_| BlobError::Channels)?;
+            }
             if self.geometry_error().is_some() {
                 return Err(BlobError::Channels);
             }
@@ -199,12 +279,27 @@ impl Companion {
     /// point of the companion), and the governing model is the complete
     /// 1,021-record base schema, every ID bound. The companion's own records
     /// are carried opaque and never interpreted.
+    ///
+    /// A six-lane companion is the same class when the compiler drops its
+    /// twelve-lane topology (so the unit builds no estimator), its model is
+    /// the complete 1,326-record extended schema, and no appended field
+    /// asks for a mechanism the static model would leave out
+    /// ([`six_lane_static_refusals`]). The flow dictionary stays opaque: it
+    /// belongs to sensing and masking, and the unit builds no masker for
+    /// six lanes. Slow and temperature gains link across all six lanes,
+    /// never less than per controller system.
     pub fn is_static(&self) -> bool {
-        if self.channels == 6 || self.topology.is_some() || self.lsm2_records.len() != 1021 {
+        if self.topology.is_some() {
             return false;
         }
         let mut ids: Vec<u32> = self.lsm2_records.iter().map(|r| r.0).collect();
         ids.sort_unstable();
+        if self.channels == 6 {
+            return ids == schema_ids() && six_lane_static_refusals(&self.lsm2_records).is_empty();
+        }
+        if self.lsm2_records.len() != 1021 {
+            return false;
+        }
         let mut base = base_ids();
         base.sort_unstable();
         ids == base

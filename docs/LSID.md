@@ -46,16 +46,26 @@ is no estimator persistence.
 
 ## The static class
 
-One kind of companion is released. A companion that is not the six-lane schema
-has no twelve-lane topology, so the unit never builds or runs its estimator.
-Beside a complete 1,021-record LSM2 model (a short preset completed by the
-owner-local fill counts), the compiler releases it with zero gates and the
-single LSM2 unit protects on that static model. That is the unit's own mode
-when it holds no valid estimate: open-loop temperature from the type's thermal
-model and ambient, no closed-loop temperature, no measured power. The
-companion's records are carried opaque and never interpreted. The compiler
-reports `lsid-static-release`. Today this is the four-lane LSM2 tuning of the
-MacBook Air 13-inch M4 and M5 (J713 AID37, J813 AID42).
+One kind of companion is released: one whose estimator is never run, beside a
+complete LSM2 model. The single LSM2 unit protects on that static model, the
+unit's own mode when it holds no valid estimate: open-loop temperature from
+the type's thermal model and ambient, no closed-loop temperature, no measured
+power. The companion's records are carried opaque and never interpreted. The
+compiler reports `lsid-static-release`. Two layouts are in the class:
+
+- A companion that is not the six-lane schema has no twelve-lane topology, so
+  the unit never builds an estimator. Its model is the complete 1,021-record
+  schema (a short preset completed by the owner-local fill counts). Today this
+  is the four-lane LSM2 tuning of the MacBook Air 13-inch M4 and M5 (J713
+  AID37, J813 AID42).
+- A six-lane companion is released when its model is the complete 1,326-record
+  extended schema and none of the 305 appended fields asks for a mechanism the
+  static model leaves out (`lsm2::companion::six_lane_static_refusals`). The
+  compiler drops its twelve-lane topology, so no estimator is built and no
+  sense source can be bound to it. Today this is the six-lane tuning of the
+  14-inch and 16-inch M5 MacBook Pros (K114 AID49, K116 AID50). A six-lane
+  companion with any refused field keeps its gates and stays muted; the
+  compiler names the fields (`lsid-six-lane-unqualified`).
 
 The released model must be representable exactly as without a companion; the
 compiler refuses it otherwise, and the Mac stays at the kernel floor. Only the
@@ -67,17 +77,51 @@ and closed-loop temperature. Three differences follow from what is run:
   rule), so they are accepted then and refused otherwise.
 - A lane may use tuning bank 1 or 2. Without the estimator the bank only
   selects the pilot block whose amplitude the peak axis reserves.
-- The current model has no inductive branch. It is left out only where that
-  cannot lower the modeled power; see below.
+- The current model has no inductive branch. Where leaving it out could lower
+  the modeled power, the current model is scaled until it cannot; see below.
+
+### The six-lane appended fields
+
+These are run, or change nothing with the rest of the model as admitted:
+
+- `TemperatureResponseRateFactor` (controller field 27) is run. It is an
+  additive floor on the temperature candidate's allocation weight, which
+  moves the split of the allowed rise from the present voice-coil/magnet
+  proportions toward the steady-state thermal-resistance proportions:
+  `w = clamp(q^2 + factor, 0, 1)`, where `q^2` alone is the base schema's
+  weight. It applies with open-loop temperature too.
+- The displacement and velocity release times belong to adaptive release and
+  change nothing while it is off.
+- The per-system power limits change no gain with no power groups and the
+  power axis off.
+- Slow and temperature gains link across all six lanes, never per controller
+  system; thermal states stay per lane.
+- The system-ID FFT size, the Rdc tolerance, the sensitivity pairing and the
+  parameters of a disabled mechanism belong to the unrun estimator or to that
+  mechanism.
+
+Refused when set: sensitivity control, MIMO compensation, the high-impedance
+watermark, adaptive release, power groups, a nonzero reserved pilot-tone
+channel selector, other than one speaker per thermal type, and the per-system
+power limits with the power axis controlled.
 
 ### The inductive branch
 
 The admittance model of these tunings enables an inductive (LR2) branch,
 `Z = jwLe + (R2 jwL2)/(R2 + jwL2)` in series with `Rdc` and the first
-resonator. The power path integrates `u * i`, so leaving the branch out keeps
-the modeled power at or above the branch's for any signal if `Re Y` without it
-is never below `Re Y` with it. The compiler checks that from DC to Nyquist on
-the channel's own resolved model and refuses the tuning where it fails.
+resonator, and the native unit's thermal power uses it. The current model has
+no such branch. The power path integrates `u * i`, so for any signal the
+modeled power stays at or above the full model's if `k Re Y` without the
+branch is never below `Re Y` with it. The compiler finds the smallest such
+`k >= 1` from DC to Nyquist on the channel's own resolved model (refined
+around the grid's maximum, rounded up to binary32) and the unit multiplies
+the current model by it (`ChannelParams::admittance_bound`), so every thermal
+and power estimate errs high. Where leaving the branch out only lowers `Re Y`,
+`k` is exactly 1 and the current model runs as it stands, bit for bit (the
+J713 and J813 tunings). A branch that is not passive (a negative or non-finite
+field) is refused. On the K114 and K116 tunings `k` is a few percent above 1,
+from a band just above the woofers' and tweeters' resonance where the branch's
+inductance cancels part of the motional reactance.
 
 The specification does not name the branch's three fields. We read them as R2,
 Le and L2 because that order fits our own V/I sense measurements of a J713's
