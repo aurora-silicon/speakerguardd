@@ -35,7 +35,7 @@
 //! | `fft` pair | the short-time transform, quadrant window, frame phase 0 (black-box exact) | exact |
 //! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
 //! | `aufx/sens` | the noise-floor suppressor (`sgv2_core::mic::sens`): the strip's global parameters and the property-1000 noise profile; artifact step fitted, TODO(SPEC) | approximate |
-//! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, unmeasured, TODO(SPEC) | approximate |
+//! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, unmeasured, so partial blobs only until measured, TODO(SPEC) | uncharacterised |
 //! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
 //! | bypassed in the strip | nothing | bypassed |
 //! | anything else | refused, partial or not | refused |
@@ -1228,13 +1228,18 @@ fn fan_out(c: &FanCtx<'_>, node: &str, r: &mut Report) -> Result<Fan> {
         &lname,
         &kind_name(lbox),
         "freq",
-        Status::Approximate,
+        Status::Uncharacterised,
         format!(
-            "low-frequency blend: beam {main}, comparison {cmp}, blend reference {bl}; boost limit under {} Hz, crossover {}..{} Hz",
+            "low-frequency blend (law from the behaviour summary, not yet measured against the unit): beam {main}, comparison {cmp}, blend reference {bl}; boost limit under {} Hz, crossover {}..{} Hz",
             law.cutoff_hz, law.xover_min_hz, law.xover_max_hz
         ),
     );
     r.todo("lwbo law from the clean summary only (target search, hold/smoother order, crossfade width); no black-box renders");
+    if !c.opts.allow_partial {
+        r.refusals.push(format!(
+            "{lname} (aufx/lwbo) is not yet measured against the unit; --allow-partial carries the summary law"
+        ));
+    }
     if !beams.iter().all(|x| out.contains(x)) {
         return Err(bad(format!("{node} feeds a beamformer the blend unit does not take")));
     }
