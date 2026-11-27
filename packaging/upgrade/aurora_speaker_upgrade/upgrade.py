@@ -1009,7 +1009,14 @@ def back_to_legacy(store, state, mode, card):
 def cmd_revert(a):
     store = Store(a.store)
     state = store.state()
-    if not state and not os.path.exists(store.root):
+    # Nothing was ever switched or stored here: no store, or only the record
+    # of an earlier --revert (a never-upgraded Mac, or after --purge). Then
+    # there is nothing to put back, and provision.conf stays as it is.
+    try:
+        kept = set(os.listdir(store.root))
+    except FileNotFoundError:
+        kept = set()
+    if not state and kept <= {REVERTED}:
         record_revert(store)
         say("nothing to revert: this Mac was never upgraded; the boot unit leaves it on the legacy protection "
             "until 'aurora-speaker-upgrade run' switches")

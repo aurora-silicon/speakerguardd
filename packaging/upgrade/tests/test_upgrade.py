@@ -548,6 +548,25 @@ class RevertSticks(unittest.TestCase):
         self.boot()
         self.assertEqual(self.calls, 2)
 
+    def test_a_second_revert_keeps_provision_conf(self):
+        # A never-upgraded Mac, and a Mac after --revert --purge: the store
+        # holds only the revert record, so a second --revert must not run
+        # the rollback (which removes a provision.conf it did not write).
+        from unittest import mock
+        calls = []
+        with mock.patch.object(self.up, "back_to_legacy", lambda *a: calls.append(a)):
+            self.revert()
+            self.revert()
+        self.assertEqual(calls, [])
+        import shutil
+        shutil.rmtree(self.dir)
+        self.switched_store()
+        with mock.patch.object(self.up, "back_to_legacy", lambda *a: calls.append(a)):
+            self.revert(purge=True)
+            self.revert()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(os.listdir(self.dir), ["reverted.json"])
+
     def test_status_reports_it(self):
         self.assertEqual(self.up.boot_migration(self.a()), "playback rows on record")
         self.revert()
