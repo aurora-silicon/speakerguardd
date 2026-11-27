@@ -127,6 +127,33 @@ def speaker_id(identity, chosen=CHOSEN_SPID, dirs=INSTALLER_BUNDLES):
     return None, False, "none"
 
 
+def installer_fill_build(identity, aid, dirs=INSTALLER_BUNDLES, pinned_builds=None):
+    """The macOS build recorded in this unit's installer lsm2 readback for
+    this AID, or None. Follows dirs order (matching installer_fill) and
+    requires a readable lsm2-param-fill.bin; when pinned_builds is given,
+    prefers the first eligible readback whose build is in pinned_builds."""
+    if not getattr(identity, "unit", None):
+        return None
+    found = []
+    for d, m in _own_manifests(identity, dirs):
+        fill = m.get("lsm2_param_fill")
+        if m.get("aid") != aid or not isinstance(fill, dict) or not isinstance(fill.get("macos_build"), str):
+            continue
+        try:
+            sz = os.path.getsize(os.path.join(d, lsm2_fill.NAME))
+        except OSError:
+            continue
+        if 0 < sz <= lsm2_fill.MAX_BYTES:
+            found.append(fill["macos_build"])
+    if not found:
+        return None
+    if pinned_builds is not None:
+        for b in found:
+            if b in pinned_builds:
+                return b
+    return found[0]
+
+
 def installer_fill(identity, aid, dirs=INSTALLER_BUNDLES):
     """[(directory, lsm2 readback bytes)] from this unit's installer bundles
     for this AID; collect.attach_fill decides whether one fits."""

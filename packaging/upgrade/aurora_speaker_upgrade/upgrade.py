@@ -171,7 +171,15 @@ def from_ipsw(identity, a, spid, known, scratch):
     # connects only after login), a timeout or a server error is Retry, which
     # leaves no refusal record, so the next boot tries again.
     try:
-        vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw)
+        pinned_builds = [b for b, _ in ipsw.pin()[1]]
+    except ipsw.IpswError:
+        pinned_builds = None
+    preferred = unit.installer_fill_build(identity, f"AID{identity.acoustic}",
+                                          getattr(a, "installer_dirs", collect.INSTALLER_BUNDLES),
+                                          pinned_builds=pinned_builds)
+    try:
+        kw = {"preferred_build": preferred} if preferred else {}
+        vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw, **kw)
     except ipsw.IpswUnavailable as e:
         raise Retry(f"the pinned restore image cannot be read now: {e}") from None
     except ipsw.IpswError as e:
