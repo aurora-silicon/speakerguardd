@@ -23,6 +23,7 @@ const SKIP: &[&str] = &[
     "aurora-speaker-tuning/src/lsid.rs",
     "aurora-speaker-tuning/src/lattice.rs",
     "aurora-speaker-tuning/src/machine.rs",
+    "aurora-speaker-tuning/src/mic.rs",
     "aurora-speaker-tuning/src/units.rs",
     "aurora-speaker-tuning/src/voicing/parity.rs",
     "sgv2-core/src/spp3.rs",
@@ -36,7 +37,30 @@ const SKIP: &[&str] = &[
     "sgv2-core/src/ring.rs",
     "sgv2-core/src/machine.rs",
     "sgv2-core/src/placeholder.rs",
+    "sgv2-core/src/mic",
 ];
+
+/// Modules in `SKIP` whose declaration line (`pub mod NAME;` in the crate
+/// root, relative to `crates/`) is left out of the hash too: the built-in
+/// microphone chain, which shares the crates but never renders the voicing.
+const SKIP_DECLARATIONS: &[(&str, &str)] =
+    &[("aurora-speaker-tuning/src/lib.rs", "pub mod mic;"), ("sgv2-core/src/lib.rs", "pub mod mic;")];
+
+/// A hashed file's bytes, without the declarations of `SKIP_DECLARATIONS`.
+fn hashed(rel: &str, data: Vec<u8>) -> Vec<u8> {
+    let drop: Vec<&str> = SKIP_DECLARATIONS.iter().filter(|(f, _)| *f == rel).map(|(_, l)| *l).collect();
+    if drop.is_empty() {
+        return data;
+    }
+    let text = String::from_utf8(data).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if !drop.contains(&line.trim_end()) {
+            out.push_str(line);
+        }
+    }
+    out.into_bytes()
+}
 
 fn walk(base: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
     if SKIP.contains(&rel) {
@@ -69,7 +93,7 @@ fn main() {
     let mut h = Sha256::new();
     h.update(b"sgv2 voicing law v1\n");
     for (rel, p) in &files {
-        let data = std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let data = hashed(rel, std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())));
         h.update(rel.as_bytes());
         h.update([0]);
         h.update((data.len() as u64).to_le_bytes());

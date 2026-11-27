@@ -958,6 +958,40 @@ class NoSensePath(unittest.TestCase):
             wiring.derive(f["hw"], f["tuning"])
         self.assertIn("one amp only", str(cm.exception))
 
+    def test_aop_dma_sense_follows_the_named_channel(self):
+        # t8152_aop_audio (T8142, T6050): the J815 names "sense" and keeps
+        # its sense and its hash; without it, it is refused (its spp3 unit
+        # reads sense, and six amps could not run without it anyway).
+        f = fx("j815")
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr", "sense", "hpai"]]
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertEqual(wiring.derive(f["hw"], f["tuning"])["hash"], "725f518662e42388")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr"]]
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f["tuning"]["tuning"]["protection"]["kind"] = "lsm2"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_t6050_one_amp_without_sense(self):
+        # The M5 Mac Studio's shape: one SN012776 on the T6050 AOP whose
+        # audio node names no "sense" (its ADT audio-speaker is TX only).
+        f = j773g(("cout", "cin", "spkr"))
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["cpu_compatible"] = [["apple,t6050-aop-audio"]]
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertTrue(w["no_sense_path"])
+        self.assertEqual((w["unit_channels"], w["sense"]), ([0], []))
+        self.assertEqual(sgsc.method_of(w), "derived-nosense")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr", "sense"]]
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertFalse(wiring.derive(f["hw"], f["tuning"])["no_sense_path"])
+
     def test_static_report_names_the_no_sense_case(self):
         f = j773g()
         w = wiring.derive(f["hw"], f["tuning"])
@@ -979,6 +1013,85 @@ class NoSensePath(unittest.TestCase):
         self.assertEqual(link["cpu_dma_names"], [["spkr", "cout", "cin"]])
         self.assertFalse(wiring.transport_senses(got))
         self.assertEqual(wiring.derive(got, j773g()["tuning"])["hash"], "d1d62e8a0aaaef3d")
+
+
+class RunLockedDispatch(unittest.TestCase):
+    """run_locked() proves each method on its own branch, and fails closed on
+    a method no branch names."""
+
+    def run_with(self, w, defer=False):
+        import tempfile
+        import types
+
+        f = j773g()
+        desc = wiring.describe(f["hw"], w)
+        calls = []
+
+        def static(idx, w2, report):
+            calls.append(("static", w2["method"]))
+            report["static"] = "spy"
+            return []
+
+        def active(idx, card, w2, report, args=None):
+            calls.append(("active", w2["method"]))
+            return []
+
+        with tempfile.TemporaryDirectory() as d:
+            params = os.path.join(d, "params.bin")
+            with open(params, "wb") as fh:
+                fh.write(b"params")
+            args = types.SimpleNamespace(state=d, params=params, force=False, defer=defer,
+                                         deferred=os.path.join(d, "deferred"))
+            with mock.patch.object(sgsc, "lv2_shadows", return_value=[]), \
+                    mock.patch.object(sgsc, "derive_live", return_value=(f["hw"], w, desc, [])), \
+                    mock.patch.object(sgsc, "blob_rate", return_value=w["rate"]), \
+                    mock.patch.object(sgsc, "read_bind", return_value={}), \
+                    mock.patch.object(sgsc, "find_card", return_value=(0, desc["card"])), \
+                    mock.patch.object(sgsc, "set_deferred"), \
+                    mock.patch.object(sgsc, "static", side_effect=static), \
+                    mock.patch.object(sgsc, "active", side_effect=active), \
+                    mock.patch.object(sgsc, "log"):
+                rc = sgsc.run_locked(args)
+            with open(os.path.join(d, "selfcheck.json")) as fh:
+                rec = json.load(fh)["record"]
+        return rc, rec, calls
+
+    def derived_j773g(self):
+        f = j773g()
+        w = wiring.derive(f["hw"], f["tuning"])
+        w["method"] = sgsc.method_of(w)
+        return w
+
+    def test_a_no_sense_mac_takes_the_static_branch(self):
+        for defer in (False, True):
+            rc, rec, calls = self.run_with(self.derived_j773g(), defer=defer)
+            self.assertEqual(calls, [("static", "derived-nosense")], defer)
+            self.assertEqual((rc, rec["result"], rec["method"], rec["sense"]), (0, "pass", "derived-nosense", 0), defer)
+
+    def test_an_unknown_method_fails_closed(self):
+        w = self.derived_j773g()
+        w["method"] = "derived-unproven"
+        rc, rec, calls = self.run_with(w)
+        self.assertEqual(calls, [])
+        self.assertEqual((rc, rec["result"]), (1, "fail"))
+        self.assertTrue(any("derived-unproven" in r for r in rec["reasons"]), rec["reasons"])
+
+
+class NoSenseUnits(unittest.TestCase):
+    def test_only_the_units_that_run_without_sense(self):
+        # an allowlist: atsp and plain lsm2 run on a transport without sense
+        for kind in wiring.NO_SENSE_UNITS:
+            f = j773g()
+            f["tuning"]["tuning"]["protection"]["kind"] = kind
+            self.assertTrue(wiring.derive(f["hw"], f["tuning"])["no_sense_path"], kind)
+        # anything else is refused there, a unit added later included
+        for kind in ("spp3", "lsid", "spp4"):
+            f = j773g()
+            f["tuning"]["tuning"]["protection"]["kind"] = kind
+            with self.assertRaises(wiring.Refused, msg=kind) as cm:
+                wiring.derive(f["hw"], f["tuning"])
+            self.assertIn("carries none", str(cm.exception), kind)
+        self.assertFalse(set(wiring.SENSE_UNITS) & set(wiring.NO_SENSE_UNITS))
 
 
 class NoHandMap(unittest.TestCase):

@@ -191,6 +191,52 @@ class Checks(unittest.TestCase):
         self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
 
 
+class MachineFromReport(unittest.TestCase):
+    """The helper's channel counts are the graph's: the self-check's machine
+    description, not the record's sense map (an ATSP unit takes no sense)."""
+
+    def _machine(self, m, report):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "selfcheck.json")
+            with open(path, "w") as f:
+                json.dump(report, f)
+            return sgs.machine(type("A", (), {"selfcheck": path, "machine": m})())
+
+    def _report(self, m):
+        c, w = gen.machine(m)
+        # the record's sense count is the wiring's sense map (its sense ports)
+        rec = {"key": m, "result": "pass", "card": c["card"], "amps": c["amps"], "sense": len(w[1])}
+        return c, w, {"record": rec, "machine": c}
+
+    def test_every_machine_links_its_amps_on_the_generated_graph(self):
+        for m in MACHINES:
+            c, _, report = self._report(m)
+            got = self._machine(m, report)
+            self.assertEqual((got["amps"], got["sense"]), (c["amps"], c["sense"]), m)
+            g, p, _ = build(m, linked=False)
+            s = sgs.Session(m, dict(c, **got))
+            s.cli = None
+            self.assertEqual(s.wanted(g)[:c["amps"]], list(zip(p["pout"], p["spk"])), m)
+
+    def test_the_j473_sense_map_is_not_a_sense_node(self):
+        c, w, report = self._report("j473")
+        self.assertEqual((len(w[1]), c["sense"]), (2, 0))
+        self.assertEqual(self._machine("j473", report)["sense"], 0)
+        g, p, _ = build("j473", linked=False)
+        s = sgs.Session("j473", dict(c, **self._machine("j473", report)))
+        s.cli = None
+        self.assertEqual(s.wanted(g), list(zip(p["pout"], p["spk"])))
+
+    def test_a_report_without_a_machine_description_or_for_another_machine_exits(self):
+        c, _, report = self._report("j473")
+        with self.assertRaises(SystemExit):
+            self._machine("j473", {"record": report["record"]})
+        with self.assertRaises(SystemExit):
+            self._machine("j473", dict(report, machine=dict(c, key="j413")))
+
+
 class AmpsUnity(unittest.TestCase):
     def _run(self, props):
         g, _, s = build("j316")

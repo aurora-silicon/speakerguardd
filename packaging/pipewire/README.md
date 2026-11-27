@@ -82,3 +82,18 @@ binary and both Turtle files together. The DSP core and artifact decoder
 remain `no_std`; the existing LV2 host shim uses `std` for non-RT loading.
 All chain storage is allocated before `run()`, which chunks host callbacks
 into at most 512 frames without allocation, locks, file I/O or logging.
+
+## Built-in microphone (example)
+
+`examples/sgv2-mic-capture.conf.example` is an example, not a generated
+file: a capture filter-chain around the `#mic-{1,2,3,4}ch` plugin
+(`crates/sgv2-lv2/src/mic.rs`) that publishes the processed channel as the
+virtual source "Built-in Microphone" and leaves the raw capture node in
+place. The plugin loads `$SGV2_MIC_PARAMS`, else
+`/run/speakerguardd/mic.bin`, written by
+`aurora-speaker-tuning mic-compile` from the Mac's own bundle; a blob for
+another board, rate or microphone count gives silence and health 1. The
+compile refuses (no blob) when a stage is not characterised;
+`--allow-partial` carries the stages documented as transparent or
+attenuating as identity and flags the blob partial. Session wiring,
+provisioning and WirePlumber priorities are not part of this example.

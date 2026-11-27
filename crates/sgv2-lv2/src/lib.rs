@@ -53,6 +53,7 @@
 pub mod attach;
 pub mod gate;
 pub mod handoff;
+pub mod mic;
 pub mod page;
 pub mod preroll;
 pub mod ttl;
@@ -657,9 +658,16 @@ const _: () = assert!(DESCRIPTORS.len() == VARIANTS.len());
 /// The LV2 entry point.
 #[no_mangle]
 pub extern "C" fn lv2_descriptor(index: u32) -> *const Lv2Descriptor {
-    DESCRIPTORS
-        .get(index as usize)
-        .map_or_else(|| voicing::descriptor(index as usize - DESCRIPTORS.len()), |d| d as *const _)
+    let i = index as usize;
+    if let Some(d) = DESCRIPTORS.get(i) {
+        return d as *const _;
+    }
+    let i = i - DESCRIPTORS.len();
+    if i < voicing::VARIANTS.len() {
+        voicing::descriptor(i)
+    } else {
+        mic::descriptor(i - voicing::VARIANTS.len())
+    }
 }
 
 #[cfg(test)]
@@ -846,7 +854,8 @@ mod tests {
         let d = lv2_descriptor(0);
         assert!(!d.is_null());
         assert!(!lv2_descriptor(VARIANTS.len() as u32).is_null());
-        assert!(lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len()) as u32).is_null());
+        assert!(!lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len()) as u32).is_null());
+        assert!(lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len() + mic::VARIANTS.len()) as u32).is_null());
         unsafe {
             let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
             // past the ramp in that follows activate (gate::RAMP_IN_MS)

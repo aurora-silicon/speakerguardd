@@ -96,5 +96,26 @@ pub fn generate() -> (String, String) {
         p.push_str(&ports.join(" ,\n    "));
         p.push_str(" .\n");
     }
+    for &(u, n) in crate::mic::VARIANTS {
+        let _ = write!(
+            m,
+            "\n<{}>\n    a lv2:Plugin ;\n    lv2:binary <libsgv2_lv2.so> ;\n    rdfs:seeAlso <sgv2.ttl> .\n",
+            uri(u)
+        );
+        let _ = write!(p, "\n<{}>\n    a lv2:Plugin, lv2:UtilityPlugin ;\n    doap:name \"sgv2 built-in microphone ({n} mics)\" ;\n    doap:license <https://opensource.org/licenses/MIT> ;\n    lv2:optionalFeature lv2:hardRTCapable ;\n    lv2:port ", uri(u));
+        let mut ports = Vec::new();
+        for c in 0..n {
+            ports.push(format!(
+                "[ a lv2:AudioPort, lv2:InputPort ; lv2:index {c} ; lv2:symbol \"in_{c}\" ; lv2:name \"Mic {c}\" ]"
+            ));
+        }
+        ports.push(format!(
+            "[ a lv2:AudioPort, lv2:OutputPort ; lv2:index {n} ; lv2:symbol \"out\" ; lv2:name \"Out\" ]"
+        ));
+        ports.push(format!("[ a lv2:ControlPort, lv2:OutputPort ; lv2:index {} ; lv2:symbol \"latency\" ; lv2:name \"Latency\" ; lv2:designation lv2:latency ; lv2:portProperty lv2:reportsLatency, lv2:integer ]", n + 1));
+        ports.push(format!("[ a lv2:ControlPort, lv2:OutputPort ; lv2:index {} ; lv2:symbol \"health\" ; lv2:name \"Health\" ; lv2:portProperty lv2:integer ]", n + 2));
+        p.push_str(&ports.join(" ,\n    "));
+        p.push_str(" .\n");
+    }
     (m, p)
 }

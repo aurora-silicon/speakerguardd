@@ -134,8 +134,11 @@ TRANSPORTS = {
                               "speaker_irq": True},
     # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
     # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    # As there, the sense is the audio node's "sense" DMA channel: a Mac
+    # whose AOP speaker stream carries none (the M5 Mac Studio's ADT
+    # audio-speaker has one TX slot and no RX slot) names none.
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
-                              "speaker_irq": False},
+                              "speaker_irq": False, "speaker_dma": "spkr", "sense_dma": "sense"},
 }
 # The T6050 (J714s) is the same driver's T6050 configuration: six amps on the
 # T8142 transport.
@@ -164,6 +167,10 @@ SENSE_HEADROOM = 512
 PLUGINS = {(1, 0): "1ch", (2, 0): "2ch", (2, 4): "2ch-vi", (4, 0): "4ch", (4, 8): "4ch-vi", (6, 12): "6ch-vi"}
 # The protection units that model from the amps' V/I sense.
 SENSE_UNITS = ("spp3",)
+# The protection units that run without it (atsp open loop, lsm2 from its
+# model alone): the only ones a transport that carries no sense admits. An
+# allowlist, so that a unit added later is refused there until it is named.
+NO_SENSE_UNITS = ("atsp", "lsm2")
 
 _PREFIX = re.compile(r"^(?:(Left|Right)\s+)?(Woofer|Tweeter|Speaker|Full[- ]Range)(?:\s+(\d+))?$")
 _ROLES = {"woofer": "woofer", "tweeter": "tweeter", "speaker": "full", "full-range": "full", "full range": "full"}
@@ -1166,8 +1173,11 @@ def derive(hw, dump, key=None):
     amps = hardware(hw)
     rl = roles(dump)
     no_sense_path = any(a.get("no_sense_path") for a in amps)
-    if no_sense_path and rl["kind"] in SENSE_UNITS:
-        raise Refused(f"the tuning's {rl['kind']} protection reads V/I sense, and this Mac's speaker transport carries none")
+    if no_sense_path and rl["kind"] not in NO_SENSE_UNITS:
+        raise Refused(
+            f"the tuning's {rl['kind']} protection is not one that runs without V/I sense "
+            f"({', '.join(NO_SENSE_UNITS)}), and this Mac's speaker transport carries none"
+        )
     # Without sense, nothing checks which amp plays which unit channel: one
     # amp has no order to get wrong, several would rest on the device tree
     # alone. A sense-capable Mac whose device tree lost its sense channel
