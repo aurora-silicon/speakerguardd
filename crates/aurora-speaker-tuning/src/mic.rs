@@ -1068,10 +1068,32 @@ fn split_region(g: &Graph, split: &str) -> Result<(Graph, String, Vec<String>)> 
     wires.insert(0, a);
     wires.push(z);
     sub.wires = wires;
-    sub.params.clear();
-    sub.param_links.clear();
+    // Graph parameters reach the region's boxes unchanged: keep the
+    // declarations and every link into a region box (the caller passes the
+    // resolved values). A link that crosses the region boundary (a
+    // parameter box outside driving a box inside, or the reverse) or a
+    // property link into the region cannot be preserved: refuse.
+    for l in &g.box_param_links {
+        if keep(&l.from.node) != keep(&l.to.node) {
+            return Err(bad(format!(
+                "split region of {split}: parameter link {} -> {} crosses the region",
+                l.from.node, l.to.node
+            )));
+        }
+    }
+    if let Some(l) = g.box_property_links.iter().find(|l| keep(&l.from.node) || keep(&l.to.node)) {
+        return Err(bad(format!(
+            "split region of {split}: property link {} -> {} not carried",
+            l.from.node, l.to.node
+        )));
+    }
+    if let Some(l) = g.property_links.iter().find(|l| keep(&l.target.node)) {
+        return Err(bad(format!("split region of {split}: property {} -> {} not carried", l.name, l.target.node)));
+    }
+    sub.param_links.retain(|l| keep(&l.target.node));
     sub.box_param_links.retain(|l| keep(&l.from.node) && keep(&l.to.node));
-    sub.box_property_links.retain(|l| keep(&l.from.node) && keep(&l.to.node));
+    sub.box_property_links.clear();
+    sub.property_links.clear();
     Ok((sub, join, members))
 }
 
@@ -1537,7 +1559,7 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                         graph: &sub_g,
                         strip: &strip,
                         props: props.as_ref(),
-                        parent_params: &BTreeMap::new(),
+                        parent_params: &graph_params,
                         width: in_w,
                         fs: fs as f64,
                         dev_drop_tone_types: opts.dev_drop_tone_types,
