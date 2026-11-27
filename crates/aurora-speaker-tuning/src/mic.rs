@@ -18,20 +18,25 @@
 //! outputs may only end in `dead` boxes; a box with several inputs takes
 //! the same source on each, as the beamformer takes the analysis spectrum
 //! on both of its buses). The first `fft` box on the path is the analysis,
-//! the second the synthesis, and exactly one beamformer sits between them.
+//! the second the synthesis, and exactly one beamformer sits between them,
+//! or one fan-out: the analysis feeding several beamformers whose outputs
+//! 0 meet in one low-frequency blend unit (`aufx/lwbo`, inputs beam,
+//! comparison reference, blend reference) that continues the path.
 //!
 //! **Boxes**, by kind, with what the report calls them:
 //!
 //! | box | carried as | status |
 //! |---|---|---|
-//! | `aufx/dccb` | DC blocker: Butterworth high-pass at parameter 0 (Hz), gain parameter 2 (dB); start ramp parameter 1 (ms) as a linear fade-in, TODO(SPEC) | approximate |
+//! | `aufx/dccb` | DC blocker: Butterworth high-pass at parameter 0 (Hz), gain parameter 2 (dB), linear start ramp over parameter 1 (ms) from the first nonzero block; steady state black-box exact, the output during the ramp TODO(SPEC) | approximate |
 //! | `gain`, `dbgn` builtins | parameter 0: a linear factor (`gain`) or dB (`dbgn`); parameter 1 must be 0 | exact |
 //! | `aufx/tmst` | the voicing chain's filter box (`crate::prestage::voicing_tone`), at its saved state; notch slots (type 6) by [`notch`] | exact |
 //! | `aufx/dspg` (nested graph) | its graph, flattened ([`nested`]) | exact when every box in it is |
 //! | `reblocker`, `dead` | nothing (structure) | structural |
-//! | `fft` pair | the short-time transform; window and frame phase TODO(SPEC) | approximate |
-//! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file; adaptive parts TODO(SPEC) | approximate |
-//! | `aufx/sens`, `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
+//! | `fft` pair | the short-time transform, quadrant window, frame phase 0 (black-box exact) | exact |
+//! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
+//! | `aufx/sens` | the noise-floor suppressor (`sgv2_core::mic::sens`): the strip's global parameters and the property-1000 noise profile; artifact step fitted, TODO(SPEC) | approximate |
+//! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, unmeasured, so partial blobs only until measured, TODO(SPEC) | uncharacterised |
+//! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
 //! | bypassed in the strip | nothing | bypassed |
 //! | anything else | refused, partial or not | refused |
 //!
@@ -39,7 +44,11 @@
 //! stage is uncharacterised or refused. `allow_partial` admits the
 //! uncharacterised ones as identity and flags the blob partial; a refused
 //! stage refuses always. No value is ever invented: a stage is the Mac's
-//! data through a stated law, identity, or a refusal.
+//! data through a stated law, identity, or a refusal. Where the clean
+//! behaviour summary leaves a law's detail open, an approximate stage uses
+//! the closest reading of the summary, with any constant fitted to
+//! black-box renders of the installed unit; its report lists each one as a
+//! TODO(SPEC).
 //!
 //! **Binding.** As the speaker blob ([`crate::compile`]): the board, the
 //! acoustic ID and, when known on both sides, the unit must be this Mac's.
@@ -62,6 +71,15 @@ use std::collections::BTreeMap;
 pub const MIC_DEVICE: &str = "Built-in Microphone";
 /// The beamformer's property carrying its coefficient file.
 pub const PROP_BEAM_FILE: u32 = 4630;
+/// The suppressor's property carrying its noise profile file.
+pub const PROP_SENS_FILE: u32 = 1000;
+/// The suppressor's processing mode (parameter 1) the black-box renders
+/// cover: the unit's default (its parameter information's default, also its
+/// maximum); any other refuses.
+pub const SENS_MODE: f64 = 6.0;
+/// The suppressor's autoregressive order. TODO(SPEC): fitted to black-box
+/// renders (the summary names the estimator, not its order).
+pub const SENS_ORDER: usize = 48;
 /// A nested graph box's graph, property strip and AU strip properties.
 pub const PROP_GRAPH: u32 = u32::from_be_bytes(*b"dspg");
 pub const PROP_PROPSTRIP: u32 = u32::from_be_bytes(*b"pstp");
@@ -69,7 +87,7 @@ pub const PROP_AUSTRIP: u32 = u32::from_be_bytes(*b"ausp");
 /// Unit kinds documented as transparent at normal levels or as attenuating
 /// only (noise suppressors): the only ones a partial blob may carry as
 /// identity.
-pub const TRANSPARENT_OR_ATTENUATING: &[&str] = &["sens", "ocns"];
+pub const TRANSPARENT_OR_ATTENUATING: &[&str] = &["ocns"];
 
 /// Compile options. The transform defaults are the best fit to black-box
 /// renders so far (TODO(SPEC)); the others exist to test alternatives.
@@ -87,17 +105,24 @@ pub struct Options {
     /// no blob is ever written with it; the offline harness uses it to
     /// measure what an uncarried slot type does.
     pub dev_drop_tone_types: u64,
+    /// The suppressor's autoregressive order (default [`SENS_ORDER`]).
+    pub sens_order: usize,
+    /// Development analysis only: replace the DC blocker's ramp time, ms
+    /// (adds a refusal: never a blob).
+    pub dev_dccb_ramp_ms: Option<f64>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             allow_partial: false,
-            window: Window::Vorbis,
+            window: Window::Quadrant,
             half_offset: false,
             frame_phase: 0,
             beam_eq: false,
             dev_drop_tone_types: 0,
+            sens_order: SENS_ORDER,
+            dev_dccb_ramp_ms: None,
         }
     }
 }
@@ -459,6 +484,41 @@ pub fn notch(f0: f64, q: f64, fs: f64) -> sgv2_core::prestage::Section {
 /// Slot type 6 (see [`notch`]).
 const NOTCH_SLOT: f64 = 6.0;
 
+/// Slot type 20: the phase companion of a Linkwitz-Riley crossover of the
+/// slot's order (slot parameter 5) at the slot frequency. Its magnitude is
+/// flat; its phase is that of the crossover's summed bands, i.e. the
+/// all-pass with the poles of a Butterworth low-pass of half the order
+/// (measured on the unit: flat magnitude, group delay within 0.4 samples of
+/// the Butterworth-3 all-pass for an order-6 slot at its frequency).
+const PHASE_SLOT: f64 = 20.0;
+
+/// The all-pass with the poles of a digital Butterworth low-pass of order
+/// `n` at `f0` (bilinear, prewarped), as second-order sections (a real
+/// pole gets a first-order section in biquad form).
+pub fn butterworth_allpass(n: usize, f0: f64, fs: f64) -> Vec<sgv2_core::prestage::Section> {
+    let wc = 2.0 * fs * (std::f64::consts::PI * f0 / fs).tan();
+    let k2 = 2.0 * fs;
+    let mut out = Vec::new();
+    // analog prototype poles in the upper half plane plus the real one
+    for k in 0..n.div_ceil(2) {
+        let theta = std::f64::consts::PI * (2 * k + n + 1) as f64 / (2 * n) as f64;
+        let (sr, si) = (wc * theta.cos(), wc * theta.sin());
+        // bilinear z = (k2 + s) / (k2 - s)
+        let (nr, ni) = (k2 + sr, si);
+        let (dr, di) = (k2 - sr, -si);
+        let den = dr * dr + di * di;
+        let (zr, zi) = ((nr * dr + ni * di) / den, (ni * dr - nr * di) / den);
+        if si.abs() < 1e-9 * wc {
+            // real pole z = zr: H = (-zr + z^-1) / (1 - zr z^-1)
+            out.push(sgv2_core::prestage::Section { b0: -zr, b1: 1.0, b2: 0.0, a1: -zr, a2: 0.0 });
+        } else {
+            let (a1, a2) = (-2.0 * zr, zr * zr + zi * zi);
+            out.push(sgv2_core::prestage::Section { b0: a2, b1: a1, b2: 1.0, a1, a2 });
+        }
+    }
+    out
+}
+
 /// A filter box at its saved state (the shared filter-box law,
 /// `crate::prestage::voicing_tone`, at the box's saved SystemVolume, as the
 /// speaker voicing carries a box the graph does not drive), as chain nodes
@@ -481,6 +541,38 @@ fn tone_nodes(bx: &GraphBox, e: &Effect, width: usize, overrides: &[(u32, f64)],
     for slot in 0..50u32 {
         let at = 14 + 10 * slot;
         let running = get(at).is_some_and(|st| (st as u32) & 2 != 0);
+        if running && get(at + 1) == Some(PHASE_SLOT) {
+            let (gain, f0, order) =
+                (get(at + 2).unwrap_or(f64::NAN), get(at + 3).unwrap_or(f64::NAN), get(at + 5).unwrap_or(f64::NAN));
+            let group = get(at + 9).unwrap_or(0.0);
+            let even = order.fract() == 0.0 && (2.0..=16.0).contains(&order) && (order as u32) % 2 == 0;
+            if gain != 0.0
+                || !even
+                || !(f0 > 0.0 && f0 < fs / 2.0)
+                || group.fract() != 0.0
+                || !(0.0..10.0).contains(&group)
+            {
+                return Err(bad(format!(
+                    "filter box {}: phase slot {slot}: gain {gain}, frequency {f0}, order {order}, group {group}",
+                    bx.name
+                )));
+            }
+            if !crate::prestage::automation(&base).is_empty() {
+                return Err(bad(format!("filter box {}: phase slot {slot} in a box with volume automation", bx.name)));
+            }
+            off.push((at, 0.0));
+            if group_bypass >> (group as u32) & 1 != 0 {
+                continue;
+            }
+            // Measured: the phase companion acts on every channel of the box
+            // (whole-graph renders match to 64 dB only so); slot word 7 is
+            // not a channel mask for this type.
+            let ap = butterworth_allpass(order as usize / 2, f0, fs);
+            for n in notches.iter_mut() {
+                n.extend_from_slice(&ap);
+            }
+            continue;
+        }
         if !running || get(at + 1) != Some(NOTCH_SLOT) {
             continue;
         }
@@ -684,6 +776,131 @@ pub fn beam(file: &Dict, mics: usize, bins: usize, fs: u32, use_eq: bool, notes:
     }
     let eq = if use_eq { Some(be_f32s(b0.get("EQSelection"), bins, "EQSelection")?) } else { None };
     Ok(Beam { mics, bins, weights, eq })
+}
+
+/// The beamformer's fixed-beam mode: the automatic-selection switches
+/// (controls 1, 3, 4, 5), the selection-metric normalisations (21, 22),
+/// boost limiting (23) and the uplink switch crossfade (42) off, the fixed
+/// beam (control 2) on. In this mode black-box renders of the unit equal
+/// the fixed beam of its coefficient file (coherent, single-microphone,
+/// independent and wind-like stimuli, over 130 dB): its adaptive blend
+/// (controls 28..41) is not engaged. `Err` names what differs.
+pub fn beam_mode(e: Option<&Effect>) -> std::result::Result<(), String> {
+    let e = e.ok_or_else(|| "no saved state in the strip".to_string())?;
+    let want: [(u32, f64); 9] =
+        [(1, 0.0), (2, 1.0), (3, 0.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0)];
+    for (id, v) in want {
+        match global(e, id) {
+            Some(x) if x == v => {}
+            Some(x) => return Err(format!("control {id} is {x}: only the fixed-beam mode is characterised")),
+            None => return Err(format!("control {id} missing from the saved state")),
+        }
+    }
+    Ok(())
+}
+
+fn need_param(e: &Effect, id: u32, what: &str) -> Result<f64> {
+    global(e, id)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| bad(format!("{what}: parameter {id} missing from the saved state")))
+}
+
+/// The suppressor of a strip effect (global scope: black-box renders
+/// follow the global scope, not the per-element one) and its noise profile
+/// file, for `mics` microphones in blocks of `hop` at `fs`.
+pub fn sens(e: &Effect, file: &Dict, mics: usize, hop: usize, fs: u32, order: usize) -> Result<mic::sens::Sens> {
+    let w = "suppressor";
+    let get = |id| need_param(e, id, w);
+    if get(1)? != SENS_MODE {
+        return Err(bad(format!("{w}: processing mode {} is not characterised", get(1)?)));
+    }
+    if get(2)? != 0.0 {
+        return Err(bad(format!("{w}: PSD estimator {} is not characterised", get(2)?)));
+    }
+    if get(8)? != 0.0 {
+        return Err(bad(format!("{w}: noise profile learning is on")));
+    }
+    let num = |k: &str| file.get(k).and_then(Value::as_number);
+    if num("SampleRate") != Some(fs as f64)
+        || num("BlockSize") != Some(hop as f64)
+        || num("NumberOfChannels") != Some(mics as f64)
+    {
+        return Err(bad(format!(
+            "{w}: profile file for {:?} Hz, {:?} frames, {:?} channels; the graph has {fs}, {hop}, {mics}",
+            num("SampleRate"),
+            num("BlockSize"),
+            num("NumberOfChannels")
+        )));
+    }
+    let bins = hop + 1;
+    let mut profile = Vec::with_capacity(mics * bins);
+    for m in 0..mics {
+        let key = format!("NoiseProfile{m}");
+        let v = be_f32s(file.get(&key), bins, &key)?;
+        if v.iter().any(|x| *x < 0.0) {
+            return Err(bad(format!("{w}: {key} has negative power")));
+        }
+        profile.extend(v);
+    }
+    let min_len = get(12)?;
+    if min_len.fract() != 0.0 || min_len < 1.0 || min_len as usize > hop {
+        return Err(bad(format!("{w}: minimum length {min_len}")));
+    }
+    let s = mic::sens::Sens {
+        mics,
+        hop,
+        bypass: get(0)? != 0.0,
+        order,
+        signal_ms: get(3)?,
+        gain_ms: get(4)?,
+        output_db: get(5)?,
+        floor_db: get(6)?,
+        multiplier: get(7)?,
+        artifact: get(9)? != 0.0,
+        threshold: get(10)?,
+        scale: get(11)?,
+        min_len: min_len as usize,
+        aggressive: get(13)? != 0.0,
+        profile,
+    };
+    if !s.valid(mics, fs as f64) {
+        return Err(bad(format!("{w}: parameters out of range")));
+    }
+    Ok(s)
+}
+
+/// The low-frequency blend unit's law from its saved state (IDs 0..17).
+/// Its reference channel (ID 0) must name input 1, the comparison
+/// reference (TODO(SPEC): its meaning).
+pub fn lwbo_law(e: &Effect, fs: f64) -> Result<mic::blend::BlendLaw> {
+    let w = "low-frequency blend";
+    let get = |id| need_param(e, id, w);
+    if get(0)? != 1.0 {
+        return Err(bad(format!("{w}: reference channel {} is not characterised", get(0)?)));
+    }
+    let l = mic::blend::BlendLaw {
+        boost_limit: true,
+        cutoff_hz: get(1)?,
+        detect_db: get(2)?,
+        max_boost_db: get(3)?,
+        scale_floor_db: get(5)?,
+        scale_smooth_s: get(6)?,
+        threshold_db: get(7)?,
+        xover_max_hz: get(8)?,
+        attack_s: get(9)?,
+        release_s: get(10)?,
+        hold_s: get(11)?,
+        xover_smooth_s: get(12)?,
+        xover_min_hz: get(13)?,
+        abs_floor_db: get(14)?,
+        wind_attack_s: get(15)?,
+        wind_release_s: get(16)?,
+        slope: get(17)?,
+    };
+    if !l.valid(fs) {
+        return Err(bad(format!("{w}: parameters out of range")));
+    }
+    Ok(l)
 }
 
 /// Static values of a graph's parameter logic: every parameter box's
@@ -938,6 +1155,166 @@ pub fn nested(n: &Nest<'_>, notes: &mut Vec<String>, dropped: &mut Vec<String>) 
     Ok(spec)
 }
 
+/// The black-box exact transform: the quadrant window at frame phase 0.
+fn transform_exact(o: &Options) -> bool {
+    o.window == Window::Quadrant && !o.half_offset && o.frame_phase == 0
+}
+
+/// A beamformer box's fixed beam: its mode, its coefficient file.
+#[allow(clippy::too_many_arguments)]
+fn beamformer(
+    b: &Bundle,
+    props: Option<&PropStrip>,
+    name: &str,
+    e: Option<&Effect>,
+    mics: usize,
+    stft: Option<Stft>,
+    fs: u32,
+    opts: &Options,
+    notes: &mut Vec<String>,
+) -> Result<Beam> {
+    if e.is_some_and(|e| e.bypass) {
+        return Err(bad(format!("{name}: a bypassed beamformer is not characterised")));
+    }
+    beam_mode(e).map_err(|m| bad(format!("{name}: {m}")))?;
+    let bins = stft.map(|s| s.bins()).unwrap_or(0);
+    let p = box_path(b, props, name, PROP_BEAM_FILE)?
+        .ok_or_else(|| bad(format!("{name}: the property strip names no coefficient file")))?;
+    beam(&plist_dict(b, &p)?, mics, bins, fs, opts.beam_eq, notes)
+}
+
+struct FanCtx<'a> {
+    b: &'a Bundle,
+    g: &'a Graph,
+    strip: &'a AuStrip,
+    props: Option<&'a PropStrip>,
+    opts: &'a Options,
+    fs: u32,
+    stft: Option<Stft>,
+}
+
+struct Fan {
+    beam: Beam,
+    refs: Vec<Beam>,
+    stage: mic::FreqStage,
+    visited: Vec<String>,
+    last: String,
+}
+
+/// The analysis `node` feeding several beamformers that meet in one
+/// low-frequency blend unit: its input 0 the main beam (the beamformer's
+/// output 0), inputs 1 and 2 the comparison and blend references (output 0
+/// of other beamformers, each a plain fixed beam of its own file).
+fn fan_out(c: &FanCtx<'_>, node: &str, r: &mut Report) -> Result<Fan> {
+    let g = c.g;
+    let live: Vec<&dspg::Wire> = g.wires.iter().filter(|w| w.src.node == node && !is_dead(g, &w.dst.node)).collect();
+    let mut beams: Vec<String> = live.iter().map(|w| w.dst.node.clone()).collect();
+    beams.sort();
+    beams.dedup();
+    let mics = wire_ch(g, live[0])?;
+    let mut blend: Option<String> = None;
+    for name in &beams {
+        let bx = g.find_box(name).unwrap();
+        if subtype(bx) != "bmfd" {
+            return Err(bad(format!("{node} feeds {name} ({}) beside other boxes", kind_name(bx))));
+        }
+        let ins = live.iter().filter(|w| w.dst.node == *name).count();
+        if ins as u32 != bx.inputs {
+            return Err(bad(format!("{name}: {ins} of its {} inputs come from {node}", bx.inputs)));
+        }
+        for w in g.wires.iter().filter(|w| w.src.node == *name && !is_dead(g, &w.dst.node)) {
+            let dst = g.find_box(&w.dst.node).ok_or_else(|| bad(format!("{name} feeds an unknown box")))?;
+            if w.src.port != 0 || subtype(dst) != "lwbo" {
+                return Err(bad(format!(
+                    "{name} output {} feeds {} ({}): only a blend unit may join the beams",
+                    w.src.port,
+                    dst.name,
+                    kind_name(dst)
+                )));
+            }
+            if wire_ch(g, w)? != 1 {
+                return Err(bad(format!("{name}: output 0 is not one channel")));
+            }
+            match &blend {
+                Some(l) if *l != dst.name => return Err(bad("the beams meet in more than one blend unit")),
+                _ => blend = Some(dst.name.clone()),
+            }
+        }
+    }
+    let lname = blend.ok_or_else(|| bad(format!("{node} feeds several beamformers that never meet")))?;
+    let lbox = g.find_box(&lname).unwrap();
+    let source = |port: u32| -> Result<String> {
+        let ws: Vec<_> = g.wires.iter().filter(|w| w.dst.node == lname && w.dst.port == port).collect();
+        match ws.as_slice() {
+            [w] if beams.contains(&w.src.node) => Ok(w.src.node.clone()),
+            _ => Err(bad(format!("{lname} input {port} is not one beamformer output"))),
+        }
+    };
+    if lbox.inputs != 3 {
+        return Err(bad(format!("{lname}: {} inputs, not 3", lbox.inputs)));
+    }
+    let (main, cmp, bl) = (source(0)?, source(1)?, source(2)?);
+    if main == cmp || main == bl {
+        return Err(bad(format!("{lname}: the main beam is also a reference")));
+    }
+    let mut out = Vec::new();
+    let mut mk = |name: &str, r: &mut Report| -> Result<Beam> {
+        let e = c.strip.effect(name);
+        let bx = g.find_box(name).unwrap();
+        let bm = beamformer(c.b, c.props, name, e, mics, c.stft, c.fs, c.opts, &mut r.notes)?;
+        r.stage(
+            name,
+            &kind_name(bx),
+            "freq",
+            if c.opts.beam_eq && name == main { Status::Approximate } else { Status::Exact },
+            format!("fixed beam over {mics} microphones, fixed-beam mode (adaptive blend not engaged)"),
+        );
+        out.push(name.to_string());
+        Ok(bm)
+    };
+    let beam = mk(&main, r)?;
+    let mut refs = vec![{
+        let mut x = mk(&cmp, r)?;
+        x.eq = None;
+        x
+    }];
+    let blend_idx = if bl == cmp {
+        0
+    } else {
+        let mut x = mk(&bl, r)?;
+        x.eq = None;
+        refs.push(x);
+        1
+    };
+    let e = c.strip.effect(&lname).ok_or_else(|| bad(format!("{lname}: no preset in the strip")))?;
+    if e.bypass {
+        return Err(bad(format!("{lname}: a bypassed blend unit is not characterised")));
+    }
+    let law = lwbo_law(e, c.fs as f64)?;
+    r.stage(
+        &lname,
+        &kind_name(lbox),
+        "freq",
+        Status::Uncharacterised,
+        format!(
+            "low-frequency blend (law from the behaviour summary, not yet measured against the unit): beam {main}, comparison {cmp}, blend reference {bl}; boost limit under {} Hz, crossover {}..{} Hz",
+            law.cutoff_hz, law.xover_min_hz, law.xover_max_hz
+        ),
+    );
+    r.todo("lwbo law from the clean summary only (target search, hold/smoother order, crossfade width); no black-box renders");
+    if !c.opts.allow_partial {
+        r.refusals.push(format!(
+            "{lname} (aufx/lwbo) is not yet measured against the unit; --allow-partial carries the summary law"
+        ));
+    }
+    if !beams.iter().all(|x| out.contains(x)) {
+        return Err(bad(format!("{node} feeds a beamformer the blend unit does not take")));
+    }
+    let mut visited = beams.clone();
+    visited.push(lname.clone());
+    Ok(Fan { beam, refs, stage: mic::FreqStage::LowBand { compare: 0, blend: blend_idx, law }, visited, last: lname })
+}
+
 /// Where a compile stands while walking the path.
 #[derive(PartialEq)]
 enum Domain {
@@ -1017,6 +1394,9 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
     let mut post: Vec<Stage> = Vec::new();
     let mut stft: Option<Stft> = None;
     let mut beam_p: Option<Beam> = None;
+    let mut refs: Vec<Beam> = Vec::new();
+    let mut freq: Vec<mic::FreqStage> = Vec::new();
+    let mut sens_hop: Option<usize> = None;
     let mut domain = Domain::PreTime;
     let mut node = input.clone();
     let mut visited = vec![input.clone()];
@@ -1033,6 +1413,23 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
         }
         let mut next: Vec<&str> = live.iter().map(|w| w.dst.node.as_str()).collect();
         next.dedup();
+        if domain == Domain::Freq && beam_p.is_none() && next.len() > 1 {
+            // the analysis feeding several beamformers that meet in a blend
+            match fan_out(&FanCtx { b, g: &g, strip: &strip, props: props.as_ref(), opts, fs, stft }, &node, &mut r) {
+                Ok(f) => {
+                    beam_p = Some(f.beam);
+                    refs = f.refs;
+                    freq.push(f.stage);
+                    visited.extend(f.visited);
+                    node = f.last;
+                }
+                Err(err) => {
+                    r.refusals.push(err.to_string());
+                    break;
+                }
+            }
+            continue;
+        }
         let [nx] = next.as_slice() else {
             r.refusals.push(format!("{node} feeds {next:?}: the chain is not a single path"));
             break;
@@ -1091,15 +1488,28 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                     node = nx;
                     continue;
                 };
+                let ramp = match opts.dev_dccb_ramp_ms {
+                    Some(v) => {
+                        r.refusals.push(format!("{nx}: development ramp override (analysis only, never a blob)"));
+                        v
+                    }
+                    None => ramp,
+                };
                 stages.push(Stage::DcBlock { cutoff_hz: fc, ramp_ms: ramp, gain_db: gdb });
                 r.stage(
                     &nx,
                     &kind,
                     dom,
                     Status::Approximate,
-                    format!("2nd-order Butterworth high-pass, gain, {} ms start ramp", ramp),
+                    format!(
+                        "2nd-order Butterworth high-pass, gain, {ramp} ms linear start ramp from the first nonzero \
+                         block (the engine's block, not the host's)"
+                    ),
                 );
-                r.todo("dccb start ramp law (carried as a linear fade-in)");
+                r.todo(
+                    "dccb output during the start ramp: black-box renders are not ramp x high-pass there (an extra \
+                     decaying term with the high-pass poles); steady state exact",
+                );
             }
             ("gain" | "dbgn", Domain::PreTime | Domain::PostTime) => match gain_db(&nx, &sub, e, &ov) {
                 Ok((db, false)) => {
@@ -1214,16 +1624,20 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                             frame_phase: opts.frame_phase.min(hop - 1),
                         });
                         domain = Domain::Freq;
+                        let exact = transform_exact(opts);
                         r.stage(
                             &nx,
                             &kind,
                             "time",
-                            Status::Approximate,
-                            format!("analysis, hop {hop}, frame {}", 2 * hop),
+                            if exact { Status::Exact } else { Status::Approximate },
+                            format!("analysis, hop {hop}, frame {}, {:?} window", 2 * hop, opts.window),
                         );
-                        r.todo(
-                            "STFT window and frame phase (best fit: power-complementary sine-of-sine-squared window)",
-                        );
+                        if !exact {
+                            r.todo("development transform option: not the black-box exact window/phase");
+                        }
+                        if sens_hop.is_some_and(|sh| sh != hop) {
+                            r.refusals.push(format!("{nx}: hop {hop}, but the suppressor runs on {sens_hop:?}"));
+                        }
                     }
                     _ => {
                         r.stage(
@@ -1242,30 +1656,37 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                     r.refusals.push(format!("{nx}: synthesis without a beamformer before it"));
                 }
                 domain = Domain::PostTime;
-                r.stage(&nx, &kind, "freq", Status::Approximate, "synthesis, overlap-add");
-                r.todo("STFT window and frame phase (as the analysis)");
+                let exact = transform_exact(opts);
+                r.stage(
+                    &nx,
+                    &kind,
+                    "freq",
+                    if exact { Status::Exact } else { Status::Approximate },
+                    "synthesis, overlap-add",
+                );
+                if !exact {
+                    r.todo("development transform option: not the black-box exact window/phase");
+                }
             }
             ("bmfd", Domain::Freq) if beam_p.is_none() => {
                 let res = (|| -> Result<Beam> {
-                    if e.is_some_and(|e| e.bypass) {
-                        return Err(bad(format!("{nx}: a bypassed beamformer is not characterised")));
-                    }
-                    let bins = stft.map(|s| s.bins()).unwrap_or(0);
-                    let p = box_path(b, props.as_ref(), &nx, PROP_BEAM_FILE)?
-                        .ok_or_else(|| bad(format!("{nx}: the property strip names no coefficient file")))?;
                     if out_w != 1 {
                         return Err(bad(format!("{nx}: output 0 carries {out_w} channels")));
                     }
-                    beam(&plist_dict(b, &p)?, in_w, bins, fs, opts.beam_eq, &mut r.notes)
+                    beamformer(b, props.as_ref(), &nx, e, in_w, stft, fs, opts, &mut r.notes)
                 })();
                 match res {
                     Ok(bm) => {
                         beam_p = Some(bm);
-                        r.stage(&nx, &kind, "freq", Status::Approximate, format!("fixed beam over {in_w} microphones"));
-                        r.todo("beamformer adaptive parts: omni blend, wind and scratch limiting, beam selection");
-                        r.todo("beamformer EQSelection table use");
-                        if e.is_some() {
-                            r.todo("beamformer AU parameters (saved state) not applied");
+                        r.stage(
+                            &nx,
+                            &kind,
+                            "freq",
+                            if opts.beam_eq { Status::Approximate } else { Status::Exact },
+                            format!("fixed beam over {in_w} microphones, fixed-beam mode (adaptive blend not engaged)"),
+                        );
+                        if opts.beam_eq {
+                            r.todo("development option: EQSelection applied to the uplink (the unit does not)");
                         }
                     }
                     Err(err) => {
@@ -1275,6 +1696,46 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                 }
                 node = nx;
                 continue;
+            }
+            ("sens", Domain::PreTime) if in_w == out_w => {
+                let res = (|| -> Result<mic::sens::Sens> {
+                    let e = e.ok_or_else(|| bad(format!("{nx}: no preset in the strip")))?;
+                    let hop = g
+                        .wire_format(fan[0])
+                        .and_then(|f| f.block_size.as_ref())
+                        .and_then(Num::value)
+                        .filter(|v| *v >= 2.0 && v.fract() == 0.0 && *v as usize <= mic::BLOCK)
+                        .ok_or_else(|| {
+                            bad(format!("{nx}: its input is not blocked in at most {} frames", mic::BLOCK))
+                        })? as usize;
+                    let p = box_path(b, props.as_ref(), &nx, PROP_SENS_FILE)?
+                        .ok_or_else(|| bad(format!("{nx}: the property strip names no noise profile")))?;
+                    sens(e, &plist_dict(b, &p)?, in_w, hop, fs, opts.sens_order)
+                })();
+                match res {
+                    Ok(sp) => {
+                        if sens_hop.is_some_and(|h| h != sp.hop) {
+                            r.refusals.push(format!("{nx}: suppressors on different blocks"));
+                        }
+                        sens_hop = Some(sp.hop);
+                        let detail = format!(
+                            "noise-floor suppressor, {} microphones, block {}, Burg order {}{}",
+                            sp.mics,
+                            sp.hop,
+                            sp.order,
+                            if sp.bypass { ", bypass (a block of delay)" } else { "" }
+                        );
+                        stages.push(Stage::Sens(sp));
+                        r.stage(&nx, &kind, dom, Status::Approximate, detail);
+                        r.todo("sens artifact step: boxcar lengths, edges, mask slope fitted to black-box renders");
+                        r.todo("sens Burg order fitted");
+                        r.todo("sens gain/signal smoother start-up state (gain 1, PSD 0 after reset)");
+                    }
+                    Err(err) => {
+                        r.stage(&nx, &kind, dom, Status::Refused, err.to_string());
+                        r.refusals.push(err.to_string());
+                    }
+                }
             }
             (s, _) if TRANSPARENT_OR_ATTENUATING.contains(&s) && in_w == out_w => {
                 let code = s.as_bytes();
@@ -1323,7 +1784,7 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
     };
     let partial = pre.iter().chain(&post).any(|s| matches!(s, Stage::Identity(_)))
         || r.stages.iter().any(|s| s.status == Status::Uncharacterised);
-    let mut p = Params { sample_rate: fs, mics, pre, stft, beam: beam_p, post, partial };
+    let mut p = Params { sample_rate: fs, mics, pre, stft, beam: beam_p, refs, freq, post, partial };
     r.partial = partial;
     r.latency_frames = p.latency();
     // an uncharacterised frequency-domain stage carries no Identity entry;
@@ -1336,6 +1797,36 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
         return Ok(Compiled { params: None, report: r });
     }
     Ok(Compiled { params: Some(p), report: r })
+}
+
+/// The suppressor of the bundle's default microphone chain alone (its
+/// first `aufx/sens` box), for offline analysis of that stage.
+pub fn stage_sens(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<mic::sens::Sens> {
+    let sel = select(b, diags)?;
+    let (gtext, _) = prepare_graph(graph_text(b, &sel.graph)?);
+    let g = dspg::parse(&gtext, &sel.substitutions, &sel.graph)?;
+    let strip = AuStrip::parse(need(b, &sel.strip, "strip")?, &sel.strip)?;
+    let props = match &sel.propstrip {
+        Some(p) => Some(PropStrip::parse(need(b, p, "property strip")?, p)?),
+        None => None,
+    };
+    let fs: u32 = sel
+        .substitutions
+        .get("fs")
+        .or_else(|| g.macros.get("fs"))
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v as u32)
+        .ok_or_else(|| bad("the configuration gives no sample rate (fs)"))?;
+    let bx = g.boxes.iter().find(|x| subtype(x) == "sens").ok_or_else(|| bad("no suppressor in the chain"))?;
+    let w = g.wires.iter().find(|w| w.dst.node == bx.name).ok_or_else(|| bad("the suppressor is not wired"))?;
+    let hop = g
+        .wire_format(w)
+        .and_then(|f| f.block_size.as_ref())
+        .and_then(Num::value)
+        .ok_or_else(|| bad("the suppressor's input is not blocked"))? as usize;
+    let e = strip.effect(&bx.name).ok_or_else(|| bad("no suppressor preset"))?;
+    let p = box_path(b, props.as_ref(), &bx.name, PROP_SENS_FILE)?.ok_or_else(|| bad("no suppressor profile"))?;
+    sens(e, &plist_dict(b, &p)?, wire_ch(&g, w)?, hop, fs, opts.sens_order)
 }
 
 /// The binding of a microphone blob, checked as the speaker blob's is.

@@ -11,6 +11,8 @@
 //! ```text
 //! mics (N) -> pre stages (N channels) -> STFT analysis per mic
 //!          -> fixed beam  Y(k) = sum_m W_m(k) X_m(k)
+//!          -> frequency stages (the low-frequency blend against
+//!             reference beams of the same spectra)
 //!          -> STFT synthesis -> post stages (1 channel) -> out
 //! ```
 //!
@@ -20,9 +22,19 @@
 //!   parameter 0 in dB, applied as a constant. Unlike the speaker voicing's
 //!   gain node, a microphone gain may boost (the graph's pre-DSP gain does).
 //! * [`Stage::DcBlock`]: the DC blocker unit: a second-order Butterworth
-//!   high-pass (bilinear, prewarped) at its cutoff, then its gain in dB.
-//!   Its start ramp is TODO(SPEC): carried as a linear fade-in over the
-//!   ramp time from the first frame after a reset.
+//!   high-pass (bilinear, prewarped) at its cutoff, then its gain in dB,
+//!   then its start ramp: a linear fade-in by `1/(ramp_ms Fs/1000)` per
+//!   sample, beginning on the first block after a reset that holds a
+//!   nonzero sample (prior silence does not consume it). A block is the
+//!   engine's internal block (at most [`BLOCK`] frames of one host call).
+//!   TODO(SPEC): black-box renders of the unit match this from the ramp's
+//!   end on (over 140 dB), not during the ramp, where the unit's output
+//!   holds a further term decaying with the high-pass's poles.
+//! * [`Stage::Sens`]: the per-microphone noise-floor suppressor
+//!   ([`sens`]), run on whole hop blocks with its own transform; it adds
+//!   `hop` frames of latency. It and every pre stage after it run at the
+//!   analysis frame rate on the latest hop block, so its blocks fall on
+//!   the analysis frames' boundaries, as the graph's reblocker makes them.
 //! * [`Stage::Graph`]: filter boxes and nested graphs, run by the voicing
 //!   chain ([`crate::voicing::chain`]) with its filter-box law.
 //! * [`Stage::Identity`]: a stage the compiler could not characterise and
@@ -35,23 +47,28 @@
 //! power-complementary window (`w(n)^2 + w(n + hop)^2 = 1`) a unit beam
 //! reconstructs the input exactly, `size - 1` samples late. The window
 //! shape, its sample offset and the frame phase (which stream sample
-//! completes a frame) are compiled parameters. TODO(SPEC): the unit's
-//! exact window and phase; the compiler's default is the best fit to
-//! black-box renders so far, not an exact match.
+//! completes a frame) are compiled parameters; [`Window::Quadrant`] at
+//! phase 0 matches black-box renders of the graph's transform pair
+//! exactly (single-bin and delay probes over 135 dB).
 //!
-//! The beam's adaptive parts (omni blend, wind and scratch limiting, beam
-//! selection) are TODO(SPEC): the chain runs the fixed weights only.
+//! The frequency stages ([`FreqStage`]) run the adaptive low-frequency
+//! blend ([`blend`]) against extra fixed beams of the same spectra (the
+//! graph's second beamformer feeding the standalone blend unit).
 //!
 //! [`Engine::process`] is real-time code: every buffer is made in
 //! [`Engine::new`].
 
 pub mod artifact;
+pub mod blend;
 pub mod fft;
+pub mod sens;
 
 use crate::voicing::chain::{Chain, Spec};
 use alloc::vec;
 use alloc::vec::Vec;
+use blend::BlendLaw;
 use fft::{Complex, Fft};
+use sens::Sens;
 
 /// Most microphone channels a chain takes.
 pub const MAX_MICS: usize = 16;
@@ -72,6 +89,11 @@ pub enum Window {
     Sine = 1,
     /// `sin(pi/2 sin^2(pi x / N))` (power complementary, as the sine is).
     Vorbis = 2,
+    /// The clean summary's closed form: `h(x) = 1/2 - cos(c x)/2`,
+    /// `c = acos(1 - sqrt 2)`, `q = 4x/N`; over the four quarters `h(q)`,
+    /// `sqrt(1 - h(2-q)^2)`, `sqrt(1 - h(q-2)^2)`, `h(4-q)`. Power
+    /// complementary, close to [`Window::Vorbis`].
+    Quadrant = 3,
 }
 
 impl Window {
@@ -79,6 +101,7 @@ impl Window {
         match v {
             1 => Some(Window::Sine),
             2 => Some(Window::Vorbis),
+            3 => Some(Window::Quadrant),
             _ => None,
         }
     }
@@ -90,6 +113,20 @@ impl Window {
         match self {
             Window::Sine => s,
             Window::Vorbis => libm::sin(core::f64::consts::FRAC_PI_2 * s * s),
+            Window::Quadrant => {
+                let c = libm::acos(1.0 - core::f64::consts::SQRT_2);
+                let h = |v: f64| 0.5 - 0.5 * libm::cos(c * v);
+                let q = 4.0 * x / size as f64;
+                if q < 1.0 {
+                    h(q)
+                } else if q < 2.0 {
+                    libm::sqrt((1.0 - h(2.0 - q).powi(2)).max(0.0))
+                } else if q < 3.0 {
+                    libm::sqrt((1.0 - h(q - 2.0).powi(2)).max(0.0))
+                } else {
+                    h(4.0 - q)
+                }
+            }
         }
     }
 }
@@ -137,7 +174,8 @@ pub enum Stage {
     /// A constant gain, dB.
     Gain { db: f64 },
     /// Second-order Butterworth high-pass at `cutoff_hz`, a gain of
-    /// `gain_db`, and a linear fade-in over `ramp_ms` after a reset.
+    /// `gain_db`, and a linear fade-in over `ramp_ms` from the first
+    /// nonzero block after a reset.
     DcBlock { cutoff_hz: f64, ramp_ms: f64, gain_db: f64 },
     /// A sub-graph (filter boxes, a nested graph), as many program channels
     /// and outputs as the stage is wide.
@@ -145,6 +183,16 @@ pub enum Stage {
     /// An uncharacterised stage carried as identity (partial blobs only);
     /// the box's four-character subtype.
     Identity([u8; 4]),
+    /// The noise-floor suppressor ([`sens`]); pre stages only.
+    Sens(Sens),
+}
+
+/// A stage between the beam and the synthesis.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FreqStage {
+    /// The low-frequency blend of the path against two of
+    /// [`Params::refs`]: the comparison and the blend reference.
+    LowBand { compare: usize, blend: usize, law: BlendLaw },
 }
 
 impl Stage {
@@ -162,6 +210,7 @@ impl Stage {
             }
             Stage::Graph(spec) => spec.program_channels == width && spec.outputs.len() == width && spec.check().is_ok(),
             Stage::Identity(_) => true,
+            Stage::Sens(s) => s.valid(width, fs),
         }
     }
 }
@@ -174,6 +223,10 @@ pub struct Params {
     pub pre: Vec<Stage>,
     pub stft: Stft,
     pub beam: Beam,
+    /// Further fixed beams of the same spectra, for the frequency stages.
+    pub refs: Vec<Beam>,
+    /// Stages between the beam and the synthesis.
+    pub freq: Vec<FreqStage>,
     /// Stages after the synthesis, one channel.
     pub post: Vec<Stage>,
     /// Some stage is carried as identity (see [`Stage::Identity`]).
@@ -200,14 +253,36 @@ impl Params {
             && self.pre.len() <= MAX_STAGES
             && self.post.len() <= MAX_STAGES
             && self.pre.iter().all(|st| st.valid(self.mics, fs))
-            && self.post.iter().all(|st| st.valid(1, fs))
+            && self.post.iter().all(|st| st.valid(1, fs) && !matches!(st, Stage::Sens(_)))
+            && self.pre.iter().all(|st| !matches!(st, Stage::Sens(x) if x.hop != s.hop))
+            && (!self.pre.iter().any(|st| matches!(st, Stage::Sens(_))) || s.hop <= BLOCK)
+            && self.refs.len() <= MAX_MICS
+            && self.refs.iter().all(|r| {
+                r.mics == self.mics
+                    && r.bins == s.bins()
+                    && r.weights.len() == r.mics * r.bins
+                    && r.weights.iter().all(|w| w[0].is_finite() && w[1].is_finite())
+                    && r.eq.is_none()
+            })
+            && self.freq.len() <= MAX_STAGES
+            && self.freq.iter().all(|f| match f {
+                FreqStage::LowBand { compare, blend, law } => {
+                    *compare < self.refs.len() && *blend < self.refs.len() && law.valid(fs)
+                }
+            })
             && self.partial == self.pre.iter().chain(&self.post).any(|st| matches!(st, Stage::Identity(_)))
     }
 
-    /// Algorithmic latency of the whole chain, frames (the transform's; the
-    /// other stages add none).
+    /// Algorithmic latency of the whole chain, frames: the transform's and
+    /// a hop per suppressor.
     pub fn latency(&self) -> usize {
-        self.stft.latency()
+        self.stft.latency() + self.stft.hop * self.pre.iter().filter(|st| matches!(st, Stage::Sens(_))).count()
+    }
+
+    /// Index of the first pre stage that runs on hop blocks (the first
+    /// suppressor), or `pre.len()`.
+    pub fn block_start(&self) -> usize {
+        self.pre.iter().position(|st| matches!(st, Stage::Sens(_))).unwrap_or(self.pre.len())
     }
 }
 
@@ -219,9 +294,12 @@ enum Run {
         /// Per channel `(s1, s2)`, transposed direct form II.
         state: Vec<[f64; 2]>,
         gain: f64,
-        ramp: usize,
-        at: usize,
+        /// Ramp step per sample (`1/(ramp_ms Fs/1000)`; 0: no ramp).
+        step: f64,
+        /// Samples into the ramp; `None` until a nonzero block.
+        at: Option<usize>,
     },
+    Sens(alloc::boxed::Box<sens::Run>),
     Graph {
         chain: alloc::boxed::Box<Chain>,
         out: Vec<Vec<f32>>,
@@ -241,10 +319,11 @@ impl Run {
                     a: [s.a1, s.a2],
                     state: vec![[0.0; 2]; width],
                     gain: libm::pow(10.0, gain_db / 20.0),
-                    ramp: libm::round(ramp_ms * fs / 1000.0) as usize,
-                    at: 0,
+                    step: if *ramp_ms > 0.0 { 1000.0 / (ramp_ms * fs) } else { 0.0 },
+                    at: None,
                 }
             }
+            Stage::Sens(p) => Run::Sens(alloc::boxed::Box::new(sens::Run::new(p, fs)?)),
             Stage::Graph(spec) => Run::Graph {
                 chain: alloc::boxed::Box::new(Chain::new(spec.clone(), fs, BLOCK)?),
                 out: vec![vec![0.0; BLOCK]; width],
@@ -257,8 +336,9 @@ impl Run {
         match self {
             Run::DcBlock { state, at, .. } => {
                 state.iter_mut().for_each(|s| *s = [0.0; 2]);
-                *at = 0;
+                *at = None;
             }
+            Run::Sens(r) => r.reset(),
             Run::Graph { chain, .. } => chain.reset(),
             Run::Gain(_) | Run::Identity => {}
         }
@@ -272,7 +352,11 @@ impl Run {
                     b[..frames].iter_mut().for_each(|x| *x *= *g);
                 }
             }
-            Run::DcBlock { b, a, state, gain, ramp, at } => {
+            Run::DcBlock { b, a, state, gain, step, at } => {
+                if at.is_none() && bufs.iter().take(width).any(|c| c[..frames].iter().any(|v| *v != 0.0)) {
+                    *at = Some(0);
+                }
+                // the ramp has not started (a silent block) or has ended
                 let start = *at;
                 for (c, buf) in bufs.iter_mut().take(width).enumerate() {
                     let s = &mut state[c];
@@ -281,14 +365,22 @@ impl Run {
                         let y = b[0] * v + s[0];
                         s[0] = b[1] * v - a[0] * y + s[1];
                         s[1] = b[2] * v - a[1] * y;
-                        // TODO(SPEC): the unit's start ramp; a linear fade-in
-                        let n = start + i;
-                        let r = if n < *ramp { n as f64 / *ramp as f64 } else { 1.0 };
+                        let r = match start {
+                            _ if *step == 0.0 => 1.0,
+                            None => 0.0,
+                            Some(n) => ((n + i) as f64 * *step).min(1.0),
+                        };
                         *x = (y * *gain * r) as f32;
                     }
                 }
-                *at = start.saturating_add(frames).min(*ramp);
+                if let Some(n) = at.as_mut() {
+                    if (*n as f64) * *step < 1.0 {
+                        *n += frames;
+                    }
+                }
             }
+            // whole hop blocks only: `Engine::frame_blocks`
+            Run::Sens(r) => r.process(bufs),
             Run::Graph { chain, out } => {
                 let ins: [&[f32]; MAX_MICS] =
                     core::array::from_fn(|c| if c < width { &bufs[c][..frames] } else { &[][..] });
@@ -324,6 +416,15 @@ pub struct Engine {
     phase: usize,
     frame: Vec<Complex>,
     beam: Vec<Complex>,
+    /// The reference beams, as `refs` in the parameters.
+    refs: Vec<Vec<Complex>>,
+    freq: Vec<blend::Run>,
+    /// Pre stages from this index run on hop blocks at frame time.
+    block_start: usize,
+    /// Per mic, the latest hop block (block stages run on it in place).
+    blk: Vec<Vec<f32>>,
+    /// Per mic, the last `size` samples after the block stages.
+    ring2: Vec<Vec<f32>>,
     ola: Vec<f64>,
     queue: Vec<f32>,
     queue_at: usize,
@@ -342,7 +443,20 @@ impl Engine {
         let pre = params.pre.iter().map(|st| Run::new(st, params.mics, fs)).collect::<Option<Vec<_>>>()?;
         let post = params.post.iter().map(|st| Run::new(st, 1, fs)).collect::<Option<Vec<_>>>()?;
         let window = (0..s.size).map(|n| s.window.at(n, s.size, s.half_offset)).collect();
+        let block_start = params.block_start();
+        let freq = params
+            .freq
+            .iter()
+            .map(|f| match f {
+                FreqStage::LowBand { law, .. } => blend::Run::new(law, s.bins(), s.hop, fs),
+            })
+            .collect();
         Some(Engine {
+            refs: vec![vec![Complex::ZERO; s.bins()]; params.refs.len()],
+            freq,
+            block_start,
+            blk: vec![vec![0.0; s.hop.max(BLOCK)]; params.mics],
+            ring2: vec![vec![0.0; s.size]; params.mics],
             fft: Fft::new(s.size)?,
             window,
             ring: vec![vec![0.0; s.size]; params.mics],
@@ -376,7 +490,9 @@ impl Engine {
     /// Back to the state [`Engine::new`] gives. Real time.
     pub fn reset(&mut self) {
         self.pre.iter_mut().chain(self.post.iter_mut()).for_each(Run::reset);
+        self.freq.iter_mut().for_each(blend::Run::reset);
         self.ring.iter_mut().for_each(|r| r.fill(0.0));
+        self.ring2.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_at = 0;
         self.phase = 0;
         self.ola.fill(0.0);
@@ -384,22 +500,59 @@ impl Engine {
         self.queue_at = 0;
     }
 
+    /// The block stages on the latest hop block of every mic, into `ring2`.
+    fn frame_blocks(&mut self) {
+        let s = self.params.stft;
+        let (n, hop) = (s.size, s.hop);
+        let mics = self.params.mics;
+        for (m, b) in self.blk.iter_mut().enumerate().take(mics) {
+            for (i, v) in b[..hop].iter_mut().enumerate() {
+                *v = self.ring[m][(self.ring_at + n - hop + i) % n];
+            }
+        }
+        for r in &mut self.pre[self.block_start..] {
+            r.process(&mut self.blk, mics, hop);
+        }
+        for (r2, b) in self.ring2.iter_mut().zip(&self.blk) {
+            r2.copy_within(hop.., 0);
+            r2[n - hop..].copy_from_slice(&b[..hop]);
+        }
+    }
+
     /// One analysis frame from the rings, the beam, one synthesis frame.
     fn transform(&mut self) {
         let s = self.params.stft;
         let (n, hop, bins) = (s.size, s.hop, s.bins());
+        let blocked = self.block_start < self.pre.len();
+        if blocked {
+            self.frame_blocks();
+        }
         let b = &self.params.beam;
         self.beam.fill(Complex::ZERO);
+        self.refs.iter_mut().for_each(|r| r.fill(Complex::ZERO));
         for m in 0..self.params.mics {
-            let ring = &self.ring[m];
-            for (i, v) in self.frame.iter_mut().enumerate() {
-                let x = ring[(self.ring_at + i) % n];
-                *v = Complex::new(f64::from(x) * self.window[i], 0.0);
+            if blocked {
+                let ring = &self.ring2[m];
+                for (i, v) in self.frame.iter_mut().enumerate() {
+                    *v = Complex::new(f64::from(ring[i]) * self.window[i], 0.0);
+                }
+            } else {
+                let ring = &self.ring[m];
+                for (i, v) in self.frame.iter_mut().enumerate() {
+                    let x = ring[(self.ring_at + i) % n];
+                    *v = Complex::new(f64::from(x) * self.window[i], 0.0);
+                }
             }
             self.fft.forward(&mut self.frame);
             let w = &b.weights[m * bins..(m + 1) * bins];
             for ((acc, wk), x) in self.beam.iter_mut().zip(w).zip(&self.frame) {
                 *acc = acc.plus(Complex::new(wk[0], wk[1]).times(*x));
+            }
+            for (r, rb) in self.refs.iter_mut().zip(&self.params.refs) {
+                let w = &rb.weights[m * bins..(m + 1) * bins];
+                for ((acc, wk), x) in r.iter_mut().zip(w).zip(&self.frame) {
+                    *acc = acc.plus(Complex::new(wk[0], wk[1]).times(*x));
+                }
             }
         }
         if let Some(eq) = &b.eq {
@@ -407,6 +560,10 @@ impl Engine {
                 v.re *= g;
                 v.im *= g;
             }
+        }
+        for (run, f) in self.freq.iter_mut().zip(&self.params.freq) {
+            let FreqStage::LowBand { compare, blend, .. } = f;
+            run.process(&mut self.beam, &self.refs[*compare], &self.refs[*blend]);
         }
         // A real signal's spectrum: DC and Nyquist are real (their
         // imaginary parts are dropped, as a packed real transform drops
@@ -448,7 +605,7 @@ impl Engine {
                     *d = if v.is_finite() { *v } else { 0.0 };
                 }
             }
-            for r in &mut self.pre {
+            for r in &mut self.pre[..self.block_start] {
                 r.process(&mut self.work, mics, len);
             }
             for i in 0..len {
@@ -490,8 +647,10 @@ mod tests {
             sample_rate: 48_000,
             mics,
             pre: Vec::new(),
-            stft: Stft { hop, size, window: Window::Vorbis, half_offset: false, frame_phase: 0 },
+            stft: Stft { hop, size, window: Window::Quadrant, half_offset: false, frame_phase: 0 },
             beam: Beam { mics, bins, weights, eq: None },
+            refs: Vec::new(),
+            freq: Vec::new(),
             post: Vec::new(),
             partial: false,
         }
@@ -512,7 +671,7 @@ mod tests {
 
     #[test]
     fn windows_are_power_complementary() {
-        for w in [Window::Sine, Window::Vorbis] {
+        for w in [Window::Sine, Window::Vorbis, Window::Quadrant] {
             for half in [false, true] {
                 for n in 0..480 {
                     let a = w.at(n, 960, half);
@@ -602,5 +761,95 @@ mod tests {
         let nan = vec![f32::NAN; 64];
         e.process(&[&nan, &nan], &mut y, 64);
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn the_dc_ramp_starts_on_the_first_nonzero_block() {
+        let mut p = unit_params(1, 480);
+        // 10 ms at 48 kHz: 480 samples
+        p.pre.push(Stage::DcBlock { cutoff_hz: 0.01, ramp_ms: 10.0, gain_db: 0.0 });
+        let mut e = Engine::new(p.clone()).unwrap();
+        let lat = e.latency();
+        // 2000 samples of silence, then a constant step
+        let n = 8000;
+        let x: Vec<f32> = (0..n).map(|i| if i < 2000 { 0.0 } else { 0.5 }).collect();
+        let y = render(&mut e, core::slice::from_ref(&x), 100);
+        // the ramp begins at the block holding sample 2000 (blocks of 100)
+        // and rises by 1/480 per sample; the 0.01 Hz high-pass barely moves
+        // the step in 480 samples
+        for k in [0usize, 100, 240, 479] {
+            let got = y[2000 + k + lat];
+            let want = 0.5 * k as f64 / 480.0;
+            assert!((f64::from(got) - want).abs() < 2e-3, "k {k}: {got} vs {want}");
+        }
+        // the same step with no silence before it ramps from the start
+        let mut e = Engine::new(p).unwrap();
+        let x2: Vec<f32> = x[2000..].to_vec();
+        let y2 = render(&mut e, &[x2], 100);
+        assert!((y2[240 + lat] - y[2240 + lat]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_suppressor_adds_one_hop_of_latency_and_passes_loud_signals() {
+        let mut p = unit_params(2, 480);
+        let mut sp = sens::tests::params(2, 480);
+        sp.profile.fill(1e-14);
+        p.pre.push(Stage::Gain { db: 0.0 });
+        p.pre.push(Stage::Sens(sp));
+        p.pre.push(Stage::Gain { db: 6.0 });
+        assert!(p.valid());
+        assert_eq!(p.latency(), 959 + 480);
+        let mut e = Engine::new(p).unwrap();
+        let n = 24_000;
+        let x: Vec<Vec<f32>> =
+            (0..2).map(|_| (0..n).map(|i| (0.1 * libm::sin(i as f64 * 0.05)) as f32).collect()).collect();
+        let y = render(&mut e, &x, 333);
+        let lat = e.latency();
+        for i in 8000..n {
+            assert!((y[i] - 2.0 * x[0][i - lat]).abs() < 1e-3, "at {i}: {} vs {}", y[i], 2.0 * x[0][i - lat]);
+        }
+    }
+
+    #[test]
+    fn a_zero_range_blend_passes_the_beam_and_a_full_one_the_reference() {
+        let mut p = unit_params(2, 480);
+        // reference: mic 1 alone; beam: mic 0 alone
+        let mut r = Beam { mics: 2, bins: 481, weights: vec![[0.0; 2]; 2 * 481], eq: None };
+        for w in r.weights[481..].iter_mut() {
+            *w = [1.0, 0.0];
+        }
+        p.refs.push(r);
+        let law = BlendLaw {
+            boost_limit: false,
+            cutoff_hz: 0.0,
+            detect_db: 0.0,
+            max_boost_db: 0.0,
+            scale_floor_db: -90.0,
+            scale_smooth_s: 0.0,
+            threshold_db: -110.0,
+            xover_max_hz: 0.0,
+            attack_s: 0.0,
+            release_s: 0.0,
+            hold_s: 0.0,
+            xover_smooth_s: 0.0,
+            xover_min_hz: 0.0,
+            abs_floor_db: -180.0,
+            wind_attack_s: 0.0,
+            wind_release_s: 0.0,
+            slope: 0.0,
+        };
+        p.freq.push(FreqStage::LowBand { compare: 0, blend: 0, law });
+        assert!(p.valid());
+        let n = 9600;
+        let x: Vec<Vec<f32>> =
+            (0..2).map(|c| (0..n).map(|i| libm::sin(i as f64 * 0.01 * (c + 1) as f64) as f32).collect()).collect();
+        let y = render(&mut Engine::new(p.clone()).unwrap(), &x, 256);
+        assert!((2000..n).all(|i| (y[i] - x[0][i - 959]).abs() < 1e-5));
+        // the crossover pinned at Nyquist: the reference everywhere
+        let FreqStage::LowBand { law, .. } = &mut p.freq[0];
+        law.xover_min_hz = 24_000.0;
+        law.xover_max_hz = 24_000.0;
+        let y = render(&mut Engine::new(p).unwrap(), &x, 256);
+        assert!((2000..n).all(|i| (y[i] - x[1][i - 959]).abs() < 1e-5));
     }
 }
