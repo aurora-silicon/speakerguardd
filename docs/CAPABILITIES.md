@@ -44,7 +44,7 @@ were made on, so one Mac's proof never admits another. It selects no value.
 | Volume step and dB level | supervisor operating point | `alsa:` control TLV | capability |
 | Applied sense geometry (format, channels, period) | self-check | `alsa:` applied hw params | capability |
 | Speaker ID (`spid`, the straps' vendor ID) | vendor chain selection in the tuning reader | bundle manifest `speaker_id` and `dt:` `/chosen/asahi,speaker-id` (the loader, from the ADT straps): either alone is used, and the two must agree | capability where the loader exports it (below) |
-| Fixed volume ceiling under the lease | supervisor grant check | not read: the supervisor expects 0 dB and latches on anything else | provider gap (below) |
+| Playback ceiling under the lease | supervisor grant check | `alsa:` each playback volume control's current maximum from control info, converted to dB using its TLV | capability |
 | Bundle speaker identity (`aid`) | voicing trim keys (below) | `tuning:` the bundle's `aid` (`AID<n>`), carried by the record and checked against the provisioned bundle at generation; no loader exports it | tuning |
 | Interim voicing trims and low-pass | voicing graph | `gate.json` tables keyed by the bundle's speaker identity (`aid`) | tuning (below) |
 | Voicing deployment overrides | offline fixtures' recorded mode | `gate.json` `voicing_pre` keyed by board | policy, to re-key with the fixtures (below) |
@@ -62,17 +62,14 @@ Each capability either has a source or refuses:
 - Sense the device tree does not rule out: the self-check's silent sense
   test must see it on the card, or the record fails.
 - No ALSA card bound to the sound node: the self-check fails.
-- A grant at any volume other than the one expected: the supervisor latches.
-- A protection value the Mac does not report (a fixed volume ceiling, a
-  high-pass in front of protection) is never filled from a table of ours,
-  whatever the table is keyed by: no grant, muted. Today a fixed ceiling
-  latches the supervisor (0 dB expected). Nothing reads a high-pass
-  requirement yet, though: a Mac whose speakers need one but have no fixed
-  ceiling would derive (`derived-nosense`) and get a grant without it. So
-  a transport entry for such a Mac lands only together with a refusal that
-  does not depend on the ceiling: `derive()` refuses when the Mac's bundle
-  names a high-pass in front of protection that the reader does not
-  compile yet.
+- Under a grant, the supervisor latches if any playback volume control
+  lacks a usable ceiling, the controls disagree on the ceiling, the
+  ceiling fails the admission bounds, or any current level differs from
+  the reported ceiling.
+- A required high-pass ahead of protection needs its own admission check.
+  The live ceiling check only proves the volume. The tuning reader and
+  session graph need to prove the filter is present and applied before a
+  route that requires it can be admitted.
 
 The only defaults are the safe ones. One missing value still admits a Mac
 today, and it is tracked:
@@ -96,17 +93,14 @@ once a release carries the provider. The fallback is never more permissive
 than the provider, and for a value that protects the speaker the only
 fallback is refusal.
 
-1. **Fixed ceiling under the lease.** The kernel knows the level its lease
-   lifts the speaker to on a machine with a fixed ceiling. Provider: the
-   kernel reports it to userspace (the leased volume control's own range,
-   or a read-only control). Reader: the self-check records it and the
-   supervisor grants only at exactly that level. Until the provider exists
-   there is no fallback value: 0 dB is expected, a ceiling latches, and a
-   Mac that needs a ceiling the kernel does not report gets no grant and
-   stays muted. A value of ours (`gate.json`, keyed by board or by speaker)
-   is not a fallback: a ceiling set too high is exactly the failure this
-   protects against, so "it only lowers the volume" does not make a guessed
-   one safe.
+1. **Playback ceiling under the lease.** macaudio publishes the effective
+   playback maximum in ALSA control info. The supervisor converts that
+   maximum and the current setting to dB with the same control TLV. Every
+   playback control must report the same ceiling and be at that level
+   while the grant is held. The supervisor's current admission band is
+   −40 to 0 dB. An optional policy cap from `gate.json`
+   (`operating_volume_cap_db`) can reject a higher card-reported ceiling.
+   Missing control metadata causes a latch even when a policy cap exists.
 2. **Speaker identity.** Linux has no passive reader of the speaker-ID
    straps. Provider: the loader reads the straps the ADT names
    (`find-speaker-id`, `function-speaker-id0/1`, `valid-speaker-ids`) and
@@ -173,7 +167,7 @@ refusing when the copy disagrees, is an open item.
 
 | Change | Its machine-specific part | Maps onto |
 |---|---|---|
-| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; the ceiling (now the card's own: the amp volumes' TLV maximum under the grant, provider 1; `operating_volume_cap_db` can only lower it); `protect_highpass` keyed by board | transport entry per block, but only together with a refusal that does not depend on the ceiling latch (`derive()` refuses a bundle that names a high-pass the reader does not compile); the ceiling only via provider 1 and the high-pass only from the bundle. Neither ships as a table of ours (board- or speaker-keyed); until the providers exist that Mac gets no grant |
+| T8152 transport without sense, playback ceiling and high-pass (J873g) | `apple,t8152-aop-audio` entry and back-end DMA names; playback ceiling from the ALSA control range and TLV | Transport discovery and the live ceiling check are on main. A tuning-backed high-pass and proof that it runs ahead of protection remain open. |
 | T8142/T6050 transport without a sense channel | `speaker_dma`/`sense_dma` on the driver entry | as is: per block, `sense_path` |
 | K114c sense on the v2 path | applied sense geometry | as is: `alsa:` applied hw params |
 | Fail closed on an unproven method; units without sense by name | method dispatch, `NO_SENSE_UNITS` | as is: `tuning:` unit kind |
