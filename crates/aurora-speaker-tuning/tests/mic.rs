@@ -61,6 +61,11 @@ fn be(v: &[f32]) -> Value {
 /// A beam file: one beam, `mics` microphones, real weights `w[m]` on
 /// every bin.
 fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
+    beam_file_of(mics, w, 1)
+}
+
+/// The same file declaring `beams` beams (only beam 0 is written).
+fn beam_file_of(mics: usize, w: &[f32], beams: i128) -> Vec<u8> {
     let mut re = Vec::new();
     let mut im = Vec::new();
     for (m, wm) in w.iter().enumerate().take(mics) {
@@ -87,7 +92,7 @@ fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
     binary::write(&dict(vec![
         ("Beam0", beam0),
         ("SampleRate", i(48_000)),
-        ("nBeams", i(1)),
+        ("nBeams", i(beams)),
         ("nCoefficients", i(BINS as i128)),
         ("nMicsUsed", i(mics as i128)),
     ]))
@@ -638,6 +643,85 @@ fn a_beamformer_outside_the_fixed_beam_mode_refuses() {
     let c = mic::compile(&f.tree("mic-beam-mode"), &partial(), &mut Diagnostics::default()).unwrap();
     assert!(c.refused());
     assert!(c.report.refusals.iter().any(|r| r.contains("fixed-beam mode")), "{:?}", c.report.refusals);
+}
+
+/// A beamformer preset selecting automatically over beam 0 alone, with
+/// `change` on top (made-up blend controls).
+fn auto_beam_state(change: &[(u32, f32)]) -> ParamState {
+    let mut v = vec![
+        (0, 0.0),
+        (1, 2.0),
+        (2, 0.0),
+        (3, 1.0),
+        (4, 0.0),
+        (5, 0.0),
+        (21, 0.0),
+        (22, 0.0),
+        (23, 0.0),
+        (31, -10.0),
+        (32, 900.0),
+        (37, 150.0),
+        (42, 0.0),
+        (43, 1.0),
+    ];
+    for (id, x) in change {
+        v.iter_mut().find(|(i, _)| i == id).unwrap().1 = *x;
+    }
+    state(&v)
+}
+
+#[test]
+fn automatic_selection_over_one_beam_is_the_fixed_beam() {
+    let fixed =
+        mic::compile(&Fixture::new().tree("mic-beam-fixed"), &mic::Options::default(), &mut Diagnostics::default())
+            .unwrap();
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &auto_beam_state(&[]), false, None);
+    let auto = mic::compile(&f.tree("mic-beam-auto"), &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!auto.refused(), "{:?}", auto.report.refusals);
+    let stage = auto.report.stages.iter().find(|s| s.name == "Beam").unwrap();
+    assert_eq!(stage.status, Status::Exact);
+    assert!(stage.detail.contains("automatic selection over its one beam"), "{}", stage.detail);
+    // the same engine program as the fixed-beam mode of the same file
+    assert!(auto.params.is_some());
+    assert_eq!(auto.params, fixed.params);
+}
+
+#[test]
+fn automatic_selection_outside_the_one_beam_state_refuses() {
+    // a real candidate range, another algorithm or mode, the metric's EQ
+    // and normalisations, the switch crossfade, switching not permitted
+    for change in [
+        [(5, 1.0)],
+        [(4, 1.0)],
+        [(3, 0.0)],
+        [(3, 2.0)],
+        [(1, 1.0)],
+        [(1, 3.0)],
+        [(2, 1.0)],
+        [(21, 1.0)],
+        [(22, 1.0)],
+        [(23, 1.0)],
+        [(42, 1.0)],
+        [(43, 0.0)],
+    ] {
+        let mut f = Fixture::new();
+        f.effects[3] = unit_effect("Beam", "bmfd", &auto_beam_state(&change), false, None);
+        let c = mic::compile(&f.tree("mic-beam-auto-odd"), &partial(), &mut Diagnostics::default()).unwrap();
+        assert!(c.refused(), "{change:?}");
+        let stage = c.report.stages.iter().find(|s| s.name == "Beam").unwrap();
+        assert_eq!(stage.status, Status::Refused, "{change:?}");
+    }
+}
+
+#[test]
+fn automatic_selection_over_several_beams_refuses() {
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &auto_beam_state(&[]), false, None);
+    f.beam = beam_file_of(2, &[0.5, 0.5], 2);
+    let c = mic::compile(&f.tree("mic-beam-auto-two"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(c.refused());
+    assert!(c.report.refusals.iter().any(|r| r.contains("2 beams")), "{:?}", c.report.refusals);
 }
 
 /// The fixture's graph with a second beamformer (a delay-and-sum on the

@@ -33,7 +33,7 @@
 //! | `aufx/dspg` (nested graph) | its graph, flattened ([`nested`]) | exact when every box in it is |
 //! | `reblocker`, `dead` | nothing (structure) | structural |
 //! | `fft` pair | the short-time transform, quadrant window, frame phase 0 (black-box exact) | exact |
-//! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
+//! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode or automatic selection over one beam ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
 //! | `aufx/sens` | the noise-floor suppressor (`sgv2_core::mic::sens`): the strip's global parameters and the property-1000 noise profile; artifact step fitted, TODO(SPEC) | approximate |
 //! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, unmeasured, so partial blobs only until measured, TODO(SPEC) | uncharacterised |
 //! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
@@ -778,25 +778,66 @@ pub fn beam(file: &Dict, mics: usize, bins: usize, fs: u32, use_eq: bool, notes:
     Ok(Beam { mics, bins, weights, eq })
 }
 
-/// The beamformer's fixed-beam mode: the automatic-selection switches
-/// (controls 1, 3, 4, 5), the selection-metric normalisations (21, 22),
-/// boost limiting (23) and the uplink switch crossfade (42) off, the fixed
-/// beam (control 2) on. In this mode black-box renders of the unit equal
-/// the fixed beam of its coefficient file (coherent, single-microphone,
-/// independent and wind-like stimuli, over 130 dB): its adaptive blend
-/// (controls 28..41) is not engaged. `Err` names what differs.
-pub fn beam_mode(e: Option<&Effect>) -> std::result::Result<(), String> {
-    let e = e.ok_or_else(|| "no saved state in the strip".to_string())?;
-    let want: [(u32, f64); 9] =
-        [(1, 0.0), (2, 1.0), (3, 0.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0)];
-    for (id, v) in want {
-        match global(e, id) {
-            Some(x) if x == v => {}
-            Some(x) => return Err(format!("control {id} is {x}: only the fixed-beam mode is characterised")),
-            None => return Err(format!("control {id} missing from the saved state")),
+/// A beamformer mode whose uplink is the fixed beam of the coefficient
+/// file ([`beam_mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeamMode {
+    /// The fixed-beam mode.
+    Fixed,
+    /// Automatic selection whose candidate range is the one beam of a
+    /// one-beam file: there is nothing to select.
+    AutoSingle,
+}
+
+impl BeamMode {
+    fn detail(self) -> &'static str {
+        match self {
+            BeamMode::Fixed => "fixed-beam mode (adaptive blend not engaged)",
+            BeamMode::AutoSingle => "automatic selection over its one beam (no switch, adaptive blend not engaged)",
         }
     }
-    Ok(())
+}
+
+/// The beamformer modes that are characterised. `Err` names what differs.
+///
+/// **Fixed-beam mode**: the automatic-selection switches (controls 1, 3, 4,
+/// 5), the selection-metric normalisations (21, 22), boost limiting (23)
+/// and the uplink switch crossfade (42) off, the selection-metric EQ
+/// (control 2) on. Black-box renders of the unit equal the fixed beam of
+/// its coefficient file (coherent, single-microphone, independent and
+/// wind-like stimuli, over 130 dB): its adaptive blend (controls 28..41)
+/// is not engaged.
+///
+/// **Automatic selection over one beam**: selection mode 2 with algorithm
+/// 1 (controls 1, 3), the candidate range (4, 5) on beam 0 alone, the
+/// selection-metric EQ (2), the normalisations (21, 22), boost limiting
+/// (23) and the switch crossfade (42) off, automatic switching (43)
+/// permitted. The selection has one candidate, so its energy metric, the
+/// EQ curve that belongs to it and the switch crossfade never reach the
+/// uplink: black-box renders of the unit in this state equal its renders
+/// in the fixed-beam state of the same one-beam file, and the fixed beam
+/// (steered coherent sources, level imbalances between the microphones,
+/// onsets out of silence, wind-like and room stimuli). [`beam`] refuses a
+/// file with more than one beam, so a real selection never passes.
+pub fn beam_mode(e: Option<&Effect>) -> std::result::Result<BeamMode, String> {
+    let e = e.ok_or_else(|| "no saved state in the strip".to_string())?;
+    const FIXED: &[(u32, f64)] =
+        &[(1, 0.0), (2, 1.0), (3, 0.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0)];
+    const AUTO_SINGLE: &[(u32, f64)] =
+        &[(1, 2.0), (2, 0.0), (3, 1.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0), (43, 1.0)];
+    let get = |id: u32| global(e, id).ok_or_else(|| format!("control {id} missing from the saved state"));
+    let (mode, want, what) = if get(1)? == 2.0 {
+        (BeamMode::AutoSingle, AUTO_SINGLE, "of automatic selection, only the one-beam state is characterised")
+    } else {
+        (BeamMode::Fixed, FIXED, "only the fixed-beam mode and automatic selection over one beam are characterised")
+    };
+    for &(id, v) in want {
+        let x = get(id)?;
+        if x != v {
+            return Err(format!("control {id} is {x}: {what}"));
+        }
+    }
+    Ok(mode)
 }
 
 fn need_param(e: &Effect, id: u32, what: &str) -> Result<f64> {
@@ -1172,15 +1213,15 @@ fn beamformer(
     fs: u32,
     opts: &Options,
     notes: &mut Vec<String>,
-) -> Result<Beam> {
+) -> Result<(Beam, BeamMode)> {
     if e.is_some_and(|e| e.bypass) {
         return Err(bad(format!("{name}: a bypassed beamformer is not characterised")));
     }
-    beam_mode(e).map_err(|m| bad(format!("{name}: {m}")))?;
+    let mode = beam_mode(e).map_err(|m| bad(format!("{name}: {m}")))?;
     let bins = stft.map(|s| s.bins()).unwrap_or(0);
     let p = box_path(b, props, name, PROP_BEAM_FILE)?
         .ok_or_else(|| bad(format!("{name}: the property strip names no coefficient file")))?;
-    beam(&plist_dict(b, &p)?, mics, bins, fs, opts.beam_eq, notes)
+    Ok((beam(&plist_dict(b, &p)?, mics, bins, fs, opts.beam_eq, notes)?, mode))
 }
 
 struct FanCtx<'a> {
@@ -1261,13 +1302,13 @@ fn fan_out(c: &FanCtx<'_>, node: &str, r: &mut Report) -> Result<Fan> {
     let mut mk = |name: &str, r: &mut Report| -> Result<Beam> {
         let e = c.strip.effect(name);
         let bx = g.find_box(name).unwrap();
-        let bm = beamformer(c.b, c.props, name, e, mics, c.stft, c.fs, c.opts, &mut r.notes)?;
+        let (bm, mode) = beamformer(c.b, c.props, name, e, mics, c.stft, c.fs, c.opts, &mut r.notes)?;
         r.stage(
             name,
             &kind_name(bx),
             "freq",
             if c.opts.beam_eq && name == main { Status::Approximate } else { Status::Exact },
-            format!("fixed beam over {mics} microphones, fixed-beam mode (adaptive blend not engaged)"),
+            format!("fixed beam over {mics} microphones, {}", mode.detail()),
         );
         out.push(name.to_string());
         Ok(bm)
@@ -1669,21 +1710,21 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                 }
             }
             ("bmfd", Domain::Freq) if beam_p.is_none() => {
-                let res = (|| -> Result<Beam> {
+                let res = (|| -> Result<(Beam, BeamMode)> {
                     if out_w != 1 {
                         return Err(bad(format!("{nx}: output 0 carries {out_w} channels")));
                     }
                     beamformer(b, props.as_ref(), &nx, e, in_w, stft, fs, opts, &mut r.notes)
                 })();
                 match res {
-                    Ok(bm) => {
+                    Ok((bm, mode)) => {
                         beam_p = Some(bm);
                         r.stage(
                             &nx,
                             &kind,
                             "freq",
                             if opts.beam_eq { Status::Approximate } else { Status::Exact },
-                            format!("fixed beam over {in_w} microphones, fixed-beam mode (adaptive blend not engaged)"),
+                            format!("fixed beam over {in_w} microphones, {}", mode.detail()),
                         );
                         if opts.beam_eq {
                             r.todo("development option: EQSelection applied to the uplink (the unit does not)");
