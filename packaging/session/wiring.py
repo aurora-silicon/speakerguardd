@@ -134,8 +134,11 @@ TRANSPORTS = {
                               "speaker_irq": True},
     # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
     # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    # As there, the sense is the audio node's "sense" DMA channel: a Mac
+    # whose AOP speaker stream carries none (the M5 Mac Studio's ADT
+    # audio-speaker has one TX slot and no RX slot) names none.
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
-                              "speaker_irq": False},
+                              "speaker_irq": False, "speaker_dma": "spkr", "sense_dma": "sense"},
 }
 # The T6050 (J714s) is the same driver's T6050 configuration: six amps on the
 # T8142 transport.
