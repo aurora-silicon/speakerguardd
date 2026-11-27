@@ -20,4 +20,6 @@ pub mod thermal;
 // and the test harness (unwinding) each need their own build of the
 // sgv2-lv2 cdylib, whose two outputs share one file name.
 #[cfg(test)]
+mod lapse_tests;
+#[cfg(test)]
 mod operating_point_tests;
