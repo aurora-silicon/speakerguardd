@@ -545,9 +545,9 @@ mod tests {
     #[test]
     fn a_delay_beam_delays_inside_the_frame() {
         let mut p = unit_params(1, 480);
-        for k in 0..481 {
+        for (k, w) in p.beam.weights.iter_mut().enumerate().take(481) {
             let a = -2.0 * core::f64::consts::PI * k as f64 * 100.0 / 960.0;
-            p.beam.weights[k] = [libm::cos(a), libm::sin(a)];
+            *w = [libm::cos(a), libm::sin(a)];
         }
         let mut e = Engine::new(p).unwrap();
         let mut x = vec![0.0f32; 4800];
