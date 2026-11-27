@@ -44,6 +44,7 @@ pub mod lattice;
 pub mod lsid;
 pub mod machine;
 pub mod manifest;
+pub mod mic;
 pub mod names;
 pub mod param_fill;
 pub mod plist;

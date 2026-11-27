@@ -7,6 +7,8 @@
 //! aurora-speaker-tuning dump     [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning validate [--json] [--speaker-id N] [SOURCE]
 //! aurora-speaker-tuning compile  [--speaker-id N] [--board B [--unit-id U | --unit-id-file F]] [--development] [--voicing-pre] [--prestage identity|tuning] [SOURCE | --bundle PATH] -o BLOB
+//! aurora-speaker-tuning mic-compile [--board B [--unit-id U | --unit-id-file F]] [--development] [--allow-partial] [--report JSON] [SOURCE | --bundle PATH] -o BLOB
+//!       (the built-in microphone chain, `mic`: exit 0 written, 1 refused)
 //! aurora-speaker-tuning identify [--json] [SOURCE]   (the bundle's identity, for provisioning)
 //! aurora-speaker-tuning blob     BLOB [BLOB]     (decode; with two, diff field by field)
 //! aurora-speaker-tuning units    [--json]
@@ -70,12 +72,15 @@ struct Args {
     attestations: Option<PathBuf>,
     key_only: bool,
     buzzkill_matrix: Option<PathBuf>,
+    allow_partial: bool,
+    report: Option<PathBuf>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: aurora-speaker-tuning {{dump|validate}} [--json] [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning compile [--speaker-id N] [--board B [--unit-id U | --unit-id-file F]] [--development] [--voicing-pre] [--prestage identity|tuning] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
+         aurora-speaker-tuning mic-compile [--board B [--unit-id U | --unit-id-file F]] [--development] [--allow-partial] [--report JSON] [--bundle PATH | --tunings-root DIR --aid N] -o BLOB\n       \
          aurora-speaker-tuning plan [--speaker-id N] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning identify [--json] [PATH | --tunings-root DIR --aid N]\n       \
          aurora-speaker-tuning blob BLOB [BLOB]\n       \
@@ -94,6 +99,7 @@ fn parse_args() -> Args {
         Some("units") => "units",
         Some("plist") => "plist",
         Some("compile") => "compile",
+        Some("mic-compile") => "mic-compile",
         Some("blob") => "blob",
         Some("identify") => "identify",
         Some("plan") => "plan",
@@ -118,6 +124,8 @@ fn parse_args() -> Args {
         attestations: None,
         key_only: false,
         buzzkill_matrix: None,
+        allow_partial: false,
+        report: None,
     };
     while let Some(x) = it.next() {
         match x.as_str() {
@@ -146,6 +154,8 @@ fn parse_args() -> Args {
                 a.unit_id = Some(id);
             }
             "--development" => a.development = true,
+            "--allow-partial" => a.allow_partial = true,
+            "--report" => a.report = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             "--attestations" => a.attestations = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             "--key-only" => a.key_only = true,
             "--voicing-pre" => a.voicing_pre = true,
@@ -156,7 +166,7 @@ fn parse_args() -> Args {
                     _ => usage(),
                 };
             }
-            "-o" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
+            "-o" | "--out" | "--output" => a.out = Some(it.next().map(PathBuf::from).unwrap_or_else(|| usage())),
             p if !p.starts_with('-') && a.path.is_none() => a.path = Some(PathBuf::from(p)),
             p if !p.starts_with('-') && a.path2.is_none() => a.path2 = Some(PathBuf::from(p)),
             _ => usage(),
@@ -167,7 +177,10 @@ fn parse_args() -> Args {
     if (a.voicing_pre || a.prestage != compile::PreStageMode::default()) && a.cmd != "compile" {
         usage();
     }
-    if a.unit_id.is_some() && (a.board.is_none() || a.cmd != "compile") {
+    if (a.allow_partial || a.report.is_some()) && a.cmd != "mic-compile" {
+        usage();
+    }
+    if a.unit_id.is_some() && (a.board.is_none() || !matches!(a.cmd.as_str(), "compile" | "mic-compile")) {
         usage();
     }
     a
@@ -535,6 +548,9 @@ fn main() {
     if a.cmd == "voicing-check" {
         voicing_check(bundle, &a);
     }
+    if a.cmd == "mic-compile" {
+        mic_compile(bundle, &a);
+    }
     let mut diags = Diagnostics::default();
     let dt = std::path::Path::new(machine::DEVICE_TREE);
     let live = a.board.is_none() && dt.is_dir();
@@ -710,4 +726,63 @@ fn voicing_check(bundle: aurora_speaker_tuning::Result<Bundle>, a: &Args) -> ! {
         }
     }
     exit(if pass { 0 } else { 1 })
+}
+
+/// `mic-compile`: the built-in microphone chain ([`aurora_speaker_tuning::mic`]).
+/// Writes the blob (and the report, when asked) and exits 0, or exits 1
+/// with the refusals and no blob.
+fn mic_compile(bundle: aurora_speaker_tuning::Result<Bundle>, a: &Args) -> ! {
+    use aurora_speaker_tuning::mic;
+    let out = a.out.clone().unwrap_or_else(|| usage());
+    let mut diags = Diagnostics::default();
+    let dt = std::path::Path::new(machine::DEVICE_TREE);
+    let m = match (&a.board, &a.unit_id) {
+        (Some(b), Some(u)) => Machine::with_unit(b, u),
+        (Some(b), None) => Machine::new(b),
+        (None, _) => Machine::from_device_tree(dt),
+    };
+    let opts = mic::Options { allow_partial: a.allow_partial, ..Default::default() };
+    let res = bundle.and_then(|b| m.and_then(|m| mic::compile_blob(&b, &m, &opts, a.development, &mut diags)));
+    let (blob, report) = match res {
+        Ok(x) => x,
+        Err(e) => {
+            diags.from_error("mic-compile", &e);
+            print_diags(&diags);
+            exit(1)
+        }
+    };
+    if let Some(p) = &a.report {
+        if let Err(e) = write_atomic(p, serde_json::to_string_pretty(&report).unwrap().as_bytes()) {
+            eprintln!("{}: {e}", p.display());
+            exit(1);
+        }
+    }
+    for s in &report.stages {
+        eprintln!("{:<28} {:<16} {:<5} {:?}: {}", s.name, s.kind, s.domain, s.status, s.detail);
+    }
+    print_diags(&diags);
+    match blob {
+        Some(b) => {
+            if let Err(e) = write_atomic(&out, &b) {
+                eprintln!("{}: {e}", out.display());
+                exit(1);
+            }
+            eprintln!(
+                "wrote {} ({} bytes): {} microphones, {} Hz, latency {} frames{}",
+                out.display(),
+                b.len(),
+                report.mics,
+                report.sample_rate,
+                report.latency_frames,
+                if report.partial { ", PARTIAL (uncharacterised stages carried as identity)" } else { "" }
+            );
+            exit(0)
+        }
+        None => {
+            for r in &report.refusals {
+                eprintln!("refused: {r}");
+            }
+            exit(1)
+        }
+    }
 }
