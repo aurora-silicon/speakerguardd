@@ -801,7 +801,8 @@ struct Cl {
     /// sticky verdict.
     fresh: bool,
     drive_thres: f32,
-    trend: [(f64, f64); TREND_N],
+    /// (T_OL, smoothed R, the window's own R) per driven window.
+    trend: [(f64, f64, f64); TREND_N],
     trend_n: usize,
     /// The trend's resistance: R_s's own smoother (`k_R` per period, the
     /// same gated windows) seeded at the first window after a (re)start
@@ -909,7 +910,7 @@ impl Cl {
             active: false,
             fresh: false,
             drive_thres: c.pilot_enable_thres,
-            trend: [(0.0, 0.0); TREND_N],
+            trend: [(0.0, 0.0, 0.0); TREND_N],
             trend_n: 0,
             r_trend: f32::NAN,
             cold_n: 0,
@@ -1070,7 +1071,7 @@ impl Cl {
             self.trend.copy_within(1.., 0);
             self.trend_n -= 1;
         }
-        self.trend[self.trend_n] = (t_ol, self.r_trend as f64);
+        self.trend[self.trend_n] = (t_ol, self.r_trend as f64, self.r_window as f64);
         self.trend_n += 1;
         if self.trend_n == TREND_N {
             let pts = &self.trend[..];
@@ -1078,14 +1079,25 @@ impl Cl {
             // back while the coil wanders is not judged
             if pts[TREND_N - 1].0 - pts[0].0 >= TREND_SPAN_K {
                 let n = TREND_N as f64;
-                let (mt, mr) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
-                let cov: f64 = pts.iter().map(|p| (p.0 - mt) * (p.1 - mr)).sum();
+                let mt = pts.iter().map(|p| p.0).sum::<f64>() / n;
                 let var: f64 = pts.iter().map(|p| (p.0 - mt) * (p.0 - mt)).sum();
-                // ohm per kelvin; an honest coil's sensed R_s gains
-                // alpha * (R_cal - Rshunt) / RdcScale
-                let slope = cov / var;
+                // ohm per kelvin of R against T_OL
+                let slope = |r: fn(&(f64, f64, f64)) -> f64| {
+                    let mr = pts.iter().map(r).sum::<f64>() / n;
+                    pts.iter().map(|p| (p.0 - mt) * (r(p) - mr)).sum::<f64>() / var
+                };
+                // an honest coil's sensed R_s gains
+                // alpha * (R_cal - Rshunt) / RdcScale per kelvin
                 let honest = (self.cal_r - self.rshunt as f64) / (self.inv_temp_co as f64 * self.rdc_scale);
-                if slope < -TREND_SLOPE_FRAC * honest {
+                // both the smoothed and the single windows' resistance must
+                // fall: the smoothed alone also falls when it starts from a
+                // stale hot value after a gap and catches up with a cooler
+                // coil that is honestly warming (J615 ladder at volume 1.0,
+                // S100 -> F100: windows rising, R_s falling, a false trip);
+                // the windows alone fall on noise (the J616s ring above). A
+                // sense that is not reading the coil falls on both.
+                let lim = -TREND_SLOPE_FRAC * honest;
+                if slope(|p| p.1) < lim && slope(|p| p.2) < lim {
                     self.implausible = true;
                 }
             }

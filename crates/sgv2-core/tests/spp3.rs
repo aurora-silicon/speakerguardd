@@ -1355,3 +1355,58 @@ fn a_drive_scale_models_the_capped_amps_exactly_and_unity_is_the_reference() {
     u.set_drive_scale(1e-6);
     assert!((u.drive_scale() - spp3::MIN_DRIVE_SCALE).abs() < 1e-9);
 }
+
+/// The J615 full-sweep ladder shape (SGV2-AIRS, 11-28, volume 1.0: S100
+/// then F100): a loud episode leaves R_s hot, then no window is accepted
+/// for tens of seconds (the next speaker's sweep, then a suspended graph)
+/// while the honest coil cools. The next stream's first windows read the
+/// cooler coil and rise with it as a bass sweep heats it, but the
+/// smoother starts from the stale hot value and falls toward them while
+/// the model climbs: judged on the smoothed resistance alone, the ring of
+/// the first eight windows fell and tripped SENSE_IMPLAUSIBLE on two
+/// woofers 3.6 s into the sweep. The single windows rose all the while:
+/// an honest coil, no trip. The [V,I]-swap fall still trips after the
+/// same gap.
+#[test]
+fn plausibility_guard_ignores_the_smoother_lag_after_a_gap() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    for swapped in [false, true] {
+        let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+        let upw = rp.updates_per_window().round() as usize;
+        // the loud episode: the coil heats honestly to 75 C, the model to 130 C
+        for k in 0..40 {
+            let t = tc + 50.0 * k as f64 / 39.0;
+            let (_, _, bad) = replay_window(&mut rp, upw, coil_r(tc, t), tc + 105.0 * k as f64 / 39.0);
+            assert!(!bad, "heating, window {k}");
+        }
+        // 25 s without an accepted window: silent windows are rejected, the
+        // model cools back to 55 C (the coil cools too, unseen)
+        let n = (25.0 * 48_000.0 / 256.0) as usize;
+        for k in 0..n {
+            if k % upw == 0 {
+                assert!(!rp.window(0.0, 0.0), "a silent window is rejected");
+            }
+            let (_, _, bad) = rp.update(130.0 - 75.0 * k as f64 / n as f64, 0.0);
+            assert!(!bad, "gap, update {k}");
+        }
+        // the next sweep's bass: the model climbs 2.3 K per window from 55 C;
+        // the coil from 40 C honestly warms 1.5 K per window (or, swapped,
+        // reads 1 K-equivalent colder each window: a fall at 0.43 of an
+        // honest coil's rise against the model)
+        let mut tripped = None;
+        for k in 0..30 {
+            let t = if swapped { 40.0 - 1.0 * k as f64 } else { 40.0 + 1.5 * k as f64 };
+            let o = replay_window(&mut rp, upw, coil_r(tc, t), 55.0 + 2.3 * k as f64);
+            if o.2 && tripped.is_none() {
+                tripped = Some(k);
+            }
+        }
+        if swapped {
+            let k = tripped.expect("the falling sense still trips after the gap");
+            assert!(k <= 20, "tripped late: window {k}");
+        } else {
+            assert_eq!(tripped, None, "an honest coil warming after a gap tripped at window {tripped:?}");
+        }
+    }
+}
