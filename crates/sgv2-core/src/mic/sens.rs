@@ -316,6 +316,12 @@ impl Run {
         let bins = self.p.bins();
         for (m, blk) in blocks.iter_mut().enumerate().take(self.p.mics) {
             let blk = &mut blk[..hop];
+            // A non-finite sample would stay in the smoothers and the
+            // overlap-add for good: take it as silence, as the engine does
+            // ahead of its stages (this keeps a direct caller safe too).
+            for x in blk.iter_mut().filter(|x| !x.is_finite()) {
+                *x = 0.0;
+            }
             if self.p.bypass {
                 for (x, p) in blk.iter_mut().zip(self.prev[m].iter_mut()) {
                     let v = f64::from(*x);
@@ -413,6 +419,25 @@ pub(crate) mod tests {
 
     fn rms(x: &[f32]) -> f64 {
         (x.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn non_finite_input_is_silence_and_the_state_recovers() {
+        let p = params(2, 480);
+        let mut x = vec![noise(48_000, 0.05, 3), noise(48_000, 0.05, 4)];
+        for v in &mut x[0][4_800..4_900] {
+            *v = f32::NAN;
+        }
+        x[1][9_600] = f32::INFINITY;
+        x[1][9_601] = f32::NEG_INFINITY;
+        let y = run(&p, &x);
+        assert!(y.iter().all(|c| c.iter().all(|v| v.is_finite())));
+        // well after the bad samples the output tracks the clean input again
+        let clean = run(&p, &[noise(48_000, 0.05, 3), noise(48_000, 0.05, 4)]);
+        for (a, b) in y.iter().zip(&clean) {
+            let tail = 38_400..48_000;
+            assert!((rms(&a[tail.clone()]) / rms(&b[tail])).ln().abs() < 0.01);
+        }
     }
 
     #[test]
