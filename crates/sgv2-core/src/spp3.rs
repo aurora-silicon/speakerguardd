@@ -1017,6 +1017,19 @@ impl Cl {
         let r = libm::sqrtf(pv / pi);
         self.r_window = r;
         self.r_s += self.k_r * (r - self.r_s);
+        // after a ring's worth of windows without an accepted one (frames
+        // the unit processed: another speaker's sweep, a pilot that
+        // stopped) the coil has moved unseen and the ring holds another
+        // episode: the trend restarts at this window, as after a rebuild.
+        // A smoother left at the stale value would fall toward a coil that
+        // cooled meanwhile while the model climbs again (J615 ladder at
+        // volume 1.0, S100 -> F100: both right woofers tripped 3.6 s into
+        // the sweep, their windows rising throughout). Windows that keep
+        // coming are judged as before.
+        if self.age >= TREND_N * self.window {
+            self.trend_n = 0;
+            self.r_trend = f32::NAN;
+        }
         self.r_trend = if self.r_trend.is_finite() { self.r_trend + self.k_r * (r - self.r_trend) } else { r };
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
         // Float32, Rw = RdcScale * R_s, the logged window resistance (rig
