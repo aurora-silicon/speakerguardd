@@ -61,11 +61,15 @@ fn be(v: &[f32]) -> Value {
 /// A beam file: one beam, `mics` microphones, real weights `w[m]` on
 /// every bin.
 fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
+    beam_file_n(mics, w, BINS)
+}
+
+fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
     let mut re = Vec::new();
     let mut im = Vec::new();
     for (m, wm) in w.iter().enumerate().take(mics) {
-        re.push((format!("Mic{m}"), be(&vec![*wm; BINS])));
-        im.push((format!("Mic{m}"), be(&vec![0.0; BINS])));
+        re.push((format!("Mic{m}"), be(&vec![*wm; bins])));
+        im.push((format!("Mic{m}"), be(&vec![0.0; bins])));
     }
     let as_dict = |v: Vec<(String, Value)>| {
         let mut d = aurora_speaker_tuning::plist::Dict::new();
@@ -78,7 +82,7 @@ fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
         ("Azimuth", r(0.0)),
         ("Description", s("Beam0")),
         ("Distance", r(1.0)),
-        ("EQSelection", be(&vec![1.0; BINS])),
+        ("EQSelection", be(&vec![1.0; bins])),
         ("Elevation", r(90.0)),
         ("ImagCoefficients", as_dict(im)),
         ("NonZeroMics", be(&vec![1.0; mics])),
@@ -88,7 +92,7 @@ fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
         ("Beam0", beam0),
         ("SampleRate", i(48_000)),
         ("nBeams", i(1)),
-        ("nCoefficients", i(BINS as i128)),
+        ("nCoefficients", i(bins as i128)),
         ("nMicsUsed", i(mics as i128)),
     ]))
 }
@@ -98,7 +102,7 @@ fn sens_file(mics: usize, power: f32, block: f64) -> Vec<u8> {
     let mut kv = vec![("BlockSize", r(block)), ("NumberOfChannels", i(mics as i128)), ("SampleRate", r(48_000.0))];
     let names: Vec<String> = (0..mics).map(|m| format!("NoiseProfile{m}")).collect();
     for n in &names {
-        kv.push((n.as_str(), be(&vec![power; BINS])));
+        kv.push((n.as_str(), be(&vec![power; block as usize + 1])));
     }
     binary::write(&dict(kv))
 }
@@ -766,4 +770,108 @@ fn the_phase_companion_is_a_butterworth_allpass() {
     let s = b2[0];
     assert!((s.a1 - (-2.0 * w0.cos() / a0)).abs() < 1e-9 && (s.a2 - (1.0 - alpha) / a0).abs() < 1e-9, "{s:?}");
     assert!((s.b0 - s.a2).abs() < 1e-12 && (s.b1 - s.a1).abs() < 1e-12 && (s.b2 - 1.0).abs() < 1e-12);
+}
+
+/// The base graph with the suppressor and pre-gain moved after the analysis
+/// (`freq_sens`) and/or a trackpad block after the synthesis (`trackpad`).
+fn neo_graph(freq_sens: bool, trackpad: bool) -> String {
+    // the trackpad block is characterised at block 480 only
+    let mut g = graph(None).replace(&format!("[def blockSize {HOP}]"), "[def blockSize 480]");
+    if freq_sens {
+        let time = "wire Rb Sens ([fs] [numChansIn] [blockSize])\nwire Sens Pre ([fs] [numChansIn] [blockSize])\n\
+                    wire Pre A ([fs] [numChansIn] [blockSize])\nwire A (Beam 0) (freq [fs] [numChansIn] [blockSize])\n\
+                    wire A (Beam 1) (freq [fs] [numChansIn] [blockSize])\n";
+        assert!(g.contains(time));
+        g = g.replace(
+            time,
+            "wire Rb A ([fs] [numChansIn] [blockSize])\nwire A Sens (freq [fs] [numChansIn] [blockSize])\n\
+             wire Sens Pre (freq [fs] [numChansIn] [blockSize])\nwire Pre (Beam 0) (freq [fs] [numChansIn] [blockSize])\n\
+             wire Pre (Beam 1) (freq [fs] [numChansIn] [blockSize])\n",
+        );
+    }
+    if trackpad {
+        let path = "wire S Eq ([fs] 1 [blockSize])\n";
+        assert!(g.contains(path));
+        g = g.replace(
+            path,
+            "box Tp (aufx nnet appl) 1 1\nbox Td delay 1 1\nbox Tn adif 2 1\nbox Ta dbgn 1 1\nbox Tm asum 2 1\n\
+             wire S Tp ([fs] 1 [blockSize])\nwire S Td ([fs] 1 [blockSize])\nwire Td (Tn 0) ([fs] 1 [blockSize])\n\
+             wire Tp (Tn 1) ([fs] 1 [blockSize])\nwire Tn Ta ([fs] 1 [blockSize])\nwire Tp (Tm 0) ([fs] 1 [blockSize])\n\
+             wire Ta (Tm 1) ([fs] 1 [blockSize])\nwire Tm Eq ([fs] 1 [blockSize])\nwireParam (Tp 14 0 0) (Td 0 0 0)\n",
+        );
+    }
+    g
+}
+
+fn neo_fixture(freq_sens: bool, trackpad: bool, unit_bypassed: bool) -> Fixture {
+    let mut f = Fixture::new();
+    f.graph = neo_graph(freq_sens, trackpad);
+    f.sens = sens_file(2, 0.0, 480.0);
+    f.beam = beam_file_n(2, &[0.5, 0.5], 481);
+    if trackpad {
+        f.effects.push(unit_effect("Tp", "nnet", &state(&[(0, 0.0)]), unit_bypassed, None));
+    }
+    f
+}
+
+#[test]
+fn a_frequency_placed_suppressor_with_a_bypassed_trackpad_block_is_the_time_domain_chain() {
+    let base = mic::compile(
+        &neo_fixture(false, false, true).tree("mic-neo-base"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(!base.refused(), "{:?}", base.report.refusals);
+    let c = mic::compile(
+        &neo_fixture(true, true, true).tree("mic-neo"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    let st: Vec<(&str, &Status)> = c.report.stages.iter().map(|s| (s.name.as_str(), &s.status)).collect();
+    for n in ["Tp", "Td", "Tn", "Ta", "Tm"] {
+        assert!(st.contains(&(n, &Status::Exact)), "{st:?}");
+    }
+    // the suppressor's extra block is the trackpad block's delay: the same
+    // engine as the time-domain graph without the block
+    assert_eq!(c.params.unwrap(), base.params.unwrap());
+}
+
+#[test]
+fn a_trackpad_block_without_a_frequency_placed_suppressor_refuses() {
+    let c = mic::compile(
+        &neo_fixture(false, true, true).tree("mic-neo-tp-alone"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains("trackpad block")), "{:?}", c.report.refusals);
+}
+
+#[test]
+fn a_frequency_placed_suppressor_without_a_trackpad_block_refuses() {
+    let c = mic::compile(
+        &neo_fixture(true, false, true).tree("mic-neo-sens-alone"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains("one block later")), "{:?}", c.report.refusals);
+}
+
+#[test]
+fn a_trackpad_block_with_a_live_neural_unit_refuses() {
+    let c = mic::compile(
+        &neo_fixture(true, true, false).tree("mic-neo-tp-live"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(
+        c.refused() && c.report.refusals.iter().any(|r| r.contains("only a bypassed neural unit")),
+        "{:?}",
+        c.report.refusals
+    );
 }
