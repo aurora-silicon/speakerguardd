@@ -484,6 +484,41 @@ pub fn notch(f0: f64, q: f64, fs: f64) -> sgv2_core::prestage::Section {
 /// Slot type 6 (see [`notch`]).
 const NOTCH_SLOT: f64 = 6.0;
 
+/// Slot type 20: the phase companion of a Linkwitz-Riley crossover of the
+/// slot's order (slot parameter 5) at the slot frequency. Its magnitude is
+/// flat; its phase is that of the crossover's summed bands, i.e. the
+/// all-pass with the poles of a Butterworth low-pass of half the order
+/// (measured on the unit: flat magnitude, group delay within 0.4 samples of
+/// the Butterworth-3 all-pass for an order-6 slot at its frequency).
+const PHASE_SLOT: f64 = 20.0;
+
+/// The all-pass with the poles of a digital Butterworth low-pass of order
+/// `n` at `f0` (bilinear, prewarped), as second-order sections (a real
+/// pole gets a first-order section in biquad form).
+pub fn butterworth_allpass(n: usize, f0: f64, fs: f64) -> Vec<sgv2_core::prestage::Section> {
+    let wc = 2.0 * fs * (std::f64::consts::PI * f0 / fs).tan();
+    let k2 = 2.0 * fs;
+    let mut out = Vec::new();
+    // analog prototype poles in the upper half plane plus the real one
+    for k in 0..n.div_ceil(2) {
+        let theta = std::f64::consts::PI * (2 * k + n + 1) as f64 / (2 * n) as f64;
+        let (sr, si) = (wc * theta.cos(), wc * theta.sin());
+        // bilinear z = (k2 + s) / (k2 - s)
+        let (nr, ni) = (k2 + sr, si);
+        let (dr, di) = (k2 - sr, -si);
+        let den = dr * dr + di * di;
+        let (zr, zi) = ((nr * dr + ni * di) / den, (ni * dr - nr * di) / den);
+        if si.abs() < 1e-9 * wc {
+            // real pole z = zr: H = (-zr + z^-1) / (1 - zr z^-1)
+            out.push(sgv2_core::prestage::Section { b0: -zr, b1: 1.0, b2: 0.0, a1: -zr, a2: 0.0 });
+        } else {
+            let (a1, a2) = (-2.0 * zr, zr * zr + zi * zi);
+            out.push(sgv2_core::prestage::Section { b0: a2, b1: a1, b2: 1.0, a1, a2 });
+        }
+    }
+    out
+}
+
 /// A filter box at its saved state (the shared filter-box law,
 /// `crate::prestage::voicing_tone`, at the box's saved SystemVolume, as the
 /// speaker voicing carries a box the graph does not drive), as chain nodes
@@ -506,6 +541,38 @@ fn tone_nodes(bx: &GraphBox, e: &Effect, width: usize, overrides: &[(u32, f64)],
     for slot in 0..50u32 {
         let at = 14 + 10 * slot;
         let running = get(at).is_some_and(|st| (st as u32) & 2 != 0);
+        if running && get(at + 1) == Some(PHASE_SLOT) {
+            let (gain, f0, order) =
+                (get(at + 2).unwrap_or(f64::NAN), get(at + 3).unwrap_or(f64::NAN), get(at + 5).unwrap_or(f64::NAN));
+            let group = get(at + 9).unwrap_or(0.0);
+            let even = order.fract() == 0.0 && (2.0..=16.0).contains(&order) && (order as u32) % 2 == 0;
+            if gain != 0.0
+                || !even
+                || !(f0 > 0.0 && f0 < fs / 2.0)
+                || group.fract() != 0.0
+                || !(0.0..10.0).contains(&group)
+            {
+                return Err(bad(format!(
+                    "filter box {}: phase slot {slot}: gain {gain}, frequency {f0}, order {order}, group {group}",
+                    bx.name
+                )));
+            }
+            if !crate::prestage::automation(&base).is_empty() {
+                return Err(bad(format!("filter box {}: phase slot {slot} in a box with volume automation", bx.name)));
+            }
+            off.push((at, 0.0));
+            if group_bypass >> (group as u32) & 1 != 0 {
+                continue;
+            }
+            // Measured: the phase companion acts on every channel of the box
+            // (whole-graph renders match to 64 dB only so); slot word 7 is
+            // not a channel mask for this type.
+            let ap = butterworth_allpass(order as usize / 2, f0, fs);
+            for n in notches.iter_mut() {
+                n.extend_from_slice(&ap);
+            }
+            continue;
+        }
         if !running || get(at + 1) != Some(NOTCH_SLOT) {
             continue;
         }

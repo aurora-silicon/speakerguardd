@@ -745,3 +745,25 @@ fn a_low_frequency_blend_after_two_beamformers_compiles_and_runs() {
     let c = mic::compile(&f2.tree("mic-lwbo-ref"), &partial(), &mut Diagnostics::default()).unwrap();
     assert!(c.refused());
 }
+
+#[test]
+fn the_phase_companion_is_a_butterworth_allpass() {
+    let fs = 48_000.0;
+    // order-6 slot -> Butterworth-3 all-pass: one first- and one second-order section
+    let ap = mic::butterworth_allpass(3, 3000.0, fs);
+    assert_eq!(ap.len(), 2);
+    for hz in [20.0, 300.0, 3000.0, 9000.0, 20_000.0] {
+        let m: f64 = ap.iter().map(|s| s.magnitude(hz, fs)).product();
+        assert!((m - 1.0).abs() < 1e-9, "{hz} Hz: {m}");
+    }
+    // order 2 (Butterworth-1 all-pass is first order); Butterworth-2 = the
+    // textbook second-order all-pass at Q = 1/sqrt(2)
+    let b2 = mic::butterworth_allpass(2, 1000.0, fs);
+    assert_eq!(b2.len(), 1);
+    let w0 = 2.0 * std::f64::consts::PI * 1000.0 / fs;
+    let alpha = w0.sin() / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
+    let a0 = 1.0 + alpha;
+    let s = b2[0];
+    assert!((s.a1 - (-2.0 * w0.cos() / a0)).abs() < 1e-9 && (s.a2 - (1.0 - alpha) / a0).abs() < 1e-9, "{s:?}");
+    assert!((s.b0 - s.a2).abs() < 1e-12 && (s.b1 - s.a1).abs() < 1e-12 && (s.b2 - 1.0).abs() < 1e-12);
+}
