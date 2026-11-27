@@ -173,7 +173,7 @@ refusing when the copy disagrees, is an open item.
 
 | Change | Its machine-specific part | Maps onto |
 |---|---|---|
-| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; `operating_volume_db`; `protect_highpass` keyed by board | transport entry per block, but only together with a refusal that does not depend on the ceiling latch (`derive()` refuses a bundle that names a high-pass the reader does not compile); the ceiling only via provider 1 and the high-pass only from the bundle. Neither ships as a table of ours (board- or speaker-keyed); until the providers exist that Mac gets no grant |
+| T8152 transport without sense, fixed ceiling, high-pass (J873g) | `apple,t8152-aop-audio` entry; the ceiling (now the card's own: the amp volumes' TLV maximum under the grant, provider 1; `operating_volume_cap_db` can only lower it); `protect_highpass` keyed by board | transport entry per block, but only together with a refusal that does not depend on the ceiling latch (`derive()` refuses a bundle that names a high-pass the reader does not compile); the ceiling only via provider 1 and the high-pass only from the bundle. Neither ships as a table of ours (board- or speaker-keyed); until the providers exist that Mac gets no grant |
 | T8142/T6050 transport without a sense channel | `speaker_dma`/`sense_dma` on the driver entry | as is: per block, `sense_path` |
 | K114c sense on the v2 path | applied sense geometry | as is: `alsa:` applied hw params |
 | Fail closed on an unproven method; units without sense by name | method dispatch, `NO_SENSE_UNITS` | as is: `tuning:` unit kind |

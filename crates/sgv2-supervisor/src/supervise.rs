@@ -66,13 +66,33 @@ pub struct Expect {
     pub fixed_full_scale_mv: u32,
     /// The front-end the speaker mux must select: the watched PCM's id.
     pub route: String,
+    /// gate.json's cap on this board's operating volume, cdB on the volume
+    /// control's own TLV (`None`: none below 0 dB), from the self-check's
+    /// record (`volume_cap_cdb`). It only ever lowers what the machine
+    /// reports: the operating volume is the ceiling the card reports under
+    /// the grant (see `Supervisor::volume_problem`), and a ceiling above the
+    /// cap latches.
+    pub volume_cap_cdb: Option<i32>,
 }
 
 impl Expect {
     pub fn new(machine: &Machine, full_scale_mv: Vec<u32>, route: &str) -> Self {
         let fixed_full_scale_mv =
             if machine.amp.has_gain_control() { 0 } else { full_scale_mv.iter().copied().min().unwrap_or(0) };
-        Expect { amps: machine.amps, amp: machine.amp, full_scale_mv, fixed_full_scale_mv, route: route.to_owned() }
+        Expect {
+            amps: machine.amps,
+            amp: machine.amp,
+            full_scale_mv,
+            fixed_full_scale_mv,
+            route: route.to_owned(),
+            volume_cap_cdb: None,
+        }
+    }
+
+    /// The same, with gate.json's cap on the operating volume (the
+    /// self-check record's `volume_cap_cdb`).
+    pub fn with_volume_cap_cdb(self, volume_cap_cdb: Option<i32>) -> Self {
+        Expect { volume_cap_cdb, ..self }
     }
 }
 
@@ -149,12 +169,24 @@ impl Supervisor {
         Ok(None)
     }
 
-    /// While the kernel grants, every amp must sit at the operating volume:
-    /// 0 dB as the control's own dB TLV reads it (the tas2764 DVC, the
-    /// J700 driver's software gain below the wire's full scale). The raw
-    /// value that is 0 dB is the driver's scale, read from the card, not
-    /// a number kept here. A volume without a dB scale is not proven to be
-    /// at the operating point, and latches like a wrong one.
+    /// While the kernel grants, every amp must sit at the operating volume,
+    /// as the control's own dB TLV reads it (the tas2764 DVC, the J700
+    /// driver's software gain below the wire's full scale). The raw value
+    /// is the driver's scale, read from the card, not a number kept here.
+    /// A volume without a dB scale is not proven to be at the operating
+    /// point, and latches like a wrong one.
+    ///
+    /// The operating volume is the machine's: the ceiling the card reports
+    /// under the grant, the dB at every amp volume's maximum (its TLV at
+    /// the limit macaudio sets): 0 dB on every board but one whose speaker
+    /// only a lease may lift (macaudio's spk_fixed_ceiling, the J873g's
+    /// -16 dB). The amps must report one ceiling, from -40 to 0 dB and no
+    /// higher than gate.json's cap (`Expect::volume_cap_cdb`, which can
+    /// only lower it), and sit exactly at it. A card that reports no
+    /// ceiling latches, whatever gate.json says; so does one that put the
+    /// amps louder, or anywhere else. The operating point is still the amp
+    /// gain's full scale: the model is computed for that drive, which is
+    /// the ceiling's dB more than the speaker gets.
     fn volume_problem(&self, kernel: &mut dyn Kernel) -> Result<Option<String>, KernelError> {
         let x = &self.expect;
         let v = kernel.levels(x.amp.volume_suffix())?;
@@ -162,9 +194,41 @@ impl Supervisor {
         if v.len() != n {
             return Ok(Some(format!("granted, but {} of {n} amp volumes", v.len())));
         }
-        Ok(v.iter()
-            .find(|l| l.centi_db != Some(0))
-            .map(|l| format!("granted, but {} is at {} ({:?} cdB), not 0 dB", l.amp, l.value, l.centi_db)))
+        let db = |c: i32| f64::from(c) / 100.0;
+        let Some(ceiling) = v.first().and_then(|l| l.max_centi_db) else {
+            return Ok(Some("granted, but the amp volume reports no ceiling (no dB scale at its maximum)".into()));
+        };
+        if let Some(l) = v.iter().find(|l| l.max_centi_db != Some(ceiling)) {
+            return Ok(Some(format!(
+                "granted, but {} reports a ceiling of {:?} cdB, not the {} dB of {}",
+                l.amp,
+                l.max_centi_db,
+                db(ceiling),
+                v[0].amp
+            )));
+        }
+        if !(-4000..=0).contains(&ceiling) {
+            return Ok(Some(format!(
+                "granted, but the amp volumes' ceiling is {} dB, not from -40 to 0 dB",
+                db(ceiling)
+            )));
+        }
+        if let Some(cap) = x.volume_cap_cdb.filter(|&cap| ceiling > cap) {
+            return Ok(Some(format!(
+                "granted, but the amp volumes' ceiling is {} dB, above gate.json's {} dB for this board",
+                db(ceiling),
+                db(cap)
+            )));
+        }
+        Ok(v.iter().find(|l| l.centi_db != Some(ceiling)).map(|l| {
+            format!(
+                "granted, but {} is at {} ({:?} cdB), not at its ceiling of {} dB",
+                l.amp,
+                l.value,
+                l.centi_db,
+                db(ceiling)
+            )
+        }))
     }
 
     pub fn tick(&mut self, obs: Observation, kernel: &mut dyn Kernel) -> Result<Event, Fatal> {
@@ -281,6 +345,7 @@ mod tests {
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
         // a granted amp off the operating volume releases to the floor
         k.volume = Some(("Speaker Playback Volume".into(), (200, Some(-50)), (161, Some(-2000))));
+        k.ceiling = Some(Some(0));
         assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::Released { .. }) | Ok(Event::HardFault(_))));
         assert!(!k.held);
         // a blob for another operating point never grants
@@ -453,6 +518,7 @@ mod tests {
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed));
         // the shared gain away from the operating point while granted latches
         k.volume = Some(("Speaker Playback Volume".into(), (100, Some(-1350)), (87, Some(-2000))));
+        k.ceiling = Some(Some(0));
         assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))));
         // a blob whose channels are not one operating point is refused
         let mut k = neo_card();
@@ -460,16 +526,103 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased));
         }
-        // granted, the volume must read 0 dB on its own scale: a control
-        // without a dB TLV, or a top that is not 0 dB, latches
-        for held in [(127, None), (127, Some(-50)), (126, Some(-50))] {
+        // granted, the volume must read its ceiling on its own scale: a
+        // control without a dB TLV, or a level below a 0 dB top, latches
+        for (held, top) in [((127, None), None), ((126, Some(-50)), Some(0)), ((127, Some(0)), None)] {
             let mut k = neo_card();
             k.volume = Some(("Speaker Playback Volume".into(), held, (87, Some(-2000))));
+            k.ceiling = Some(top);
             let mut s = Supervisor::new(Expect::new(neo, vec![7_300, 7_330], "Secondary"));
             s.tick(CLEAN, &mut k).unwrap();
             assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
             assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))), "{held:?}");
             assert!(!k.held);
+        }
+    }
+
+    /// The J873g's shape: one SN012776 whose kernel lifts it under the
+    /// lease only to its fixed ceiling, -16 dB on the DVC (raw 169, the
+    /// control's limit under the grant), and a blob for amp gain 15
+    /// (11.89 V peak). The ceiling comes from the card; nothing names the
+    /// board.
+    #[test]
+    fn a_fixed_ceiling_board_grants_only_at_the_ceiling_the_card_reports() {
+        let m = &Machine { board: "j873g", card_id: "AppleJ873", amps: 1, amp: Amp::Sn012776 };
+        let card = |held: crate::kernel::Level, ceiling: Option<Option<i32>>| {
+            let mut k = Recorder::healthy(1);
+            k.volume = Some(("Speaker Volume".into(), held, (1, Some(-10000))));
+            k.ceiling = ceiling;
+            k
+        };
+        let at = |cap: Option<i32>| Expect::new(m, vec![11_890], "Secondary").with_volume_cap_cdb(cap);
+        // the reported ceiling, no gate.json entry, or one at or above it: grants
+        for cap in [None, Some(-1600), Some(0)] {
+            let mut k = card((169, Some(-1600)), None);
+            let mut s = Supervisor::new(at(cap));
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::StayedReleased), "{cap:?}");
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted), "{cap:?}");
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Renewed), "{cap:?}");
+        }
+        let latches = |mut k: Recorder, cap: Option<i32>, want: &str| {
+            let mut s = Supervisor::new(at(cap));
+            s.tick(CLEAN, &mut k).unwrap();
+            assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted), "{want}");
+            match s.tick(CLEAN, &mut k) {
+                Ok(Event::HardFault(why)) => assert!(why.contains(want), "{want}: {why}"),
+                e => panic!("{want}: {e:?}"),
+            }
+            assert!(!k.held, "{want}");
+        };
+        // held off the ceiling: louder, just above or below it, or without a dB scale
+        for held in [(201, Some(0)), (170, Some(-1550)), (168, Some(-1650)), (169, None)] {
+            latches(card(held, Some(Some(-1600))), None, "not at its ceiling of -16 dB");
+        }
+        // no ceiling from the card: latched, with or without a gate.json entry
+        for cap in [None, Some(-1600)] {
+            latches(card((169, Some(-1600)), Some(None)), cap, "reports no ceiling");
+        }
+        // a ceiling above gate.json's cap: latched, the cap only lowers it
+        latches(card((169, Some(-1600)), None), Some(-2000), "above gate.json's -20 dB");
+        // a ceiling above 0 dB, or below -40 dB
+        latches(card((213, Some(600)), None), None, "not from -40 to 0 dB");
+        latches(card((100, Some(-5050)), None), None, "not from -40 to 0 dB");
+        // amps that report different ceilings
+        let mut k = card((169, Some(-1600)), None);
+        k.amps.push("Amp 1".into());
+        k.amp_faults.push(AmpFault { amp: "Amp 1".into(), bits: 0, events: 0, group_off: false });
+        struct Split(Recorder);
+        impl Kernel for Split {
+            fn renew(&mut self) -> Result<(), KernelError> {
+                self.0.renew()
+            }
+            fn release(&mut self) -> Result<(), KernelError> {
+                self.0.release()
+            }
+            fn granted(&mut self) -> Result<bool, KernelError> {
+                self.0.granted()
+            }
+            fn faults(&mut self) -> Result<Vec<AmpFault>, KernelError> {
+                self.0.faults()
+            }
+            fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
+                let mut v = self.0.levels(suffix)?;
+                if suffix != GAIN_CONTROL_SUFFIX && self.0.held {
+                    v[1].max_centi_db = Some(0);
+                }
+                Ok(v)
+            }
+            fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
+                self.0.speaker_route()
+            }
+        }
+        let two = &Machine { board: "j873g", card_id: "AppleJ873", amps: 2, amp: Amp::Sn012776 };
+        let mut k = Split(k);
+        let mut s = Supervisor::new(Expect::new(two, vec![11_890, 11_890], "Secondary"));
+        s.tick(CLEAN, &mut k).unwrap();
+        assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
+        match s.tick(CLEAN, &mut k) {
+            Ok(Event::HardFault(why)) => assert!(why.contains("reports a ceiling of Some(0) cdB"), "{why}"),
+            e => panic!("{e:?}"),
         }
     }
 
@@ -507,7 +660,13 @@ mod tests {
         fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
             let mut v = self.0.levels(suffix)?;
             if suffix == GAIN_CONTROL_SUFFIX {
-                v[3] = AmpLevel { amp: "Amp 3".into(), value: 14, centi_db: Some(1800), step_centi_db: Some(50) };
+                v[3] = AmpLevel {
+                    amp: "Amp 3".into(),
+                    value: 14,
+                    centi_db: Some(1800),
+                    step_centi_db: Some(50),
+                    max_centi_db: Some(1800),
+                };
             }
             Ok(v)
         }
@@ -634,8 +793,10 @@ mod tests {
 
     #[test]
     fn a_grant_without_the_operating_volume_latches() {
+        // the kernel lifted the limit to 0 dB, the amps stayed at -10.5 dB
         let mut k = Recorder::healthy(6);
         k.volume = Some(("Speaker Volume".into(), (180, Some(-1050)), (0, None)));
+        k.ceiling = Some(Some(0));
         let mut s = j316();
         s.tick(CLEAN, &mut k).unwrap();
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
@@ -754,6 +915,7 @@ mod tests {
         assert_eq!(s.tick(CLEAN, &mut k), Ok(Event::Granted));
         // a volume that is wrong while the grant stays live still latches
         k.0.volume = Some(("Speaker Volume".into(), (180, Some(-1050)), (0, None)));
+        k.0.ceiling = Some(Some(0));
         assert!(matches!(s.tick(CLEAN, &mut k), Ok(Event::HardFault(_))));
         assert!(!k.0.held);
     }

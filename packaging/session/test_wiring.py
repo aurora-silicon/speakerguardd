@@ -1528,6 +1528,41 @@ class Record(unittest.TestCase):
         self.assertTrue(all("=" in l for l in lines))
 
 
+    def test_a_record_carries_only_the_gate_cap_never_the_volume(self):
+        # no cap is no line; a cap (0 dB included) is volume_cap_cdb; the
+        # volume itself is the card's ceiling, so no record names it
+        rec = {"schema": 1, "version": 3, "result": "pass", "board": "j873g", "kernel": "k", "params_sha256": "ab",
+               "wiring": "d1d62e8a0aaaef3d", "card": "AppleJ873", "amps": 1, "sense": 0, "family": "sn012776",
+               "key": "j873", "method": "derived-nosense", "reasons": []}
+        for r in (rec, dict(rec, volume_cap_cdb=None)):
+            self.assertFalse(any(l.startswith("volume_") for l in sgsc.bind_lines(r).splitlines()))
+        for cap in (0, -1600):
+            lines = sgsc.bind_lines(dict(rec, volume_cap_cdb=cap)).splitlines()
+            self.assertEqual([l for l in lines if l.startswith("volume_")], [f"volume_cap_cdb={cap}"])
+
+
+class OperatingVolumeCap(unittest.TestCase):
+    """gate.json operating_volume_cap_db: a cap that can only lower the
+    ceiling the card reports under the grant, never a volume of its own.
+    No board, the J873g included, carries one: its -16 dB is the card's."""
+
+    def test_shipped_gate_names_no_board(self):
+        self.assertEqual(gen.load_gate()["operating_volume_cap_db"], {})
+        self.assertNotIn("operating_volume_db", gen.load_gate())
+        for board in ("j316s", "j413", "j616s", "j700", "j773g", "j813", "j815", "j873g"):
+            self.assertIsNone(gen.operating_volume_cap_db(board), board)
+
+    def test_malformed_values_refuse_the_board(self):
+        for v in (1.0, 0.5, -40.5, True, "-16", [-16]):
+            with self.assertRaises(wiring.Refused, msg=repr(v)):
+                gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": v}})
+        with self.assertRaises(wiring.Refused):
+            gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": [-16]})
+        self.assertIsNone(gen.operating_volume_cap_db("j873g", {}))
+        self.assertIsNone(gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": None}}))
+        self.assertEqual(gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": -40}}), -40.0)
+        self.assertEqual(gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": 0}}), 0.0)
+
 class BoundRecord(unittest.TestCase):
     """A bound pass is reused only with its record (the graph is generated
     from it): a bind without one is checked again (11-07: a removed

@@ -91,7 +91,8 @@ impl KernelError {
 
 /// One amp's level control, read back: its raw value and, from the
 /// control's dB TLV, the level in hundredths of a dB (`None`: no dB scale,
-/// or muted) and the size of one control step.
+/// or muted), the level at the control's maximum and the size of one
+/// control step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AmpLevel {
     /// The amp's control prefix, for example "Left Woofer 1".
@@ -102,6 +103,12 @@ pub struct AmpLevel {
     /// no fixed-step dB scale). The operating-point match is held to half
     /// of it, so the tolerance is the card's own, not an assumed step.
     pub step_centi_db: Option<i32>,
+    /// The level at the control's current maximum, hundredths of a dB on
+    /// the same TLV (`None`: no dB scale there). Under a grant this is the
+    /// highest volume the kernel lets the amp reach: macaudio limits every
+    /// amp volume to 0 dB, or, on a machine whose speaker only a lease may
+    /// lift (spk_fixed_ceiling, the J873g), to that machine's ceiling.
+    pub max_centi_db: Option<i32>,
 }
 
 /// One amp's fault report.
@@ -169,6 +176,11 @@ pub struct Recorder {
     pub gain: Option<(i64, i32)>,
     /// The dB step every level control's TLV states, centi-dB.
     pub step_centi_db: Option<i32>,
+    /// The dB at the volume control's maximum while held, when it is not
+    /// the held level's own (`None`, the default: the kernel holds a grant
+    /// at its limit, so the held level is the maximum). While released the
+    /// maximum is the released level, the kernel's floor.
+    pub ceiling: Option<Option<i32>>,
     pub route: Option<String>,
 }
 
@@ -212,18 +224,25 @@ impl Kernel for Recorder {
     }
     fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
         let level = if suffix == GAIN_CONTROL_SUFFIX {
-            self.gain.map(|(v, d)| (v, Some(d)))
+            self.gain.map(|(v, d)| (v, Some(d), Some(d)))
         } else {
             match &self.volume {
-                Some((s, on, off)) if s == suffix => Some(if self.held { *on } else { *off }),
+                Some((s, on, _)) if s == suffix && self.held => Some((on.0, on.1, self.ceiling.unwrap_or(on.1))),
+                Some((s, _, off)) if s == suffix => Some((off.0, off.1, off.1)),
                 _ => None,
             }
         };
         Ok(level
-            .map(|(value, centi_db)| {
+            .map(|(value, centi_db, max_centi_db)| {
                 self.amps
                     .iter()
-                    .map(|a| AmpLevel { amp: a.clone(), value, centi_db, step_centi_db: self.step_centi_db })
+                    .map(|a| AmpLevel {
+                        amp: a.clone(),
+                        value,
+                        centi_db,
+                        step_centi_db: self.step_centi_db,
+                        max_centi_db,
+                    })
                     .collect()
             })
             .unwrap_or_default())
@@ -657,12 +676,14 @@ mod alsa {
                 if info.kind != ELEM_TYPE_INTEGER {
                     continue;
                 }
-                let min = info.value[0] as i64;
+                let (min, max) = (info.value[0] as i64, info.value[1] as i64);
                 let value = self.read(id)?.value[0];
                 let tlv = self.tlv(id.numid);
                 let centi_db = tlv.as_deref().and_then(|t| db_scale_centi(t, value, min));
                 let step_centi_db = tlv.as_deref().and_then(db_scale_step);
-                out.push(AmpLevel { amp: amp.trim_end().to_owned(), value, centi_db, step_centi_db });
+                // the maximum as the driver limits it now (snd_soc_limit_volume)
+                let max_centi_db = tlv.as_deref().and_then(|t| db_scale_centi(t, max, min));
+                out.push(AmpLevel { amp: amp.trim_end().to_owned(), value, centi_db, step_centi_db, max_centi_db });
             }
             Ok(out)
         }
