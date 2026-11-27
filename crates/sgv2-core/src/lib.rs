@@ -27,6 +27,7 @@ pub mod failsafe;
 pub mod lsid;
 pub mod lsm2;
 pub mod machine;
+pub mod mic;
 pub mod placeholder;
 pub mod prestage;
 pub mod resonator;
