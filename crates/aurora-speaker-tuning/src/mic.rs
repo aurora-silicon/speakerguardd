@@ -429,7 +429,11 @@ fn builtin_is(g: &Graph, node: &str, word: &str) -> bool {
 /// The link that sets a trackpad block's delay from its neural unit's
 /// latency; [`trackpad_block`] checks it, the parameter logic skips it.
 fn trackpad_latency_link(g: &Graph, l: &dspg::BoxLink) -> bool {
-    g.find_box(&l.from.node).is_some_and(|b| subtype(b) == "nnet") && builtin_is(g, &l.to.node, "delay")
+    let at = |t: &dspg::Target, id: f64| Num::value(&t.id) == Some(id) && t.rest == ["0", "0"];
+    g.find_box(&l.from.node).is_some_and(|b| subtype(b) == "nnet")
+        && builtin_is(g, &l.to.node, "delay")
+        && at(&l.from, 14.0)
+        && at(&l.to, 0.0)
 }
 
 /// The trackpad mitigation block after the synthesis: `src` feeds a neural
@@ -481,17 +485,46 @@ fn trackpad_block(g: &Graph, strip: &AuStrip, src: &str, fs: u32) -> Result<(Str
     {
         return Err(no("the mix is not unit plus attenuated difference"));
     }
-    let mut nn_to: Vec<(String, u32)> = outs(&nn).iter().map(|w| (w.dst.node.clone(), w.dst.port)).collect();
-    nn_to.sort();
-    let mut want = vec![(a.clone(), 1), (m.clone(), 0)];
-    want.sort();
-    if nn_to != want {
-        return Err(no("the neural unit feeds other boxes"));
-    }
-    if !g.box_param_links.iter().any(|l| l.from.node == nn && l.to.node == dl) {
-        return Err(no("the delay is not set from the unit's latency"));
-    }
     let names = [nn.clone(), dl.clone(), a.clone(), gn.clone(), m.clone()];
+    // the complete characterised wiring, ports included: nothing else into or
+    // out of the block but the mix's one output
+    let shape = |w: &dspg::Wire| (w.src.node.clone(), w.src.port, w.dst.node.clone(), w.dst.port);
+    let mut got: Vec<_> = g.wires.iter().filter(|w| names.contains(&w.dst.node)).map(shape).collect();
+    got.sort();
+    let mut want = vec![
+        (src.to_string(), 0, nn.clone(), 0),
+        (src.to_string(), 0, dl.clone(), 0),
+        (dl.clone(), 0, a.clone(), 0),
+        (nn.clone(), 0, a.clone(), 1),
+        (a.clone(), 0, gn.clone(), 0),
+        (nn.clone(), 0, m.clone(), 0),
+        (gn.clone(), 0, m.clone(), 1),
+    ];
+    want.sort();
+    if got != want {
+        return Err(no("its wiring or ports differ from the characterised block"));
+    }
+    let leaving: Vec<_> =
+        g.wires.iter().filter(|w| names.contains(&w.src.node) && !names.contains(&w.dst.node)).map(shape).collect();
+    if leaving.len() != 1 || leaving[0].0 != m || leaving[0].1 != 0 {
+        return Err(no("something other than the mix's output 0 leaves the block"));
+    }
+    // exactly one parameter link touches the block: the unit's latency
+    // (parameter 14) into the delay's parameter 0
+    let touching: Vec<_> =
+        g.box_param_links.iter().filter(|l| names.contains(&l.from.node) || names.contains(&l.to.node)).collect();
+    if touching.len() != 1
+        || !trackpad_latency_link(g, touching[0])
+        || touching[0].from.node != nn
+        || touching[0].to.node != dl
+    {
+        return Err(no("its parameter links are not exactly the unit's latency into the delay"));
+    }
+    if g.param_links.iter().any(|l| names.contains(&l.target.node))
+        || g.box_property_links.iter().any(|l| names.contains(&l.from.node) || names.contains(&l.to.node))
+    {
+        return Err(no("another parameter or property writes into the block"));
+    }
     for w in g.wires.iter().filter(|w| names.contains(&w.dst.node)) {
         let block = g.wire_format(w).and_then(|f| f.block_size.as_ref()).and_then(Num::value);
         if wire_ch(g, w)? != 1 || block != Some(480.0) || fs != 48_000 {
@@ -1485,6 +1518,7 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
     let mut sens_hop: Option<usize> = None;
     // a frequency-placed suppressor's extra block, until a trackpad block takes it
     let mut freq_sens_block = false;
+    let mut freq_sens_count = 0usize;
     let mut domain = Domain::PreTime;
     let mut node = input.clone();
     let mut visited = vec![input.clone()];
@@ -1839,6 +1873,12 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                         }
                         sens_hop = Some(sp.hop);
                         let placed = if domain == Domain::Freq {
+                            freq_sens_count += 1;
+                            if freq_sens_count > 1 {
+                                r.refusals.push(format!(
+                                    "{nx}: a second frequency-placed suppressor (one trackpad block carries one block)"
+                                ));
+                            }
                             freq_sens_block = true;
                             "; after the analysis: carried before the transform (black-box equal, one block later)"
                         } else {

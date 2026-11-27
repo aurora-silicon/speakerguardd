@@ -452,6 +452,72 @@ fn a_frequency_placed_suppressor_without_a_trackpad_block_refuses() {
     assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains("one block later")), "{:?}", c.report.refusals);
 }
 
+/// Compile `f` with the graph text changed by `edit` and expect a refusal mentioning `why`.
+fn neo_mutation_refuses(name: &str, edit: impl Fn(&str) -> String, why: &str) {
+    let mut f = neo_fixture(true, true, true);
+    let g = edit(&f.graph);
+    assert_ne!(g, f.graph, "{name}: the edit changed nothing");
+    f.graph = g;
+    // fails closed either way: a refusal, or an error before the walk
+    match mic::compile(&f.tree(name), &mic::Options::default(), &mut Diagnostics::default()) {
+        Ok(c) => {
+            assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains(why)), "{name}: {:?}", c.report.refusals)
+        }
+        Err(e) => assert!(e.to_string().contains(why), "{name}: {e}"),
+    }
+}
+
+#[test]
+fn a_trackpad_block_with_another_latency_parameter_refuses() {
+    neo_mutation_refuses(
+        "mic-neo-tp-param",
+        |g| g.replace("wireParam (Tp 14 0 0) (Td 0 0 0)", "wireParam (Tp 13 0 0) (Td 0 0 0)"),
+        "parameter link from Tp",
+    );
+}
+
+#[test]
+fn a_trackpad_block_with_swapped_difference_ports_refuses() {
+    neo_mutation_refuses(
+        "mic-neo-tp-port",
+        |g| {
+            g.replace("wire Td (Tn 0)", "wire Td (Tn X)")
+                .replace("wire Tp (Tn 1)", "wire Tp (Tn 0)")
+                .replace("wire Td (Tn X)", "wire Td (Tn 1)")
+        },
+        "differ",
+    );
+}
+
+#[test]
+fn a_trackpad_block_with_another_writer_into_the_delay_refuses() {
+    neo_mutation_refuses(
+        "mic-neo-tp-writer",
+        |g| g.replace("wireGraphParam mvol (Vol 0)\n", "wireGraphParam mvol (Vol 0)\nwireGraphParam mvol (Td 0)\n"),
+        "writes into the block",
+    );
+}
+
+#[test]
+fn a_second_frequency_placed_suppressor_refuses() {
+    let mut f = neo_fixture(true, true, true);
+    f.graph = f
+        .graph
+        .replace("box Sens (aufx sens appl) 1 1\n", "box Sens (aufx sens appl) 1 1\nbox Sens2 (aufx sens appl) 1 1\n")
+        .replace(
+            "wire Sens Pre (freq [fs] [numChansIn] [blockSize])",
+            "wire Sens Sens2 (freq [fs] [numChansIn] [blockSize])\nwire Sens2 Pre (freq [fs] [numChansIn] [blockSize])",
+        );
+    f.effects.push(unit_effect("Sens2", "sens", &sens_state(6.0), false, None));
+    f.props.push(("Sens2".into(), 1000, "mic_sens.plist".into()));
+    let c = mic::compile(&f.tree("mic-neo-two-sens"), &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(
+        c.refused() && c.report.refusals.iter().any(|r| r.contains("second frequency-placed suppressor")),
+        "{:?}",
+        c.report.refusals
+    );
+}
+
 #[test]
 fn a_trackpad_block_with_a_live_neural_unit_refuses() {
     let c = mic::compile(
