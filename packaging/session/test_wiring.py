@@ -1015,6 +1015,103 @@ class NoSensePath(unittest.TestCase):
         self.assertEqual(wiring.derive(got, j773g()["tuning"])["hash"], "d1d62e8a0aaaef3d")
 
 
+def t8152_six_amp(names=("hpai", "spkr", "sense", "cout", "cin")):
+    """Six SN012776 amps behind the T8152 AOP back-end (J804 shape), using the
+    generic J815 six-channel spp3 lane structure."""
+    f = fx("j815")
+    h = f["hw"]
+    h.update(board="j804", compatible=["apple,j804", "apple,t8152", "apple,arm-platform"],
+             sound_compatible=["apple,j804-macaudio", "apple,macaudio"], model="MacBook Pro J804")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["name"] = "Speakers"
+    link["cpu_compatible"] = [["apple,t8152-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    return f
+
+
+def t8152_one_amp(names=("cout", "cin", "spkr")):
+    """One SN012776 behind the T8152 AOP back-end (J873g shape) with a mono
+    atsp tuning."""
+    f = fx("j473")
+    h = f["hw"]
+    h.update(board="j873g", compatible=["apple,j873g", "apple,t8152", "apple,arm-platform"],
+             sound_compatible=["apple,j873-macaudio", "apple,macaudio"], model="Mac mini J873")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["cpu_compatible"] = [["apple,t8152-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    link["codecs"] = [{"node": "soc/i2c@33101c000/codec@38", "compatible": ["ti,sn012776", "ti,tas2764"],
+                       "vmon": 0, "imon": 2, "i2c": "1-0038"}]
+    return f
+
+
+class T8152Transport(unittest.TestCase):
+    """apple,t8152-aop-audio binds the same t8152_aop_audio driver (aop-dma)
+    as T8142/T6050: sense follows the back-end node's dma-names, and PCM
+    widths follow the link's amps and sense lanes."""
+
+    def test_six_amps_with_sense_derive_6ch_vi(self):
+        for names in (("hpai", "spkr", "sense", "cout", "cin"), None):
+            f = t8152_six_amp(names)
+            self.assertTrue(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertFalse(w["no_sense_path"], names)
+            self.assertEqual(len(w["sense"]), 12, names)
+            self.assertEqual(sgsc.method_of(w), "derived", names)
+            self.assertEqual(
+                (c["card"], c["transport"], c["plugin"], c["speaker_pcm"], c["sense_pcm"],
+                 c["alsa_format"], c["speaker_format"], c["speaker_irq"]),
+                ("AppleJ804", "aop-dma", "6ch-vi", 6, 12, "S24_LE", "S24_32LE", False),
+                names,
+            )
+
+    def test_six_amps_without_sense_channel_are_refused(self):
+        f = t8152_six_amp(("hpai", "spkr", "cout", "cin"))
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f["tuning"]["tuning"]["protection"]["kind"] = "lsm2"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_one_amp_with_sense_fails_closed_when_card_has_no_sense_pcm(self):
+        for names in (("cout", "cin", "spkr", "sense"), None):
+            f = t8152_one_amp(names)
+            self.assertTrue(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            self.assertFalse(w["no_sense_path"], names)
+            self.assertEqual(len(w["sense"]), 2, names)
+            self.assertEqual(sgsc.method_of(w), "derived", names)
+            with mock.patch.object(sgsc, "pcm_ids", return_value={("Secondary", "p"): 1}):
+                with self.assertRaises(wiring.Refused) as cm:
+                    sgsc.active(0, "AppleJ873", w, {})
+                self.assertIn("sense PCM None", str(cm.exception))
+
+    def test_one_amp_without_sense_channel_derives_nosense(self):
+        for names in (("cout", "cin", "spkr"), ("spkr", "cout", "cin")):
+            f = t8152_one_amp(names)
+            self.assertFalse(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertTrue(w["no_sense_path"], names)
+            self.assertEqual((w["family"], w["unit_kind"], w["unit_channels"], w["sense"]),
+                             ("sn012776", "atsp", [0], []), names)
+            self.assertEqual((c["transport"], c["plugin"], c["speaker_pcm"], c["sense_pcm"], c["alsa_format"]),
+                             ("aop-dma", "1ch", 1, 0, "S24_LE"), names)
+            self.assertFalse(c["speaker_irq"], names)
+            self.assertEqual(sgsc.method_of(w), "derived-nosense", names)
+            self.assertEqual(w["hash"], "d1d62e8a0aaaef3d", names)
+
+    def test_t8142_keeps_its_sense_and_hash(self):
+        f = fx("j815")
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual((w["no_sense_path"], len(w["sense"]), w["hash"]), (False, 12, "725f518662e42388"))
+        self.assertEqual(wiring.describe(f["hw"], w)["transport"], "aop-dma")
+
+
 class RunLockedDispatch(unittest.TestCase):
     """run_locked() proves each method on its own branch, and fails closed on
     a method no branch names."""
