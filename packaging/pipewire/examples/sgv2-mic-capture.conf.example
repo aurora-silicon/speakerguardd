@@ -1,0 +1,61 @@
+# EXAMPLE ONLY: not generated, not installed, not wired into any session.
+#
+# A capture filter-chain around the sgv2 built-in microphone plugin
+# (`sgv2_mic`, `crates/sgv2-lv2/src/mic.rs`). It reads the raw microphone
+# channels of the machine's capture PCM and publishes one processed channel
+# as the virtual source "Built-in Microphone". The raw source stays
+# available under its own name for applications that want the channels.
+#
+# Before using it on a machine:
+# - compile the blob from the Mac's own bundle:
+#     aurora-speaker-tuning mic-compile -o /run/speakerguardd/mic.bin
+#   (the plugin also reads $SGV2_MIC_PARAMS); without a valid blob for this
+#   board, rate and microphone count the plugin outputs silence and reports
+#   health 1;
+# - pick the variant matching the microphone count (#mic-1ch .. #mic-4ch);
+# - replace RAW_MIC_SOURCE with the raw capture node's name and the channel
+#   positions with the PCM's;
+# - keep the raw source's priority below this one so "Built-in Microphone"
+#   is the default input.
+#
+# Drop into ~/.config/pipewire/pipewire.conf.d/ (or /etc/pipewire/...)
+# with a .conf suffix and restart PipeWire.
+
+context.modules = [
+    {   name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Built-in Microphone"
+            media.name       = "Built-in Microphone"
+            filter.graph = {
+                nodes = [
+                    {   type   = lv2
+                        name   = mic
+                        plugin = "https://aurora-silicon.org/lv2/sgv2#mic-3ch"
+                    }
+                ]
+                inputs  = [ "mic:in_0" "mic:in_1" "mic:in_2" ]
+                outputs = [ "mic:out" ]
+            }
+            capture.props = {
+                node.name      = "sgv2.mic.raw-in"
+                node.passive   = true
+                audio.rate     = 48000
+                audio.channels = 3
+                audio.position = [ AUX0 AUX1 AUX2 ]
+                # the raw capture node; it stays visible to applications
+                target.object  = "RAW_MIC_SOURCE"
+                stream.dont-remix = true
+            }
+            playback.props = {
+                node.name        = "sgv2.mic.builtin"
+                node.description = "Built-in Microphone"
+                media.class      = "Audio/Source"
+                audio.rate       = 48000
+                audio.channels   = 1
+                audio.position   = [ MONO ]
+                priority.session = 2100
+                priority.driver  = 2100
+            }
+        }
+    }
+]

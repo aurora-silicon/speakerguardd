@@ -119,14 +119,32 @@ def _manifest(z):
     return plistlib.loads(m.read(MAX_MANIFEST))
 
 
-def find(board, images, version=None, open_zip=remotezip.RemoteZip):
-    """(build, url, member) of the first image in images ([(build, url)])
-    that carries the board. Each image must be the build (and version, when
-    given) it is listed as."""
+def _prefer(images, preferred_build):
+    """Move any entry matching preferred_build to the front; ignore builds
+    that are not already in images."""
+    if not preferred_build:
+        return images
+    hit = [e for e in images if e[0] == preferred_build]
+    if not hit:
+        return images
+    return hit + [e for e in images if e[0] != preferred_build]
+
+
+def find(board, images, version=None, open_zip=remotezip.RemoteZip, preferred_build=None):
+    """(build, url, member) of the first image in images
+    ([(build, url)] or [(build, url, version)]) that carries the board.
+    Each image must be the build (and its per-entry version, or version
+    when given) it is listed as. When preferred_build is already in images,
+    that entry is tried first."""
     if not images:
         raise IpswError(f"no restore image of macOS {version} is known")
     seen = []
-    for build, url in images:
+    for entry in _prefer(images, preferred_build):
+        if len(entry) == 3:
+            build, url, want_ver = entry
+        else:
+            build, url = entry
+            want_ver = version
         try:
             bm = _manifest(open_zip(url))
         except (remotezip.RemoteZipUnavailable, OSError) as e:
@@ -134,7 +152,7 @@ def find(board, images, version=None, open_zip=remotezip.RemoteZip):
         except (IpswError, remotezip.RemoteZipError, ValueError) as e:
             raise IpswError(f"restore image {build}: {e}") from None
         got, gotv = bm.get("ProductBuildVersion"), bm.get("ProductVersion")
-        if got != build or (version is not None and gotv != version):
+        if got != build or (want_ver is not None and gotv != want_ver):
             raise IpswError(f"the restore image listed as {build} is macOS {gotv} ({got})")
         member = os_member(bm, board)
         if member is not None:
@@ -143,13 +161,14 @@ def find(board, images, version=None, open_zip=remotezip.RemoteZip):
     raise IpswError(f"no restore image of macOS {version or ''} ({', '.join(seen)}) carries board {board}")
 
 
-def open_system(board, images, version=None, open_zip=remotezip.RemoteZip, require_aea=False):
+def open_system(board, images, version=None, open_zip=remotezip.RemoteZip,
+                require_aea=False, preferred_build=None):
     """(System volume, range fetcher, build, url) of the restore image for a
     board (j413) among images. require_aea: only an Apple Encrypted Archive
     root file system, whose every byte is authenticated against Apple's key,
     is opened; the member checked is the member opened (one BuildManifest
     fetch decides both)."""
-    build, url, member = find(board, images, version, open_zip)
+    build, url, member = find(board, images, version, open_zip, preferred_build=preferred_build)
     if require_aea and not member.endswith(".aea"):
         raise IpswError(f"the macOS {build} root file system {member} is not an Apple Encrypted Archive")
     try:
