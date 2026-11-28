@@ -466,6 +466,24 @@ class BootRefusalRecord(unittest.TestCase):
         self.assertRegex(k, r"^[0-9a-f]{64}$")
         self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
 
+    def test_stage2_repair_retries_a_refusal_without_a_kernel_update(self):
+        from subprocess import CompletedProcess
+        from unittest.mock import patch
+
+        up = self.up
+        up.refusal_key = self.saved[2]
+        result = CompletedProcess([], 0, "1234567890abcdef\n")
+        with patch.object(up, "tool", return_value="/fixture/selfcheck"), patch.object(up, "run", return_value=result):
+            with self.assertRaises(up.Refused):
+                up.cmd_run(self.a(True))
+            self.assertEqual(up.cmd_run(self.a(True)), up.EXIT_OK)
+            self.assertEqual(self.calls, 1)
+            result.stdout = "fedcba0987654321\n"
+            self.result = "pass"
+            self.assertEqual(up.cmd_run(self.a(True)), up.EXIT_OK)
+            self.assertEqual(self.calls, 2)
+            self.assertFalse(os.path.exists(os.path.join(self.dir, "refused.json")))
+
 
 class V2Umask(unittest.TestCase):
     def test_v2_programs_run_with_the_units_umask(self):

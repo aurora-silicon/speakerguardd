@@ -922,14 +922,23 @@ def _cmd_run(a):
 
 
 def refusal_key(identity):
-    """What a refusal depends on: this unit, the running kernel, and the code
-    and data that judged it (this tool, v2's provisioning and self-check, the
-    parity attestation, the gate data with its playback rows). A new kernel,
-    a v2 update, a new attestation or a new playback row makes the boot unit
-    try again; nothing else does."""
+    """Bind a refusal to the running audio stack and what judged it."""
     h = hashlib.sha256()
     h.update(f"{identity.unit}\0{os.uname().release}\0".encode())
-    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), tool("speakerguardd-selfcheck"), *PARITY, GATE,
+    # Stage 2 can replace the live speaker DTB without changing uname.
+    # Bind only the audio stack, so unrelated per-boot DT data does not
+    # invalidate a standing refusal.
+    selfcheck_tool = tool("speakerguardd-selfcheck")
+    if selfcheck_tool:
+        try:
+            result = run([selfcheck_tool, "audio-fingerprint"], timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        else:
+            fingerprint = result.stdout.strip()
+            if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{16}", fingerprint):
+                h.update(f"audio\0{fingerprint}\0".encode())
+    for p in [os.path.abspath(__file__), tool("speakerguardd-provision"), selfcheck_tool, *PARITY, GATE,
               ipsw.CATALOG]:
         try:
             with open(p or "", "rb") as f:
