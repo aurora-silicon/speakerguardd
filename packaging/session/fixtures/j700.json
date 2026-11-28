@@ -52,6 +52,20 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@310c00000/audio",
+  "compatible": [
+   "apple,t8140-aop-audio"
+  ],
+  "dma_names": [
+   "spkr",
+   "cout",
+   "cin",
+   "spkr-tap",
+   "hpai"
+  ],
+  "chassis": "J700"
+ },
  "tuning": {
   "tuning": {
    "aid": "AID44",

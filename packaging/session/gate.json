@@ -103,6 +103,18 @@
         ],
         "evidence": "lab row 2026-11-07 15:15 (neo ladder): health 0x0, 0 lost frames, 0 amp or TDM fault; coil model max 51.7 / 52.2 C against the 135 C limit, model power max 0.285 W; lease granted again 0.818 s after the kill"
       }
+    ],
+    "AID48": [
+      {
+        "date": "2026-11-27",
+        "board": "j873g",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s (-8 dBFS RMS stereo pink noise) through sgv2#voicing-1ch -> sgv2#1ch (atsp), supervisor kill -9 at 300.2 s; speakerguardd v2 5bd2d652 on 7.3.0-aurora-j873-speaker+ (linux#3434 18a0e3bcd3f7) and Aura 1.0.0b17-gc83bcb7f (aura#548), AID48 tuning from macOS 27.2 26B123",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j873g ladder 2026-11-27 21:29 CET: 39,990 engine records (512-frame quantum), lost=0, health_or=0x0, 0 amp/TDM faults (Amp Fault Status 0,0,0 before/during/after); open-loop coil model climbed from 50.00 C to 114.99 C max (magnet max 84.52 C, modeled power max 3.402 W, gain 0.00 dB), cooling smoothly after stop; kill -9 at 300.2 s immediately withdrew protection and dropped Speaker Volume to 0, supervisor offered saved thermal state (pre-kill 106.45 C -> post-kill 105.63 C) and re-granted in 0.488 s (0 starts refused), idle released cleanly to muted floor; 0 kernel audio/DART errors, 0 failed units"
+      }
     ]
   },
   "denied_boards": [],

@@ -18,7 +18,8 @@ It runs in the user's session, beside PipeWire, and does three things:
    also checks the carrier: the protect stage's input and the sense at unity
    volume, unmuted.
 3. **Report.** On every link, carrier or playback change, and every 50 ms
-   (every IDLE_PERIOD while nothing plays and nothing is linked), it writes
+   while active (and for QUIET_SETTLE_S after going quiet, so the supervisor
+   enters idle with a fresh report), it writes
    `links=<0|1> carrier=<0|1> mono_ns=<t> pid=<pid> start=<ticks> wiring=<hash> amps=<0|1> play=<0|1>`
    to /run/speakerguardd/<uid>/helper/session, where the wiring is the one
    the protect stage was built with (its `sgv2.wiring` property; the
@@ -26,9 +27,13 @@ It runs in the user's session, beside PipeWire, and does three things:
    to a new file and a
    rename, so the supervisor never reads a partial report. `amps` says whether
    anything is linked into the amps' sink (the sleep step waits for 0), and
-   `play` whether the speakers are wanted (5 below). A report older
-   than 500 ms, dated in the future, or whose writer (pid, start time) is not
-   this live process counts as absent, and the supervisor then releases.
+   `play` whether the speakers are wanted (5 below). Once settled quiet with
+   event watches active (PipeWire monitor, ALSA control events, and inotify on
+   the hold/self-check/helper directories), unchanged idle reports are not
+   rewritten and the loop wakes only every IDLE_PERIOD as a backstop; any
+   graph, control, hold or supervisor-restart event wakes it at once. A report
+   older than 500 ms, dated in the future, or whose writer (pid, start time) is
+   not this live process counts as absent, and the supervisor then releases.
 4. **The grant-before-start sequence.** The supervisor grants only on a
    live engine heartbeat (the protect stage runs on PipeWire's dummy driver
    while the amps are unlinked) and a fresh report; this helper links the
@@ -80,10 +85,12 @@ It reads the graph from `pw-dump --monitor` and makes or removes links with
 `pw-link`. It never touches the amps' volume: the kernel owns it.
 """
 import argparse
+import ctypes
 import fcntl
 import json
 import os
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -91,9 +98,13 @@ import sys
 import time
 
 PERIOD = 0.050
-# The report's period while nothing plays and nothing is linked: a change is
-# reported at once anyway, and the supervisor accepts a report for 500 ms.
-IDLE_PERIOD = 0.250
+# Once quiet for QUIET_SETTLE_S (past the supervisor's 500 ms idle transition)
+# with event watches active, the loop sleeps this long between backstop checks
+# and skips rewriting unchanged idle reports; without event watches it falls
+# back to IDLE_PERIOD_FALLBACK.
+QUIET_SETTLE_S = 1.0
+IDLE_PERIOD = 5.0
+IDLE_PERIOD_FALLBACK = 0.250
 # When the graph first appears the hold is linked for this long, so the
 # protect stage and the voicing negotiate and start once with no client and
 # no amps: the first stream after PipeWire starts then finds them prepared
@@ -135,6 +146,265 @@ _ELEM_READ = (3 << 30) | (_VAL_SIZE << 16) | (0x55 << 8) | 0x12
 _SUBSCRIBE_EVENTS = (3 << 30) | (4 << 16) | (0x55 << 8) | 0x16
 _EVENT_SIZE = 72
 _IFACE_MIXER = 2
+
+# Linux inotify constants (<sys/inotify.h>)
+_IN_NONBLOCK = 0o0004000
+_IN_CLOEXEC = 0o2000000
+_IN_ATTRIB = 0x00000004
+_IN_CLOSE_WRITE = 0x00000008
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_EVENT_HDR = struct.Struct("iIII")
+
+
+def _dir_id(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if (os.path.isdir(path) and not os.path.islink(path)) else None
+
+
+def _ancestors(path):
+    """Strict ancestor directories above `path`, stopping below `/`."""
+    out = []
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur and cur != os.path.dirname(cur):
+        out.append(cur)
+        cur = os.path.dirname(cur)
+    return out
+
+
+class HoldWatch:
+    """Inotify watch on the sleep-hold and self-check marker files, their
+    parent directories (since those directories may be created only on demand),
+    the helper report directory (so a restarted supervisor's chmod/chown or a
+    removed report wakes the helper at once), and their ancestor directories
+    (for move/delete). `active` is True only while every required parent and
+    every currently existing target/helper/ancestor directory is validly
+    watched at its live (dev, ino); otherwise the loop keeps its 250 ms
+    fallback."""
+
+    def __init__(self, files, report_path):
+        self.fd = None
+        self._libc = None
+        # file watches: dir -> set of basenames
+        self._file_dirs = {}
+        # parent watches: parent_dir -> set of child dir basenames
+        self._parent_dirs = {}
+        # higher ancestors watched only for self-move/delete
+        self._ancestor_dirs = set()
+        self._report_dir = os.path.dirname(report_path)
+        self._report_name = os.path.basename(report_path)
+        for p in files:
+            d, name = os.path.dirname(p), os.path.basename(p)
+            self._file_dirs.setdefault(d, set()).add(name)
+            pd, dname = os.path.dirname(d), os.path.basename(d)
+            if pd and dname:
+                self._parent_dirs.setdefault(pd, set()).add(dname)
+            self._ancestor_dirs.update(_ancestors(d))
+        if self._report_dir:
+            pd, dname = os.path.dirname(self._report_dir), os.path.basename(self._report_dir)
+            if pd and dname:
+                self._parent_dirs.setdefault(pd, set()).add(dname)
+            self._ancestor_dirs.update(_ancestors(self._report_dir))
+        # wd -> path, path -> wd, path -> (dev, ino)
+        self._wd_path = {}
+        self._path_wd = {}
+        self._path_id = {}
+        self.active = False
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.inotify_init1.argtypes = [ctypes.c_int]
+            libc.inotify_init1.restype = ctypes.c_int
+            libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            libc.inotify_add_watch.restype = ctypes.c_int
+            libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+            libc.inotify_rm_watch.restype = ctypes.c_int
+            fd = libc.inotify_init1(_IN_NONBLOCK | _IN_CLOEXEC)
+            if fd < 0:
+                return
+            self._libc = libc
+            self.fd = fd
+            self.sync()
+        except (OSError, AttributeError):
+            self.close()
+
+    def _mask_for(self, d):
+        mask = 0
+        if d in self._parent_dirs:
+            mask |= _IN_CREATE | _IN_MOVED_TO | _IN_DELETE_SELF | _IN_MOVE_SELF
+        if d in self._file_dirs:
+            mask |= _IN_CREATE | _IN_MOVED_TO | _IN_CLOSE_WRITE | _IN_DELETE | _IN_DELETE_SELF | _IN_MOVE_SELF
+        if d == self._report_dir:
+            mask |= _IN_ATTRIB | _IN_DELETE | _IN_MOVED_FROM | _IN_DELETE_SELF | _IN_MOVE_SELF
+        if d in self._ancestor_dirs:
+            mask |= _IN_DELETE_SELF | _IN_MOVE_SELF
+        return mask
+
+    def _drop(self, d, rm=True):
+        wd = self._path_wd.pop(d, None)
+        self._path_id.pop(d, None)
+        if wd is not None:
+            if self._wd_path.get(wd) == d:
+                self._wd_path.pop(wd, None)
+            if rm and self.fd is not None and self._libc is not None:
+                try:
+                    self._libc.inotify_rm_watch(self.fd, wd)
+                except OSError:
+                    pass
+
+    def _add(self, d):
+        if self.fd is None or d in self._path_wd:
+            return
+        cur_id = _dir_id(d)
+        if cur_id is None:
+            return
+        mask = self._mask_for(d)
+        if not mask:
+            return
+        wd = self._libc.inotify_add_watch(self.fd, os.fsencode(d), mask)
+        if wd < 0:
+            return
+        if _dir_id(d) != cur_id:
+            try:
+                self._libc.inotify_rm_watch(self.fd, wd)
+            except OSError:
+                pass
+            return
+        self._wd_path[wd] = d
+        self._path_wd[d] = wd
+        self._path_id[d] = cur_id
+
+    def _required_dirs(self):
+        """All directories that must be watched right now for full coverage.
+        Uses lexists() so a symlink or non-directory at a target/helper/ancestor
+        path is still required and forces active=False (250 ms fallback) instead
+        of being silently treated as absent."""
+        req = set(self._parent_dirs)
+        for d in self._file_dirs:
+            if os.path.lexists(d):
+                req.add(d)
+        if self._report_dir and os.path.lexists(self._report_dir):
+            req.add(self._report_dir)
+        for d in self._ancestor_dirs:
+            if os.path.lexists(d):
+                req.add(d)
+        return req
+
+    def sync(self):
+        """Verify live directory identities, rebuild any missing/replaced
+        watches, and update `self.active`."""
+        if self.fd is None:
+            self.active = False
+            return
+        # Drop any watch whose path was removed or replaced by a new inode.
+        for d in list(self._path_wd):
+            if _dir_id(d) != self._path_id.get(d):
+                self._drop(d)
+        req = self._required_dirs()
+        for d in req:
+            self._add(d)
+        self.active = all(d in self._path_wd and _dir_id(d) == self._path_id.get(d) for d in req)
+
+    def _reopen(self):
+        """Rebuild the inotify instance from scratch (e.g. after queue
+        overflow, where IN_IGNORED events for removed watches may have been
+        dropped)."""
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+        self.active = False
+        self._wd_path.clear()
+        self._path_wd.clear()
+        self._path_id.clear()
+        if self._libc is None:
+            return
+        try:
+            fd = self._libc.inotify_init1(_IN_NONBLOCK | _IN_CLOEXEC)
+            if fd < 0:
+                return
+            self.fd = fd
+            self.sync()
+        except OSError:
+            self.close()
+
+    def drain(self):
+        """Drain pending events; True if any hold, self-check, helper-dir,
+        ancestor move/delete, or queue overflow event arrived."""
+        if self.fd is None:
+            return False
+        hit = False
+        need_sync = False
+        overflow = False
+        while True:
+            try:
+                data = os.read(self.fd, 4096)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not data:
+                break
+            off = 0
+            n = len(data)
+            while off + _IN_EVENT_HDR.size <= n:
+                wd, mask, _, length = _IN_EVENT_HDR.unpack_from(data, off)
+                off += _IN_EVENT_HDR.size
+                raw = data[off : off + length]
+                off += length
+                name = raw.split(b"\x00", 1)[0].decode(errors="surrogateescape") if raw else ""
+                if mask & _IN_Q_OVERFLOW:
+                    overflow = True
+                    hit = True
+                    continue
+                path = self._wd_path.get(wd)
+                if mask & (_IN_DELETE_SELF | _IN_MOVE_SELF | _IN_IGNORED):
+                    if path is not None:
+                        # IN_MOVE_SELF keeps the kernel watch alive on the old
+                        # inode; explicitly remove it unless IN_IGNORED already did.
+                        self._drop(path, rm=not (mask & _IN_IGNORED))
+                        need_sync = True
+                        hit = True
+                    continue
+                if path is None:
+                    continue
+                if path in self._parent_dirs and name in self._parent_dirs[path]:
+                    need_sync = True
+                    hit = True
+                if path in self._file_dirs and (not name or name in self._file_dirs[path]):
+                    hit = True
+                if path == self._report_dir:
+                    if (mask & _IN_ATTRIB and not name) or (
+                        mask & (_IN_DELETE | _IN_MOVED_FROM) and name == self._report_name
+                    ):
+                        hit = True
+        if overflow:
+            self._reopen()
+        elif need_sync:
+            self.sync()
+        return hit
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+        self.active = False
+        self._wd_path.clear()
+        self._path_wd.clear()
+        self._path_id.clear()
 
 
 def own_start():
@@ -210,8 +480,14 @@ class PwCli:
         if time.monotonic() < self.next_start:
             return
         try:
+            # An unsuccessful spawn can return a child that only exits later.
+            # Check that the command resolves before a pipe write can succeed.
+            executable = shutil.which(self.argv[0])
+            if executable is None:
+                raise FileNotFoundError(self.argv[0])
             self.proc = subprocess.Popen(
-                self.argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                self.argv, executable=executable, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             os.set_blocking(self.proc.stdin.fileno(), False)
         except (OSError, AttributeError, ValueError):
@@ -803,6 +1079,23 @@ class Session:
     def hold_linked(self, g):
         return bool(self.hold_links(g)[1])
 
+    def is_quiet(self, g, granted, reported, priming, amps, hold_active=False):
+        """Whether nothing plays, nothing is linked, and no short timer
+        (volume restore grace/retry, unlink retry, sleep/selfcheck hold) needs
+        the fast 50 ms tick."""
+        return not (
+            granted
+            or reported
+            or self.reported_play
+            or priming
+            or amps
+            or self.hold_linked(g)
+            or hold_active
+            or (self.vs_id is not None and not self.vs_settled)
+            or self.pending
+            or self.unlink_sent
+        )
+
     def priming(self, g, now):
         """Whether the hold primes the stage now: for PRIME_S once the
         protect stage's output and the hold are first both there."""
@@ -829,6 +1122,13 @@ class Session:
                 self.last_suspend = now
                 # the node's Suspend command (pw-cli 1.x: id, command, args)
                 self._spawn(("suspend", nid), ["pw-cli", "send-command", str(nid), "Suspend", "{}"])
+
+
+def report_needed(settled_quiet, report_key, last_report_key, wrote, force=False):
+    """Whether to write/rename the session report on this tick. Once settled
+    quiet with event watches active, unchanged idle reports are skipped so
+    they do not wake the supervisor's inotify watch."""
+    return not settled_quiet or force or not wrote or report_key != last_report_key
 
 
 _WRITER = None
@@ -923,12 +1223,14 @@ def main():
     g = Graph()
     s = Session(args.machine, c)
     report = f"/run/speakerguardd/{os.getuid()}/helper/session"
+    watch = HoldWatch((SLEEP_HOLD, SELFCHECK_ACTIVE), report)
 
     def stop(*_):
         # a stopped helper leaves no report behind (the supervisor releases
         # at once), and no amps or sense linked, so the sink does not keep
         # retrying a refused start until PipeWire restarts; the unlink is
         # bounded to 1 s
+        watch.close()
         try:
             os.unlink(report)
         except OSError:
@@ -944,48 +1246,77 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     last = (None, None, None, None, None)
-    was_granted = None
+    last_report_key = None
+    last_gen = -1
+    wrote = False
+    quiet_since = None
     play = False
     nxt = time.monotonic()
     while True:
-        ready = g.pump(max(0.0, nxt - time.monotonic()), [card.fd] if card.events else [])
-        if ready and card.drain():
-            # a grant or a withdrawal: link or unlink now
-            granted = card.granted()
-            if granted != was_granted:
-                s.reconcile(g, granted, play)
-                was_granted = granted
+        extra = []
+        if card.events:
+            extra.append(card.fd)
+        if watch.active:
+            extra.append(watch.fd)
+        ready = g.pump(max(0.0, nxt - time.monotonic()), extra)
+        woke_hold = watch.active and watch.fd in ready and watch.drain()
+        woke_card = card.events and card.fd in ready and card.drain()
         if time.monotonic() < nxt:
-            # event-driven: a link, carrier or playback change is reported
-            # at once, not at the next period
-            if ready is not None and (s.check(g) != last[1:3] or s.want(g, time.monotonic()) != play):
+            # event-driven: any graph, ALSA control or hold/supervisor change
+            # runs at once, publishing safety observations before reconcile
+            if woke_hold or woke_card or g.gen != last_gen:
                 nxt = time.monotonic()
             else:
                 continue
+        last_gen = g.gen
+        watch.sync()
+        hold_active = os.path.exists(SLEEP_HOLD) or os.path.exists(SELFCHECK_ACTIVE)
         granted = card.granted()
         now = time.monotonic()
         play = s.want(g, now)
         links, carrier = s.check(g)
         amps = s.amps_linked(g)
         reported = s.play_report(g, play, now)
-        wrote = write_report(report, links, carrier, s.wiring(g), amps, reported)
+        wiring = s.wiring(g)
+        priming = s.priming(g, now)
+        event_backed = card.events and watch.active
+        quiet_pre = s.is_quiet(g, granted, reported, priming, amps, hold_active)
+        if woke_hold or not quiet_pre:
+            quiet_since = None
+        elif quiet_since is None:
+            quiet_since = now
+        settled_quiet = event_backed and quiet_since is not None and now - quiet_since >= QUIET_SETTLE_S
+        report_key = (links, carrier, wiring, amps, reported)
+        report_missing = not os.path.exists(report)
+        # Publish safety observations before reconcile, child launches, or
+        # voicing state-file I/O so a fault is never delayed behind them.
+        if report_needed(settled_quiet, report_key, last_report_key, wrote, force=woke_hold or report_missing):
+            wrote = write_report(report, links, carrier, wiring, amps, reported)
+            if wrote:
+                last_report_key = report_key
         s.reconcile(g, granted, play)
         # the hold stays linked while this or the last report said play=1,
         # so the supervisor reads play=0 (and gives the grant back as idle)
         # while the stage still beats
-        priming = s.priming(g, now)
         s.keep_hold(g, reported or s.reported_play or priming)
-        quiet = not (granted or reported or s.reported_play or priming or amps or s.hold_linked(g))
         s.reported_play = reported
-        period = IDLE_PERIOD if quiet else PERIOD
+        s.pin_amps_unity(g)
+        s.keep_voicing_volume(g, now)
+        quiet = s.is_quiet(g, granted, reported, priming, amps, hold_active)
+        if not quiet:
+            quiet_since = None
+            settled_quiet = False
+        if settled_quiet:
+            period = IDLE_PERIOD
+        elif quiet and not event_backed:
+            period = IDLE_PERIOD_FALLBACK
+        else:
+            period = PERIOD
         nxt += period
         if nxt < time.monotonic():
             nxt = time.monotonic() + period
-        s.pin_amps_unity(g)
-        s.keep_voicing_volume(g, now)
         if s.cli is not None:
             s.cli.ensure()
-        was_granted = granted
         state = (granted, links, carrier, wrote, play)
         if state != last:
             log(f"granted={int(granted)} links={int(links)} carrier={int(carrier)} play={int(play)} report={'ok' if wrote else 'unwritable'}")

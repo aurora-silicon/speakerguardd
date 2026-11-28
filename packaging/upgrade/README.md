@@ -97,16 +97,16 @@ boot starts it again wherever the gate qualifies the board.
 Exit codes: 0 done (or nothing to do), 1 refused (nothing switched; no older
 daemon starts), 2 not now (retry), 3 internal error (nothing switched).
 
+The boot service runs after `multi-user.target` and any scheduled Aurora
+Stage 2 commit. A slow restore image fetch can then finish independently
+of the Stage 2 rollback deadline.
+
 At boot (`aurora-speaker-upgrade.service`, `run --at-boot`), a refusal is
 recorded in `/var/lib/aurora-speaker-upgrade/refused.json` and not tried
 again until the kernel, the live speaker wiring or sound modules,
 speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
 outcome, not a failure. `run` by hand always tries again.
-
-The boot service runs after `multi-user.target` and any scheduled Aurora
-Stage 2 commit. A slow restore image fetch can then finish independently
-of the Stage 2 rollback deadline.
 
 The boot unit also moves a speaker only once protected playback on it is on
 record. speakerguardd v2's gate data (`packaging/session/gate.json`,

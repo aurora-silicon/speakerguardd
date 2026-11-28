@@ -1,0 +1,103 @@
+{
+ "note": "Mac mini (M6, J873g): the sound node of arch/arm64/boot/dts/apple/t8152-j873g.dtb (aurora-silicon/linux#3434, public); the T8152 AOP audio component omits \"sense\" from dma-names (speaker-protection = 0 and zero RX sense slots in the ADT), driving one SN012776 speaker amp on I2C3 alongside the CS42L84 jack. Tuning lanes: the structure of the graph's single full-range input lane only (AID48 Atsp), with generic box names and no tuning values. The hardware half is wiring.py's reading of the compiled t8152-j873g.dtb.",
+ "hw": {
+  "board": "j873g",
+  "compatible": [
+   "apple,j873g",
+   "apple,t8152",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j873-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "Mac mini J873",
+  "links": [
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8152-aop-audio"
+     ]
+    ],
+    "cpu_dma_names": [
+     [
+      "cout",
+      "cin",
+      "spkr"
+     ]
+    ],
+    "cpu_nodes": [
+     "soc/aop@310c00000/audio"
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@331014000/codec@4b",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l84"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t8152-aop-audio"
+     ]
+    ],
+    "cpu_dma_names": [
+     [
+      "cout",
+      "cin",
+      "spkr"
+     ]
+    ],
+    "cpu_nodes": [
+     "soc/aop@310c00000/audio"
+    ],
+    "codecs": [
+     {
+      "node": "soc/i2c@33101c000/codec@38",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 0,
+      "imon": 2
+     }
+    ]
+   }
+  ]
+ },
+ "mic": null,
+ "tuning": {
+  "tuning": {
+   "aid": "-",
+   "selection": {
+    "sample_rate": 48000,
+    "substitutions": {
+     "fs": "48000"
+    }
+   },
+   "protection": {
+    "kind": "atsp",
+    "strip_properties": [],
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": []
+     }
+    ]
+   }
+  }
+ }
+}

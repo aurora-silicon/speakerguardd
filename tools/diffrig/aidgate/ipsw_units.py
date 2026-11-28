@@ -21,7 +21,8 @@ import argparse, hashlib, json, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "packaging", "upgrade"))
-from aurora_speaker_upgrade import apfs_ro, ipsw  # noqa: E402
+from aurora_speaker_upgrade import ipsw  # noqa: E402
+from aurora_speaker_upgrade.asahi_firmware import apfs_ro  # noqa: E402
 
 UNIT = "/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP"
 
@@ -31,7 +32,7 @@ def main():
     ap.add_argument("build"); ap.add_argument("board"); ap.add_argument("out")
     ap.add_argument("--ipsw"); ap.add_argument("--no-tunings", action="store_true")
     a = ap.parse_args()
-    vol, _, got = ipsw.open_system(ipsw.find_url(a.build, a.ipsw), a.board, a.build)
+    vol, _, got, _ = ipsw.open_system(a.board, url=a.ipsw, preferred_build=a.build)
     os.makedirs(a.out, mode=0o700, exist_ok=True)
     ino, _ = vol.resolve(UNIT)
     b = vol.read_file(ino)

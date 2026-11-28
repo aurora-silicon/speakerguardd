@@ -1355,3 +1355,231 @@ fn a_drive_scale_models_the_capped_amps_exactly_and_unity_is_the_reference() {
     u.set_drive_scale(1e-6);
     assert!((u.drive_scale() - spp3::MIN_DRIVE_SCALE).abs() < 1e-9);
 }
+
+/// The J615 full-sweep ladder shape (SGV2-AIRS 11-28, volume 1.0, S100
+/// then F100): a loud episode leaves the smoothed resistance hot, then no
+/// window is accepted for tens of seconds (another speaker's sweep) while
+/// the honest coil cools unseen. The next sweep's first windows read the
+/// cooler coil and rise as its bass heats it; a smoother left at the stale
+/// hot value falls toward them while the model climbs, which read as a fall
+/// and tripped SENSE_IMPLAUSIBLE on two woofers 3.6 s into the sweep. After
+/// such a gap the trend restarts at the first window: no trip.
+#[test]
+fn plausibility_guard_restarts_the_trend_after_a_gap() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    gap_episode(&mut rp, upw);
+    // the next sweep's bass: the model climbs 2.3 K per window from 55 C,
+    // the coil from 40 C honestly warms 1.5 K per window
+    for k in 0..30 {
+        let o = replay_window(&mut rp, upw, coil_r(tc, 40.0 + 1.5 * k as f64), 55.0 + 2.3 * k as f64);
+        assert!(!o.2, "an honest coil warming after a gap tripped at window {k}: T_CL {}", o.1);
+    }
+}
+
+/// Heat the coil honestly to 75 C (the model to 130 C), then 25 s without
+/// an accepted window while the model cools to 55 C.
+fn gap_episode(rp: &mut spp3::ClReplay, upw: usize) {
+    let tc = 25.0;
+    for k in 0..40 {
+        let t = tc + 50.0 * k as f64 / 39.0;
+        let (_, _, bad) = replay_window(rp, upw, coil_r(tc, t), tc + 105.0 * k as f64 / 39.0);
+        assert!(!bad, "heating, window {k}");
+    }
+    let n = (25.0 * 48_000.0 / 256.0) as usize;
+    for k in 0..n {
+        if k % upw == 0 {
+            assert!(!rp.window(0.0, 0.0), "a silent window is rejected");
+        }
+        let (_, _, bad) = rp.update(130.0 - 75.0 * k as f64 / n as f64, 0.0);
+        assert!(!bad, "gap, update {k}");
+    }
+}
+
+/// Window index at which a [V,I]-swap-shaped reading (falling `fall` K-
+/// equivalent per window from 40 C while the model climbs 2.3 K per
+/// window from 55 C) trips, after `gap_episode` or straight from a fresh
+/// kernel.
+fn swap_trip(after_gap: bool, fall: f64) -> Option<usize> {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    if after_gap {
+        gap_episode(&mut rp, upw);
+    }
+    (0..40).find(|&k| {
+        let o = replay_window(&mut rp, upw, coil_r(tc, 40.0 - fall * k as f64), 55.0 + 2.3 * k as f64);
+        if o.2 {
+            assert_eq!(o.0, 0.0, "a tripped guard drops the relaxation");
+        }
+        o.2
+    })
+}
+
+/// A sense that is not reading the coil still trips after the gap, on the
+/// same window as from a fresh kernel (the trend restarts as after a
+/// rebuild), and without a gap nothing changes (the pinned window).
+#[test]
+fn plausibility_guard_still_trips_a_swap_after_a_gap() {
+    for (fall, pinned) in [(0.6, 13), (1.0, 7), (2.0, 7)] {
+        let fresh = swap_trip(false, fall).expect("the falling sense trips");
+        assert_eq!(swap_trip(true, fall), Some(fresh), "fall {fall} K/window");
+        assert_eq!(fresh, pinned, "fall {fall} K/window: no gap, the trip window is unchanged");
+    }
+}
+
+/// Forced over-temperature across the same gap: a coil that honestly runs
+/// 10 K hotter than the model, driven at full scale, cooled 25 s with no
+/// accepted window, then driven at full scale until the model is far past
+/// its limit. The closed loop never trips and the limiter engages. On an
+/// unproven board the gain is the same, block for block, as a unit whose
+/// sense bus carries nothing, the limit never above the base. On a
+/// relaxing board (which may relax by the reference law while its T_CL
+/// lags the model) the post-gap limiter trace is pinned and no looser than
+/// before the change: the re-qualification hold only keeps the limit at
+/// the base longer.
+#[test]
+fn over_temperature_after_a_gap_limits_as_the_open_loop() {
+    let p = slow_cl_params();
+    // live and silent on an unproven board, live on the relaxing board
+    let mut units = [spp3::Unit::new(p), spp3::Unit::new(p), spp3::Unit::for_machine(p, Some("j616s"))];
+    let n = 8192.0;
+    let m = (43.0664f64 * n / RATE as f64).round();
+    let (mut ob, zeros) = (vec![vec![0.0f32; 512]; 4], vec![0.0f32; 512]);
+    let (mut min_gain, mut max_tol, mut f) = (1.0f32, 0.0f32, 0usize);
+    let mut t_ol = [p.thermal_ambient_temp; 3];
+    // the relaxing board after the gap: sum of gains, highest limit
+    let mut trace = (0.0f64, 0.0f64);
+    for (phase, (secs, x)) in [(6.0, 1.0f32), (25.0, 0.0), (20.0, 1.0)].into_iter().enumerate() {
+        let xs = vec![x; 512];
+        for _ in 0..(secs * RATE as f64 / 512.0) as usize {
+            let (mut gains, mut lims) = ([0.0f32; 3], [0.0f64; 3]);
+            for (j, u) in units.iter_mut().enumerate() {
+                // the coil 10 K above the model; nothing on the bus while
+                // silent, nor ever for the open-loop twin
+                let r = coil_r(25.0, t_ol[j] as f64 + 10.0);
+                let v: Vec<f32> = (f..f + 512)
+                    .map(|k| (0.05 * (2.0 * std::f64::consts::PI * m * k as f64 / n).sin()) as f32)
+                    .collect();
+                let i: Vec<f32> = v.iter().map(|&s| ((s as f64 * 12.0 / r) / 2.0) as f32).collect();
+                let live = x > 0.0 && j != 1;
+                let sense: Vec<&[f32]> = (0..8)
+                    .map(|k| {
+                        if !live {
+                            &zeros[..]
+                        } else if k % 2 == 0 {
+                            &i[..]
+                        } else {
+                            &v[..]
+                        }
+                    })
+                    .collect();
+                let ins: Vec<&[f32]> = (0..4).map(|_| &xs[..]).collect();
+                let mut outs: Vec<&mut [f32]> = ob.iter_mut().map(|b| &mut b[..]).collect();
+                u.process(Io { frames: 512, input: &ins, sense: &sense, output: &mut outs });
+                let mut t = Telemetry::new();
+                u.telemetry(&mut t);
+                t_ol[j] = t.channels[0].ol_temp_c;
+                gains[j] = t.channels[0].gain;
+                lims[j] = u.effective_limit(0);
+                assert!(!u.sense_implausible(0), "unit {j}: an honest coil tripped");
+            }
+            assert!(lims[0] <= 120.0 && lims[1] <= 120.0, "unproven board relaxed: {lims:?}");
+            assert_eq!(gains[0], gains[1], "unproven board: gain differs from the open loop at frame {f}");
+            if phase == 2 {
+                min_gain = min_gain.min(gains[0]).min(gains[2]);
+                trace.0 += gains[2] as f64;
+                trace.1 = trace.1.max(lims[2]);
+            }
+            max_tol = max_tol.max(t_ol[0]);
+            f += 512;
+        }
+    }
+    assert!(max_tol > 120.0, "the model went past its limit: {max_tol}");
+    assert!(min_gain < 0.5, "the limiter engaged after the gap: {min_gain}");
+    assert!(units[0].controller_state(0)[9] == 1.0, "the closed loop was live at the end");
+    // the pre-restart limiter (no trend restart, no re-qualification hold)
+    // traced gains summing to 0x4087_0a9c_75d0_0000 with a highest limit of
+    // 0x405f_64c5_0f87_fa40: after the gap the hold keeps the limit at the
+    // base until a full ring is judged, so the trace may only be stricter
+    let before = (f64::from_bits(0x4087_0a9c_75d0_0000), f64::from_bits(0x405f_64c5_0f87_fa40));
+    assert!(trace.0 <= before.0 && trace.1 <= before.1, "looser than before the change: {trace:?} vs {before:?}");
+    assert_eq!((trace.0.to_bits(), trace.1.to_bits()), (0x4086_f3ee_d4a0_0000, 0x405e_1de3_9946_b08b), "{trace:?}");
+}
+
+/// Repeated gaps on a relaxing board (App review of the trend restart): a
+/// sense that is not reading the coil (it reads a falling coil while the
+/// model climbs, the [V,I]-swap shape) comes back in bursts shorter than a
+/// trend ring, each after a gap long enough to restart the trend. No ring
+/// is ever full, so the guard never judges it; the correction must not
+/// relax on it meanwhile. The limit stays at the base through every burst.
+#[test]
+fn repeated_gaps_never_relax_on_an_unjudged_sense() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    gap_episode(&mut rp, upw);
+    let gap = (25.0 * 48_000.0 / 256.0) as usize;
+    let mut max_adj = 0.0f64;
+    for burst in 0..12 {
+        // five windows (shorter than the ring): the model climbs 2.3 K per
+        // window from 55 C, the sense reads 0.6 K-equivalent colder each
+        for k in 0..5 {
+            let o = replay_window(&mut rp, upw, coil_r(tc, 40.0 - 0.6 * k as f64), 55.0 + 2.3 * k as f64);
+            assert!(!o.2, "burst {burst} window {k}: a short burst is not judged");
+            max_adj = max_adj.max(o.0);
+        }
+        // a gap long enough to restart the trend
+        for k in 0..gap {
+            if k % upw == 0 {
+                assert!(!rp.window(0.0, 0.0), "a silent window is rejected");
+            }
+            let o = rp.update(60.0, 0.0);
+            max_adj = max_adj.max(o.0);
+        }
+    }
+    assert_eq!(max_adj, 0.0, "the correction relaxed on a sense the guard never judged");
+}
+
+/// REVIEW6 on #290: a second gap while a restarted trend re-qualifies must
+/// restart the trend again. Burst B (half a ring) after the first gap reads
+/// a cool coil, burst C (half a ring) after a second gap a hot one, the
+/// model rising monotonically across both. Sharing one ring across the
+/// second gap, B + C would judge as an honest rise and end the
+/// re-qualification, so C would relax on windows the guard never judged
+/// together; restarted at C, half a ring is not judged and nothing relaxes.
+#[test]
+fn second_gap_during_requalification_restarts_the_trend() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    gap_episode(&mut rp, upw);
+    let gap = (25.0 * 48_000.0 / 256.0) as usize;
+    let mut max_adj = 0.0f64;
+    // burst B: four windows, coil 40 C, model 55 -> 61.9 C
+    for k in 0..4 {
+        let o = replay_window(&mut rp, upw, coil_r(tc, 40.0), 55.0 + 2.3 * k as f64);
+        assert!(!o.2, "burst B window {k}");
+        max_adj = max_adj.max(o.0);
+    }
+    // second gap, the model held at its last value (monotonic overall)
+    for k in 0..gap {
+        if k % upw == 0 {
+            assert!(!rp.window(0.0, 0.0), "a silent window is rejected");
+        }
+        let o = rp.update(61.9, 0.0);
+        max_adj = max_adj.max(o.0);
+    }
+    // burst C: four windows, coil 80 C, model 70 -> 76.9 C
+    for k in 0..4 {
+        let o = replay_window(&mut rp, upw, coil_r(tc, 80.0), 70.0 + 2.3 * k as f64);
+        assert!(!o.2, "burst C window {k}");
+        max_adj = max_adj.max(o.0);
+    }
+    assert_eq!(max_adj, 0.0, "a ring spanning the second gap re-qualified the trend");
+}
