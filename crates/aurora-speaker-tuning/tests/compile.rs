@@ -245,95 +245,7 @@ fn compile_binds_to_the_machine() {
 /// A synthetic lsm2 saved state: one active type-A model, two channels.
 fn lsm2_state(tweak: impl Fn(&mut BTreeMap<u32, f32>)) -> ParamState {
     let mut m: BTreeMap<u32, f32> = BTreeMap::new();
-    m.insert(id::ENABLE_CLOSED_LOOP_TEMPERATURE, 0.0);
-    m.insert(id::BYPASS_SYS_ID, 1.0);
-    // type-A PilotToneAmplitude_dB: the peak axis reserves it
-    m.insert(1024 + 2, -40.0);
-    for c in 0..8 {
-        m.insert(id::CH_TUNING + c, 0.0);
-        m.insert(id::CH_SPEAKER_TYPE + c, 0.0);
-    }
-    for mgr in 0..5 {
-        for ty in 0..3 {
-            for k in 0..37 {
-                m.insert(id::model(mgr, ty, k), 0.0);
-            }
-            let set = |m: &mut BTreeMap<u32, f32>, k, v| {
-                m.insert(id::model(mgr, ty, k), v);
-            };
-            set(&mut m, id::M_RDC, 5.0 + mgr as f32);
-            set(&mut m, id::M_ENABLE_RES1, 1.0);
-            set(&mut m, id::M_BL, 0.9);
-            set(&mut m, id::M_MMS_G, 0.3);
-            set(&mut m, id::M_RMS, 0.2);
-            set(&mut m, id::M_KMS, 1500.0 + 10.0 * mgr as f32);
-        }
-    }
-    for ty in 0..3 {
-        for (k, v) in [(id::T_RTH_VC, 30.0), (id::T_TAU_VC, 3.0), (id::T_RTH_MG, 20.0), (id::T_TAU_MG, 80.0)] {
-            m.insert(id::thermal(ty, k), v);
-        }
-        m.insert(id::thermal(ty, id::T_AMBIENT), 45.0);
-        m.insert(id::thermal(ty, id::T_ENABLE), 1.0);
-    }
-    for k in 0..23 {
-        m.insert(id::controller(k), 1.0);
-    }
-    for (k, v) in [
-        (id::C_ATTACK, 4.0),
-        (id::C_FAST_RELEASE, 150.0),
-        (id::C_SLOW_RELEASE, 15000.0),
-        (id::C_LATENCY, 22.0 / 3.0),
-        (id::C_FILTERBANK_LATENCY, 10.0 / 3.0),
-        (id::C_LOOKAHEAD, 2.0 / 3.0),
-        (id::C_UNLINK_TEMPERATURE, 0.0),
-        (id::C_COMPENSATE_RESONATORS, 0.0),
-        (id::C_USE_FAST_PEAK, 0.0),
-    ] {
-        m.insert(id::controller(k), v);
-    }
-    for k in 0..37 {
-        m.insert(id::amp0(k), 0.0);
-    }
-    for j in 0..4 {
-        m.insert(id::amp0(id::A_TIME_SCALE + j), [0.01, 0.2, 2.0, 30.0][j as usize]);
-        m.insert(id::amp0(id::A_HARD_LIMIT + j), [50.0, 8.0, 3.0, 2.0][j as usize]);
-        m.insert(id::amp0(id::A_SOFT_LIMIT + j), 100.0);
-    }
-    m.insert(id::amp0(id::A_LOW_IDLE), 0.02);
-    m.insert(id::amp0(id::A_LOW_RATIO), 1.2);
-    m.insert(id::amp0(id::A_MAX_ATTENUATION), 4.0);
-    for c in 0..8 {
-        for k in 0..33 {
-            m.insert(id::channel(c, k), 1.0);
-        }
-        m.insert(id::channel(c, id::CH_VOLTS_FS), 11.89);
-        m.insert(id::channel(c, id::CH_PARASITIC), 0.2);
-        m.insert(id::channel(c, id::CH_DISPLACEMENT_LIMIT), 0.0005);
-        m.insert(id::channel(c, id::CH_TEMP_HARD), 130.0);
-        m.insert(id::channel(c, id::CH_TEMP_SOFT), 115.0);
-        m.insert(id::channel(c, id::CH_VELOCITY_LIMIT0), 0.5);
-        m.insert(id::channel(c, id::CH_MAX_VELOCITY_ATTEN), 18.0);
-        m.insert(id::channel(c, id::CH_MAX_TEMP_ATTEN), 10.0);
-        m.insert(id::channel(c, id::CH_TEMP_HEADROOM), 4.0);
-        m.insert(id::channel(c, id::CH_POWER_AMP_MODEL), 0.0);
-        m.insert(id::channel(c, id::CH_MASK_BAND_MIN), 8000.0);
-        m.insert(id::channel(c, id::CH_MASK_BAND_MAX), 12000.0);
-        m.insert(id::channel(c, id::CH_MASK_ATTACK), 0.01);
-        m.insert(id::channel(c, id::CH_MASK_RELEASE), 0.1);
-        m.insert(id::channel(c, id::CH_MASK_ATTACK_FAST_MS), 5.0);
-        m.insert(id::channel(c, id::CH_MASK_ATTACK_RANGE), 70.0);
-        m.insert(id::channel(c, id::CH_BANDWIDTH), 0.0);
-        for (j, v) in [0.5, 0.6, 0.9].into_iter().enumerate() {
-            m.insert(id::channel(c, id::CH_VELOCITY_LIMIT0 + j as u32), v);
-        }
-        for (j, v) in [10.0, 20.0, 30.0, 40.0].into_iter().enumerate() {
-            m.insert(id::channel(c, id::CH_MASK_ENERGY0 + j as u32), v);
-        }
-        for (j, v) in [60.0, 300.0, 650.0, 1600.0, 5000.0].into_iter().enumerate() {
-            m.insert(id::channel(c, id::CH_BAND_CENTER0 + j as u32), v);
-        }
-    }
+    lsm2_model(&mut m);
     tweak(&mut m);
     ParamState { sections: vec![ParamSection { scope: 0, element: 0, params: m.into_iter().collect() }] }
 }
@@ -1154,7 +1066,7 @@ fn static_lsid_lanes_may_use_their_tuning_bank() {
 }
 
 #[test]
-fn static_lsid_admittance_inductance_must_not_raise_the_modeled_power() {
+fn static_lsid_admittance_inductance_never_lowers_the_modeled_power() {
     let branch = |r2: f32, le: f32, l2: f32| {
         move |m: &mut BTreeMap<u32, f32>| {
             for ty in 0..3 {
@@ -1168,21 +1080,76 @@ fn static_lsid_admittance_inductance_must_not_raise_the_modeled_power() {
             }
         }
     };
-    // A resistive-inductive branch only adds impedance at every frequency.
+    // A resistive-inductive branch only adds impedance at every frequency:
+    // the current model runs as it stands.
     let (plain, guarded) = static_case("c-lsid-lr2", branch(0.2, 60e-6, 35e-6));
-    let (_, d) = released(&guarded);
+    let (unit, d) = released(&guarded);
     assert!(d.items.iter().any(|i| i.code == "lsm2-lr2-bounded"));
+    assert!(unit.params().ch[..4].iter().all(|c| c.admittance_bound == 1.0));
     assert!(refusal(&plain).contains("LR2 inductance"));
     // A large L2 behind a tiny R2 lowers |Z| just above the resonance, where
-    // the motional part is capacitive: the model without it would under-read.
+    // the motional part is capacitive: the model without it would under-read,
+    // so the current model is scaled until it no longer does.
     let (_, guarded) = static_case("c-lsid-lr2-up", branch(1e-5, 1e-6, 0.2));
-    assert!(refusal(&guarded).contains("admittance inductance would raise the modeled power"));
+    let (unit, _) = released(&guarded);
+    let c = unit.params().ch[0];
+    assert!(c.admittance_bound > 1.0, "{}", c.admittance_bound);
+    // the bound holds against the full model on a dense grid
+    let (rdc, bl, m, rms, k) = (c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64);
+    let (r2, le, l2) = (1e-5f32 as f64, 1e-6f32 as f64, 0.2f32 as f64);
+    for j in 0..20_000 {
+        let f = 10f64.powf(4.38 * j as f64 / 19_999.0);
+        let w = 2.0 * std::f64::consts::PI * f;
+        let s = num_complex_free::C(0.0, w);
+        let base = num_complex_free::C(rdc, 0.0)
+            + num_complex_free::C(bl * bl, 0.0)
+                / (num_complex_free::C(rms, 0.0) + s * m + num_complex_free::C(k, 0.0) / s);
+        let full = base + s * le + (s * (r2 * l2)) / (s * l2 + r2);
+        let (yb, yf) = (base.recip().0, full.recip().0);
+        assert!(yf <= yb * c.admittance_bound as f64 * (1.0 + 1e-9), "f {f}: {yf} > {} x {yb}", c.admittance_bound);
+    }
     // A negative field is never bounded.
     let (_, guarded) = static_case("c-lsid-lr2-neg", branch(-0.1, 60e-6, 35e-6));
-    assert!(refusal(&guarded).contains("admittance inductance"));
+    assert!(refusal(&guarded).contains("admittance inductance is not a passive"));
     // Other managers' inductance is not modelled at all: refused.
     let (_, guarded) = static_case("c-lsid-lr2-disp", |m| {
         m.insert(id::model(id::MANAGER_DISPLACEMENT, 0, id::M_ENABLE_LR2), 1.0);
     });
     assert!(refusal(&guarded).contains("displacement LR2 inductance"));
+}
+
+/// Just enough complex arithmetic for the admittance checks.
+mod num_complex_free {
+    #[derive(Clone, Copy)]
+    pub struct C(pub f64, pub f64);
+    impl std::ops::Add for C {
+        type Output = C;
+        fn add(self, o: C) -> C {
+            C(self.0 + o.0, self.1 + o.1)
+        }
+    }
+    impl std::ops::Add<f64> for C {
+        type Output = C;
+        fn add(self, o: f64) -> C {
+            C(self.0 + o, self.1)
+        }
+    }
+    impl std::ops::Mul<f64> for C {
+        type Output = C;
+        fn mul(self, o: f64) -> C {
+            C(self.0 * o, self.1 * o)
+        }
+    }
+    impl std::ops::Div for C {
+        type Output = C;
+        fn div(self, o: C) -> C {
+            let n = o.0 * o.0 + o.1 * o.1;
+            C((self.0 * o.0 + self.1 * o.1) / n, (self.1 * o.0 - self.0 * o.1) / n)
+        }
+    }
+    impl C {
+        pub fn recip(self) -> C {
+            C(1.0, 0.0) / self
+        }
+    }
 }

@@ -241,6 +241,10 @@ pub fn effective_filterbank_latency_ms(latency_ms: f32, lookahead_ms: f32, rate:
 pub const BANDS: usize = 5;
 /// Taps of the property-6632 pressure response.
 pub const PRESSURE_TAPS: usize = 1024;
+
+/// The highest stream rate the unit runs at: the 176.4/192 kHz family, where
+/// the native controller caps ([`controller_frames`]).
+pub const MAX_STREAM_RATE: u32 = 192_000;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
 const CUT: f32 = 0.99;
@@ -356,6 +360,16 @@ pub struct ChannelParams {
     /// its generic flags like the other managers': Rdc, Bl, Mms (kg), Rms,
     /// Kms.
     pub compensation: [f32; 10],
+    /// The power-path admittance bound, >= 1: the current models' numerator
+    /// is multiplied by it. 1 runs the current model as it stands. Above 1,
+    /// the tuning's admittance model enables an inductive (LR2) branch that
+    /// the current model leaves out and whose omission would lower the
+    /// modeled power somewhere below Nyquist; the compiler sets the smallest
+    /// factor with which `Re Y` of the model without the branch is at or
+    /// above `Re Y` with it at every frequency, from the channel's own
+    /// resolved model, so the modeled electrical power (and with it every
+    /// thermal and power estimate) stays at or above the full model's.
+    pub admittance_bound: f32,
 }
 
 impl ChannelParams {
@@ -431,6 +445,7 @@ impl Default for ChannelParams {
             pressure_taps: 0,
             pressure_fir: [0.0; PRESSURE_TAPS],
             compensation: [0.0; 10],
+            admittance_bound: 1.0,
         }
     }
 }
@@ -461,6 +476,10 @@ pub struct Params {
     pub power_hard_limit_w: [f32; 4],
     pub power_soft_limit_pct: [f32; 4],
     pub power_budgets_scale: f32,
+    /// `TemperatureResponseRateFactor` (the six-lane schema's controller
+    /// field 27; 0 in the base schema): an additive floor on the
+    /// temperature candidate's allocation weight ([`laws::temperature_candidate`]).
+    pub temperature_rate_factor: f32,
     pub max_power_attenuation_db: f32,
     pub low_rail_idle_power_w: f32,
     pub low_rail_power_ratio: f32,
@@ -486,9 +505,9 @@ unsafe impl Pod for Params {}
 // SAFETY: as above.
 unsafe impl Pod for ChannelParams {}
 
-const CH_WORDS: usize = 84 + PRESSURE_TAPS;
+const CH_WORDS: usize = 85 + PRESSURE_TAPS;
 const _: () = assert!(core::mem::size_of::<ChannelParams>() == CH_WORDS * 4);
-const _: () = assert!(core::mem::size_of::<Params>() == (40 + laws::MASK_BUCKETS + MAX_CHANNELS * CH_WORDS) * 4);
+const _: () = assert!(core::mem::size_of::<Params>() == (41 + laws::MASK_BUCKETS + MAX_CHANNELS * CH_WORDS) * 4);
 
 impl Default for Params {
     fn default() -> Self {
@@ -514,6 +533,7 @@ impl Default for Params {
             power_hard_limit_w: [0.0; 4],
             power_soft_limit_pct: [0.0; 4],
             power_budgets_scale: 1.0,
+            temperature_rate_factor: 0.0,
             max_power_attenuation_db: 0.0,
             low_rail_idle_power_w: 0.0,
             low_rail_power_ratio: 0.0,
@@ -690,6 +710,13 @@ impl Params {
         }
         if !(nonneg(self.filterbank_latency_ms) && nonneg(self.speaker_response_lookahead_ms)) {
             return Err(InitError::Invalid("latency"));
+        }
+        if !self.temperature_rate_factor.is_finite() {
+            return Err(InitError::Invalid("temperature rate factor"));
+        }
+        // The bound only ever raises the modeled current.
+        if self.ch[..n].iter().any(|c| !(c.admittance_bound.is_finite() && c.admittance_bound >= 1.0)) {
+            return Err(InitError::Invalid("admittance bound"));
         }
         // The bank needs a centre tap and at least one on each side, and its
         // look-ahead region must fit in one controller frame.
@@ -1304,6 +1331,17 @@ impl ProtectedPeak {
     }
 }
 
+/// The current models' coefficients for a channel: the tuning's current
+/// model, its numerator scaled by the channel's admittance bound. A bound
+/// of exactly 1 leaves every coefficient bit-identical.
+fn bounded_current_coefficients(c: &ChannelParams, rate: f64) -> ([f32; 3], [f32; 2]) {
+    let (b, a) = current_coefficients(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
+    if c.admittance_bound == 1.0 {
+        return (b, a);
+    }
+    (b.map(|v| v * c.admittance_bound), a)
+}
+
 /// The input power-path current model: binary32 state and output.
 #[derive(Clone, Copy, Default)]
 struct Current {
@@ -1314,8 +1352,7 @@ struct Current {
 }
 
 impl Current {
-    fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
-        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
+    fn new((b, a): ([f32; 3], [f32; 2])) -> Self {
         Current { b, a, u: [0.0; 2], i: [0.0; 2] }
     }
     #[inline]
@@ -1365,8 +1402,7 @@ impl Default for MonitorCurrent {
 }
 
 impl MonitorCurrent {
-    fn new(rdc: f64, bl: f64, m: f64, rms: f64, k: f64, rate: f64) -> Self {
-        let (b, a) = current_coefficients(rdc, bl, m, rms, k, rate);
+    fn new((b, a): ([f32; 3], [f32; 2])) -> Self {
         MonitorCurrent { b, a, table: Self::bulk_table(b, a), z: [0.0; 2] }
     }
 
@@ -1904,6 +1940,8 @@ struct Run {
     /// the peak over its oldest `tb_sel` points with the frame's.
     tb_hist: usize,
     tb_sel: usize,
+    /// [`Params::temperature_rate_factor`].
+    temp_rate_factor: f32,
     axis: [bool; 5],
     /// ControlVelocity alone: the published velocity candidate is computed
     /// whenever the axis is configured, also with EnableMitigation = 0
@@ -1962,6 +2000,15 @@ impl Unit {
         let (mut params, companion) = companion::decode_blob(bytes)?;
         if rate != 0 {
             params.sample_rate = rate;
+        }
+        if let Some(c) = &companion {
+            // The run factor must be the companion's own saved record (0
+            // where the schema has none), bit for bit.
+            let id = ids::controller(companion::extension::CONTROLLER_TEMPERATURE_RATE_FACTOR);
+            let saved = c.lsm2_records.iter().find(|r| r.0 == id).map_or(0.0, |r| r.1);
+            if params.temperature_rate_factor.to_bits() != saved.to_bits() {
+                return Err(InitError::Invalid("temperature rate factor"));
+            }
         }
         let mut unit = Self::new(params);
         if let Some(c) = &companion {
@@ -2131,9 +2178,9 @@ impl Run {
             };
             let vel = motion(c.vel_rdc, c.vel_bl, c.vel_mms_kg, c.vel_rms, c.vel_kms, rate, true);
             let disp = motion(c.disp_rdc, c.disp_bl, c.disp_mms_kg, c.disp_rms, c.disp_kms, rate, false);
-            let cur = Current::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
-            let monitor_cur =
-                MonitorCurrent::new(c.rdc as f64, c.bl as f64, c.mms_kg as f64, c.rms as f64, c.kms as f64, rate);
+            let coefficients = bounded_current_coefficients(c, rate);
+            let cur = Current::new(coefficients);
+            let monitor_cur = MonitorCurrent::new(coefficients);
             let br_vc = ThermalBranch::new(c.rth_vc as f64, c.tau_vc as f64, sub_dt);
             let br_mg = ThermalBranch::new(c.rth_mag as f64, c.tau_mag as f64, sub_dt);
             ch.push(Chan {
@@ -2277,6 +2324,7 @@ impl Run {
             ring_len,
             tb_hist: p.latency_frames() / sub,
             tb_sel: p.latency_frames() / sub + SUBSTEPS - fb / sub,
+            temp_rate_factor: p.temperature_rate_factor,
             // EnableMitigation = 0: every axis off, the models and meters run
             axis: [
                 p.control_sample_peak,
@@ -2841,6 +2889,7 @@ impl Run {
                     c.t_hard as f32,
                     c.br_vc.r_eff,
                     c.br_mg.r_eff,
+                    self.temp_rate_factor,
                 ) as f64
             } else {
                 1.0

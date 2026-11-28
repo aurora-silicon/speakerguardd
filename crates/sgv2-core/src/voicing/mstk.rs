@@ -144,9 +144,10 @@ pub struct Params {
     pub render_quality: u32,
     pub overshoot_compensation: bool,
     pub algorithm: u32,
-    /// Whether automated algorithm-3 band zero uses the 25G83 selected-rate
-    /// detector producer. macOS 27 uses the host-rate producer instead.
-    /// Unknown source builds deliberately retain the established 25G83 law.
+    /// Whether an automated algorithm-3 box follows the 25G83 law: the
+    /// eight-frame pick with band zero's selected-rate producer. macOS 27
+    /// keeps the per-band cadence instead (see `cadence`). Unknown source
+    /// builds deliberately retain the established 25G83 law.
     pub selected_rate_band_zero: bool,
     pub automation_input: f64,
     pub automation_min: f64,
@@ -1013,7 +1014,13 @@ enum Cadence {
 /// magnitude reproduces the unit's steady tone gains above 300 Hz exactly.
 fn cadence(p: &Params) -> Cadence {
     let picks = p.algorithm >= 3 || p.render_quality >= 2;
-    if picks && p.threshold_automation.iter().any(|curve| curve.count != 0) {
+    // macOS 27's units keep the per-band cadence for an automated
+    // algorithm-3 box (black-box, 26B8125, threshold automation, release
+    // 5/20/80 ms: with the eight-frame pick the gain recovered up to 5.8 dB
+    // early after a burst; with [1, 2, 4, 4] and the per-band windows it
+    // follows within 0.02 dB RMS). Algorithms 0-2 were not measured there.
+    let eight = p.selected_rate_band_zero || p.algorithm < 3;
+    if picks && eight && p.threshold_automation.iter().any(|curve| curve.count != 0) {
         Cadence::PickEight
     } else if picks {
         Cadence::Pick
@@ -1179,7 +1186,7 @@ impl Run {
         // four arms. At the fixed eight-frame cadence this is 11/13/25
         // updates at 44.1/48/96 kHz before any outer band-rate reduction.
         // The eight-frame automation pick shares that window too. Black-box
-        // (installed unit, a box with threshold automation): with the
+        // (installed 25G83 unit, a box with threshold automation): with the
         // per-band 10/8/2/1 ms windows, low tones at full scale compressed
         // up to 0.33 dB too far and steps down released up to 1 dB late.
         let window_ms = match cadence(q) {
@@ -1943,6 +1950,17 @@ mod tests {
         // updates.
         assert_eq!(window, [1, 13, 13, 13]);
         assert!(!analytic_pick);
+        // macOS 27, algorithm 3: automation keeps the per-band cadence.
+        let mut automated27 = automated;
+        automated27.algorithm = 3;
+        automated27.render_quality = 1;
+        automated27.selected_rate_band_zero = false;
+        let (factor, window, _, band_zero_factor, _) = cadence(&automated27, 48_000.0);
+        assert_eq!((factor, window, band_zero_factor), ([1, 2, 4, 4], [481, 193, 25, 13], 1));
+        assert!(!alloc::boxed::Box::new(Run::new(&automated27, 48_000.0, 1)).band_zero_pick_lag);
+        // The 25G83 law keeps the eight-frame pick and its 2 ms window.
+        automated27.selected_rate_band_zero = true;
+        assert_eq!(cadence(&automated27, 48_000.0).0, [8; BANDS]);
         assert!(alloc::boxed::Box::new(Run::new(&automated, 48_000.0, 1)).band_zero_pick_lag);
         assert!(!alloc::boxed::Box::new(Run::new(&p, 48_000.0, 1)).band_zero_pick_lag);
 
@@ -2046,9 +2064,11 @@ mod tests {
             assert_eq!(Run::new(&p, 48_000.0, 1).band_zero_pick_lag, expected == 1, "order {order}");
         }
 
+        // macOS 27 keeps the per-band cadence: no band-zero reduction and
+        // no eight-frame pick lag.
         p.selected_rate_band_zero = false;
         assert_eq!(band_zero_factor(&p, 48_000.0), 1);
-        assert!(Run::new(&p, 48_000.0, 1).band_zero_pick_lag);
+        assert!(!Run::new(&p, 48_000.0, 1).band_zero_pick_lag);
         p.selected_rate_band_zero = true;
 
         p.render_quality = 2;

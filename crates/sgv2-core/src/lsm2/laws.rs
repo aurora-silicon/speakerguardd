@@ -124,6 +124,7 @@ pub fn temperature_candidate(
     hard: f32,
     rv: f32,
     rm: f32,
+    rate_factor: f32,
 ) -> f32 {
     if tpk <= soft {
         return 1.0;
@@ -147,7 +148,11 @@ pub fn temperature_candidate(
     let phi = (vc1 / (vc1 + mg1)).min(0.995);
     let body_ceiling = (1.0 - rho) * hard;
     let mix = if om >= body_ceiling { 1.0 } else { (om / body_ceiling).max(0.0) };
-    let mix = mix * mix;
+    // TemperatureResponseRateFactor: an additive floor on the weight that
+    // moves the split from the present rise proportions toward the
+    // steady-state resistance proportions (0 in the base schema, where the
+    // weight is the square alone).
+    let mix = if rate_factor == 0.0 { mix * mix } else { (mix * mix + rate_factor).clamp(0.0, 1.0) };
     // The native arm64 path does not form an interpolated split and then
     // multiply it by the room.  It first scales both endpoint splits by the
     // room, then interpolates each allowance with one binary32 FMA.  The two
@@ -910,8 +915,34 @@ mod tests {
 
     #[test]
     fn the_temperature_candidate_is_unity_below_the_soft_limit_and_cuts_above() {
-        assert_eq!(temperature_candidate(100.0, 40.0, 20.0, 10.0, 40.0, 110.0, 125.0, 30.0, 20.0), 1.0);
-        let g = temperature_candidate(130.0, 70.0, 30.0, 20.0, 40.0, 110.0, 125.0, 30.0, 20.0);
+        assert_eq!(temperature_candidate(100.0, 40.0, 20.0, 10.0, 40.0, 110.0, 125.0, 30.0, 20.0, 0.0), 1.0);
+        let g = temperature_candidate(130.0, 70.0, 30.0, 20.0, 40.0, 110.0, 125.0, 30.0, 20.0, 0.0);
+        // TemperatureResponseRateFactor: the weight is q^2 + factor, clamped
+        // to [0, 1]; a factor that saturates it takes the resistance split
+        // alone, so the result no longer depends on the output body rise.
+        let rated = temperature_candidate(130.0, 70.0, 30.0, 20.0, 40.0, 110.0, 125.0, 30.0, 20.0, 0.3125);
+        assert_ne!(rated, g);
+        let full = |om: f32| temperature_candidate(130.0, 70.0, 30.0, om, 40.0, 110.0, 125.0, 30.0, 20.0, 1.0);
+        assert_eq!(full(0.0), full(20.0));
+        // an independent evaluation of the law in binary64
+        let law = |om: f64, factor: f64| {
+            let [tpk, vc, mg, amb, soft, hard, rv, rm]: [f64; 8] = [130.0, 70.0, 30.0, 40.0, 110.0, 125.0, 30.0, 20.0];
+            let knee = soft + (hard - soft) * (1.0 - libm::exp(-(tpk - soft) / (hard - soft)));
+            let rho = (rv / (rv + rm)).min(0.995);
+            let phi = (vc / (vc + mg)).min(0.995);
+            let q = (om / ((1.0 - rho) * hard)).clamp(0.0, 1.0);
+            let w = (q * q + factor).clamp(0.0, 1.0);
+            let p = phi + w * (rho - phi);
+            let room = (knee - amb).max(0.0);
+            let (af, as_) = (room * p, room * (1.0 - p));
+            let g = [(af, vc), (as_, mg)].iter().fold(1.0f64, |g, &(a, t)| if a < t { g.min(a / t) } else { g });
+            libm::sqrt(g.max(0.0))
+        };
+        for (om, factor) in [(20.0f32, 0.0f32), (20.0, 0.3125), (5.0, 0.0625), (60.0, 0.4375), (0.0, 1.0)] {
+            let got = temperature_candidate(130.0, 70.0, 30.0, om, 40.0, 110.0, 125.0, 30.0, 20.0, factor) as f64;
+            let want = law(om as f64, factor as f64);
+            assert!((got - want).abs() < 1e-5, "om {om} factor {factor}: {got} vs {want}");
+        }
         assert!(g < 1.0 && g > 0.0);
     }
 }
