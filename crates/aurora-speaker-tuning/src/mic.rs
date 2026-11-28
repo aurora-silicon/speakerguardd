@@ -935,20 +935,36 @@ impl BeamMode {
 /// (steered coherent sources, level imbalances between the microphones,
 /// onsets out of silence, wind-like and room stimuli). [`beam`] refuses a
 /// file with more than one beam, so a real selection never passes.
+///
+/// **Older presets** save no controls 42 and 43 (the switch crossfade and
+/// automatic switching, added later). The unit then keeps its defaults,
+/// 0 and 1 (read from the unit), and black-box renders of such a preset
+/// equal the fixed-beam state of the same file; so a missing 42 or 43 is
+/// read as that default, in the fixed-beam state only (the one measured);
+/// automatic selection still needs both saved. Any other missing control
+/// refuses.
 pub fn beam_mode(e: Option<&Effect>) -> std::result::Result<BeamMode, String> {
     let e = e.ok_or_else(|| "no saved state in the strip".to_string())?;
     const FIXED: &[(u32, f64)] =
         &[(1, 0.0), (2, 1.0), (3, 0.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0)];
     const AUTO_SINGLE: &[(u32, f64)] =
         &[(1, 2.0), (2, 0.0), (3, 1.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0), (43, 1.0)];
-    let get = |id: u32| global(e, id).ok_or_else(|| format!("control {id} missing from the saved state"));
-    let (mode, want, what) = if get(1)? == 2.0 {
+    // the unit's defaults for the controls older presets do not save; only
+    // the fixed-beam state of such a preset is characterised
+    const LATER_DEFAULTS: &[(u32, f64)] = &[(42, 0.0), (43, 1.0)];
+    let strict = |id: u32| global(e, id).ok_or_else(|| format!("control {id} missing from the saved state"));
+    let (mode, want, what) = if strict(1)? == 2.0 {
         (BeamMode::AutoSingle, AUTO_SINGLE, "of automatic selection, only the one-beam state is characterised")
     } else {
         (BeamMode::Fixed, FIXED, "only the fixed-beam mode and automatic selection over one beam are characterised")
     };
     for &(id, v) in want {
-        let x = get(id)?;
+        let x = match (strict(id), mode) {
+            (Err(_), BeamMode::Fixed) if LATER_DEFAULTS.iter().any(|(k, _)| *k == id) => {
+                LATER_DEFAULTS.iter().find(|(k, _)| *k == id).map(|(_, d)| *d).unwrap()
+            }
+            (x, _) => x?,
+        };
         if x != v {
             return Err(format!("control {id} is {x}: {what}"));
         }
