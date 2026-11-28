@@ -1597,16 +1597,36 @@ class PcmWidths(unittest.TestCase):
 
 class AudioStack(unittest.TestCase):
     """wiring.audio_stack: the speaker card, the nodes its links point at and
-    the loaded sound modules, nothing else."""
+    only the speaker-path modules (bound drivers + ancestors + transitive
+    holders dependencies), nothing else."""
 
     @staticmethod
     def be(*w):
         import struct
         return struct.pack(">%dI" % len(w), *w)
 
+    @staticmethod
+    def _add_module(mods, name, build_id, holders=()):
+        os.makedirs(os.path.join(mods, name, "notes"), exist_ok=True)
+        with open(os.path.join(mods, name, "notes", ".note.gnu.build-id"), "wb") as f:
+            f.write(b"\x04\0\0\0\x14\0\0\0\x03\0\0\0GNU\0" + build_id)
+        if holders:
+            hdir = os.path.join(mods, name, "holders")
+            os.makedirs(hdir, exist_ok=True)
+            for h in holders:
+                os.symlink(os.path.join(mods, h), os.path.join(hdir, h))
+
+    @staticmethod
+    def _bind_dev(sysfs, bus, dev_name, dt_node_path, mod_path):
+        dev = os.path.join(sysfs, "bus", bus, "devices", dev_name)
+        os.makedirs(os.path.join(dev, "driver"), exist_ok=True)
+        os.symlink(dt_node_path, os.path.join(dev, "of_node"))
+        os.symlink(mod_path, os.path.join(dev, "driver", "module"))
+
     def tree(self, d):
-        import struct
-        root, mods = os.path.join(d, "dt"), os.path.join(d, "module")
+        root = os.path.join(d, "dt")
+        mods = os.path.join(d, "module")
+        sysfs = os.path.join(d, "sys")
 
         def node(path, props):
             p = os.path.join(root, path)
@@ -1625,20 +1645,31 @@ class AudioStack(unittest.TestCase):
         node("sound/dai-link@0", {"link-name": b"Speakers\0"})
         node("sound/dai-link@0/cpu", {"sound-dai": be(1, 0)})
         node("sound/dai-link@0/codec", {"sound-dai": be(2)})
-        for m, v in (("snd_soc_apple_mca", b"\xaa" * 20), ("snd_soc_macaudio", b"\xbb" * 20), ("nvme", b"\xcc" * 20)):
-            os.makedirs(os.path.join(mods, m, "notes"))
-            with open(os.path.join(mods, m, "notes", ".note.gnu.build-id"), "wb") as f:
-                f.write(b"\x04\0\0\0\x14\0\0\0\x03\0\0\0GNU\0" + v)
-        return root, mods
+        self._add_module(mods, "snd_soc_apple_mca", b"\xaa" * 20)
+        self._add_module(mods, "snd_soc_macaudio", b"\xbb" * 20)
+        self._add_module(mods, "snd_soc_tas2764", b"\xbc" * 20)
+        self._add_module(mods, "snd_soc_core", b"\xbd" * 20,
+                         holders=("snd_soc_apple_mca", "snd_soc_macaudio", "snd_soc_tas2764"))
+        self._add_module(mods, "snd_pcm", b"\xbe" * 20, holders=("snd_soc_core",))
+        self._add_module(mods, "snd_timer", b"\xbf" * 20, holders=("snd_pcm",))
+        self._add_module(mods, "snd", b"\xc0" * 20, holders=("snd_pcm", "snd_timer"))
+        self._add_module(mods, "nvme", b"\xcc" * 20)
+        self._bind_dev(sysfs, "platform", "sound", os.path.join(root, "sound"),
+                       os.path.join(mods, "snd_soc_macaudio"))
+        self._bind_dev(sysfs, "platform", "2a3400000.i2s", os.path.join(root, "soc/i2s@2a3400000"),
+                       os.path.join(mods, "snd_soc_apple_mca"))
+        self._bind_dev(sysfs, "i2c", "0-0038", os.path.join(root, "soc/i2c@0/codec@38"),
+                       os.path.join(mods, "snd_soc_tas2764"))
+        return root, mods, sysfs
 
     def test_what_changes_the_fingerprint(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            root, mods = self.tree(d)
+            root, mods, sysfs = self.tree(d)
             be = self.be
 
             def fp():
-                return wiring.audio_stack("sound", root, mods)
+                return wiring.audio_stack("sound", root, mods, sysfs)
             base = fp()
             self.assertRegex(base, r"^[0-9a-f]{16}$")
             self.assertEqual(fp(), base)
@@ -1648,13 +1679,26 @@ class AudioStack(unittest.TestCase):
             with open(os.path.join(mods, "nvme", "notes", ".note.gnu.build-id"), "ab") as f:
                 f.write(b"\xdd")
             self.assertEqual(fp(), base)
+            # late-loading software-only sound modules (issue #263: ALSA
+            # sequencer and hrtimer load after boot self-check) do not drift
+            # the fingerprint, even when they add themselves to snd/snd_timer
+            # holders
+            self._add_module(mods, "snd_seq_device", b"\xd1" * 20)
+            self._add_module(mods, "snd_seq", b"\xd2" * 20)
+            self._add_module(mods, "snd_seq_dummy", b"\xd3" * 20)
+            self._add_module(mods, "snd_hrtimer", b"\xd4" * 20)
+            self._add_module(mods, "snd_usb_audio", b"\xd5" * 20)
+            os.symlink(os.path.join(mods, "snd_seq"), os.path.join(mods, "snd", "holders", "snd_seq"))
+            os.symlink(os.path.join(mods, "snd_hrtimer"), os.path.join(mods, "snd_timer", "holders", "snd_hrtimer"))
+            os.makedirs(os.path.join(mods, "snd_seq", "holders"), exist_ok=True)
+            os.symlink(os.path.join(mods, "snd_seq_dummy"), os.path.join(mods, "snd_seq", "holders", "snd_seq_dummy"))
+            self.assertEqual(fp(), base)
             # the serializer node a link points at (the J615's receiver delay)
             with open(os.path.join(root, "soc/i2s@2a3400000/apple,rx-delay-bclks"), "wb") as f:
                 f.write(bytes.fromhex("00000001000000010000000000000000"))
             with_prop = fp()
             self.assertNotEqual(with_prop, base)
-            # a rebuilt sound module under the same kernel release (its
-            # build ID; srcversion where the module has one)
+            # a rebuilt bound speaker-path module under the same kernel release
             with open(os.path.join(mods, "snd_soc_apple_mca", "notes", ".note.gnu.build-id"), "r+b") as f:
                 f.seek(16)
                 f.write(b"\xee" * 20)
@@ -1662,14 +1706,58 @@ class AudioStack(unittest.TestCase):
             self.assertNotEqual(rebuilt_id, with_prop)
             with open(os.path.join(mods, "snd_soc_apple_mca", "srcversion"), "w") as f:
                 f.write("EEEE\n")
-            self.assertNotEqual(fp(), rebuilt_id)
             rebuilt = fp()
+            self.assertNotEqual(rebuilt, rebuilt_id)
             self.assertNotEqual(rebuilt, with_prop)
+            # a rebuilt transitive dependency (snd_soc_core via holders) also
+            # changes the fingerprint
+            with open(os.path.join(mods, "snd_soc_core", "notes", ".note.gnu.build-id"), "r+b") as f:
+                f.seek(16)
+                f.write(b"\xef" * 20)
+            rebuilt_dep = fp()
+            self.assertNotEqual(rebuilt_dep, rebuilt)
             # an amp node a link points at
             with open(os.path.join(root, "soc/i2c@0/codec@38/ti,imon-slot-no"), "wb") as f:
                 f.write(be(4))
-            self.assertNotEqual(fp(), rebuilt)
-            self.assertEqual(wiring.audio_stack("nowhere", root, mods), "-")
+            self.assertNotEqual(fp(), rebuilt_dep)
+            self.assertEqual(wiring.audio_stack("nowhere", root, mods, sysfs), "-")
+
+    def test_aop_ancestor_module_is_included(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "dt")
+            mods = os.path.join(d, "module")
+            sysfs = os.path.join(d, "sys")
+
+            def node(path, props):
+                p = os.path.join(root, path)
+                os.makedirs(p, exist_ok=True)
+                for k, v in props.items():
+                    with open(os.path.join(p, k), "wb") as f:
+                        f.write(v)
+
+            be = self.be
+            node("soc/aop@310c00000", {"compatible": b"apple,aop\0"})
+            node("soc/aop@310c00000/audio", {"compatible": b"apple,aop-audio\0", "phandle": be(1),
+                                             "#sound-dai-cells": be(1)})
+            node("sound", {"compatible": b"apple,macaudio\0"})
+            node("sound/dai-link@0", {"link-name": b"Speakers\0"})
+            node("sound/dai-link@0/cpu", {"sound-dai": be(1, 0)})
+            self._add_module(mods, "aop", b"\x11" * 20)
+            self._add_module(mods, "snd_soc_aop", b"\x22" * 20)
+            self._add_module(mods, "snd_soc_macaudio", b"\x33" * 20)
+            self._bind_dev(sysfs, "platform", "sound", os.path.join(root, "sound"),
+                           os.path.join(mods, "snd_soc_macaudio"))
+            self._bind_dev(sysfs, "platform", "310c00000.aop", os.path.join(root, "soc/aop@310c00000"),
+                           os.path.join(mods, "aop"))
+            self._bind_dev(sysfs, "platform", "audio.2.auto", os.path.join(root, "soc/aop@310c00000/audio"),
+                           os.path.join(mods, "snd_soc_aop"))
+
+            base = wiring.audio_stack("sound", root, mods, sysfs)
+            with open(os.path.join(mods, "aop", "notes", ".note.gnu.build-id"), "r+b") as f:
+                f.seek(16)
+                f.write(b"\x99" * 20)
+            self.assertNotEqual(wiring.audio_stack("sound", root, mods, sysfs), base)
 
     def test_the_bind_carries_it(self):
         rec = {"schema": 1, "version": 1, "result": "pass", "board": "j615", "kernel": "k", "params_sha256": "ab",
