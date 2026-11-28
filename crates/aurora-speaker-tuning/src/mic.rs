@@ -33,11 +33,13 @@
 //! | `aufx/dspg` (nested graph) | its graph, flattened ([`nested`]) | exact when every box in it is |
 //! | `reblocker`, `dead` | nothing (structure) | structural |
 //! | `fft` pair | the short-time transform, quadrant window, frame phase 0 (black-box exact) | exact |
-//! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
+//! | `aufx/bmfd` | the fixed beam `sum_m W_m(k) X_m(k)` of its property-4630 file, in fixed-beam mode or automatic selection over one beam ([`beam_mode`]; the adaptive blend is not engaged there, measured); any other mode refuses | exact |
 //! | `aufx/sens` | the noise-floor suppressor (`sgv2_core::mic::sens`): the strip's global parameters and the property-1000 noise profile; artifact step fitted, TODO(SPEC) | approximate |
-//! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, unmeasured, so partial blobs only until measured, TODO(SPEC) | uncharacterised |
+//! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, measured against black-box whole-graph renders of the unit (broadband, wind-like, steered, onset: 43-60 dB; low-level and tone-in-noise residuals), TODO(SPEC) | approximate |
 //! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
 //! | bypassed in the strip | nothing | bypassed |
+//! | `aufx/sens` after the analysis (frequency domain, before the beam) | the same suppressor carried before the transform: black-box equal there, one block later than the unit; with the trackpad block below the two blocks cancel, without it the blob carries one block (10 ms) more latency than the unit, stated in the report | approximate |
+//! | trackpad block (`aufx/nnet` bypassed, `delay` set from its latency, `adif`, `dbgn`, `asum`) | one block of delay (black-box exact), which the frequency-placed suppressor's block carries; the unit not bypassed, or the block alone, refuses | exact |
 //! | anything else | refused, partial or not | refused |
 //!
 //! **Refusal.** The default compile refuses, and writes no blob, when any
@@ -420,6 +422,120 @@ fn parameter_box(bx: &GraphBox) -> bool {
     matches!(&bx.kind, BoxKind::Builtin(w) if w.starts_with("parameter_"))
 }
 
+fn builtin_is(g: &Graph, node: &str, word: &str) -> bool {
+    g.find_box(node).is_some_and(|b| matches!(&b.kind, BoxKind::Builtin(w) if w == word))
+}
+
+/// The link that sets a trackpad block's delay from its neural unit's
+/// latency; [`trackpad_block`] checks it, the parameter logic skips it.
+fn trackpad_latency_link(g: &Graph, l: &dspg::BoxLink) -> bool {
+    let at = |t: &dspg::Target, id: f64| Num::value(&t.id) == Some(id) && t.rest == ["0", "0"];
+    g.find_box(&l.from.node).is_some_and(|b| subtype(b) == "nnet")
+        && builtin_is(g, &l.to.node, "delay")
+        && at(&l.from, 14.0)
+        && at(&l.to, 0.0)
+}
+
+/// The trackpad mitigation block after the synthesis: `src` feeds a neural
+/// unit N and a delay D (set from N's latency); `adif` A = D - N, a dB gain
+/// G on A, `asum` M = N + G. With N bypassed in the strip, black-box renders
+/// of the whole block are one block of delay (exact at 48 kHz, block 480).
+/// Returns M and the block's boxes; anything else is an error.
+fn trackpad_block(g: &Graph, strip: &AuStrip, src: &str, fs: u32) -> Result<(String, Vec<String>)> {
+    let no = |why: &str| bad(format!("{src} feeds two boxes that are not the characterised trackpad block: {why}"));
+    let outs = |n: &str| g.wires.iter().filter(|w| w.src.node == n).collect::<Vec<_>>();
+    let from =
+        |n: &str, port: u32| g.wires.iter().find(|w| w.dst.node == n && w.dst.port == port).map(|w| w.src.node.clone());
+    let single = |n: &str| {
+        let v: Vec<String> = outs(n).iter().map(|w| w.dst.node.clone()).collect();
+        if v.len() == 1 {
+            v.into_iter().next()
+        } else {
+            None
+        }
+    };
+    let s = outs(src);
+    let nn = s
+        .iter()
+        .map(|w| w.dst.node.clone())
+        .find(|n| g.find_box(n).is_some_and(|b| subtype(b) == "nnet"))
+        .ok_or_else(|| no("no neural unit"))?;
+    let dl = s.iter().map(|w| w.dst.node.clone()).find(|n| builtin_is(g, n, "delay")).ok_or_else(|| no("no delay"))?;
+    if s.len() != 2 {
+        return Err(no("not exactly two consumers"));
+    }
+    if !strip.effect(&nn).is_some_and(|e| e.bypass) {
+        return Err(bad(format!("{nn} (aufx/nnet): only a bypassed neural unit is characterised")));
+    }
+    let a = single(&dl).ok_or_else(|| no("the delay feeds more than one box"))?;
+    if !builtin_is(g, &a, "adif")
+        || from(&a, 0).as_deref() != Some(dl.as_str())
+        || from(&a, 1).as_deref() != Some(nn.as_str())
+    {
+        return Err(no("the difference is not delay minus unit"));
+    }
+    let gn = single(&a).ok_or_else(|| no("the difference feeds more than one box"))?;
+    if !builtin_is(g, &gn, "dbgn") {
+        return Err(no("the difference does not feed a dB gain"));
+    }
+    let m = single(&gn).ok_or_else(|| no("the gain feeds more than one box"))?;
+    if !builtin_is(g, &m, "asum")
+        || from(&m, 0).as_deref() != Some(nn.as_str())
+        || from(&m, 1).as_deref() != Some(gn.as_str())
+    {
+        return Err(no("the mix is not unit plus attenuated difference"));
+    }
+    let names = [nn.clone(), dl.clone(), a.clone(), gn.clone(), m.clone()];
+    // the complete characterised wiring, ports included: nothing else into or
+    // out of the block but the mix's one output
+    let shape = |w: &dspg::Wire| (w.src.node.clone(), w.src.port, w.dst.node.clone(), w.dst.port);
+    let mut got: Vec<_> = g.wires.iter().filter(|w| names.contains(&w.dst.node)).map(shape).collect();
+    got.sort();
+    let mut want = vec![
+        (src.to_string(), 0, nn.clone(), 0),
+        (src.to_string(), 0, dl.clone(), 0),
+        (dl.clone(), 0, a.clone(), 0),
+        (nn.clone(), 0, a.clone(), 1),
+        (a.clone(), 0, gn.clone(), 0),
+        (nn.clone(), 0, m.clone(), 0),
+        (gn.clone(), 0, m.clone(), 1),
+    ];
+    want.sort();
+    if got != want {
+        return Err(no("its wiring or ports differ from the characterised block"));
+    }
+    let leaving: Vec<_> =
+        g.wires.iter().filter(|w| names.contains(&w.src.node) && !names.contains(&w.dst.node)).map(shape).collect();
+    if leaving.len() != 1 || leaving[0].0 != m || leaving[0].1 != 0 {
+        return Err(no("something other than the mix's output 0 leaves the block"));
+    }
+    // exactly one parameter link touches the block: the unit's latency
+    // (parameter 14) into the delay's parameter 0
+    let touching: Vec<_> =
+        g.box_param_links.iter().filter(|l| names.contains(&l.from.node) || names.contains(&l.to.node)).collect();
+    if touching.len() != 1
+        || !trackpad_latency_link(g, touching[0])
+        || touching[0].from.node != nn
+        || touching[0].to.node != dl
+    {
+        return Err(no("its parameter links are not exactly the unit's latency into the delay"));
+    }
+    if g.param_links.iter().any(|l| names.contains(&l.target.node))
+        || g.box_property_links.iter().any(|l| names.contains(&l.from.node) || names.contains(&l.to.node))
+    {
+        return Err(no("another parameter or property writes into the block"));
+    }
+    for w in g.wires.iter().filter(|w| names.contains(&w.dst.node)) {
+        let block = g.wire_format(w).and_then(|f| f.block_size.as_ref()).and_then(Num::value);
+        if wire_ch(g, w)? != 1 || block != Some(480.0) || fs != 48_000 {
+            return Err(bad(format!(
+                "{nn}: the trackpad block is characterised at one channel, 48 kHz, block 480 only"
+            )));
+        }
+    }
+    Ok((m, names.to_vec()))
+}
+
 fn wire_ch(g: &Graph, w: &dspg::Wire) -> Result<usize> {
     Ok(analysis::wire_channels(g, w)? as usize)
 }
@@ -778,25 +894,82 @@ pub fn beam(file: &Dict, mics: usize, bins: usize, fs: u32, use_eq: bool, notes:
     Ok(Beam { mics, bins, weights, eq })
 }
 
-/// The beamformer's fixed-beam mode: the automatic-selection switches
-/// (controls 1, 3, 4, 5), the selection-metric normalisations (21, 22),
-/// boost limiting (23) and the uplink switch crossfade (42) off, the fixed
-/// beam (control 2) on. In this mode black-box renders of the unit equal
-/// the fixed beam of its coefficient file (coherent, single-microphone,
-/// independent and wind-like stimuli, over 130 dB): its adaptive blend
-/// (controls 28..41) is not engaged. `Err` names what differs.
-pub fn beam_mode(e: Option<&Effect>) -> std::result::Result<(), String> {
-    let e = e.ok_or_else(|| "no saved state in the strip".to_string())?;
-    let want: [(u32, f64); 9] =
-        [(1, 0.0), (2, 1.0), (3, 0.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0)];
-    for (id, v) in want {
-        match global(e, id) {
-            Some(x) if x == v => {}
-            Some(x) => return Err(format!("control {id} is {x}: only the fixed-beam mode is characterised")),
-            None => return Err(format!("control {id} missing from the saved state")),
+/// A beamformer mode whose uplink is the fixed beam of the coefficient
+/// file ([`beam_mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeamMode {
+    /// The fixed-beam mode.
+    Fixed,
+    /// Automatic selection whose candidate range is the one beam of a
+    /// one-beam file: there is nothing to select.
+    AutoSingle,
+}
+
+impl BeamMode {
+    fn detail(self) -> &'static str {
+        match self {
+            BeamMode::Fixed => "fixed-beam mode (adaptive blend not engaged)",
+            BeamMode::AutoSingle => "automatic selection over its one beam (no switch, adaptive blend not engaged)",
         }
     }
-    Ok(())
+}
+
+/// The beamformer modes that are characterised. `Err` names what differs.
+///
+/// **Fixed-beam mode**: the automatic-selection switches (controls 1, 3, 4,
+/// 5), the selection-metric normalisations (21, 22), boost limiting (23)
+/// and the uplink switch crossfade (42) off, the selection-metric EQ
+/// (control 2) on. Black-box renders of the unit equal the fixed beam of
+/// its coefficient file (coherent, single-microphone, independent and
+/// wind-like stimuli, over 130 dB): its adaptive blend (controls 28..41)
+/// is not engaged.
+///
+/// **Automatic selection over one beam**: selection mode 2 with algorithm
+/// 1 (controls 1, 3), the candidate range (4, 5) on beam 0 alone, the
+/// selection-metric EQ (2), the normalisations (21, 22), boost limiting
+/// (23) and the switch crossfade (42) off, automatic switching (43)
+/// permitted. The selection has one candidate, so its energy metric, the
+/// EQ curve that belongs to it and the switch crossfade never reach the
+/// uplink: black-box renders of the unit in this state equal its renders
+/// in the fixed-beam state of the same one-beam file, and the fixed beam
+/// (steered coherent sources, level imbalances between the microphones,
+/// onsets out of silence, wind-like and room stimuli). [`beam`] refuses a
+/// file with more than one beam, so a real selection never passes.
+///
+/// **Older presets** save no controls 42 and 43 (the switch crossfade and
+/// automatic switching, added later). The unit then keeps its defaults,
+/// 0 and 1 (read from the unit), and black-box renders of such a preset
+/// equal the fixed-beam state of the same file; so a missing 42 or 43 is
+/// read as that default, in the fixed-beam state only (the one measured);
+/// automatic selection still needs both saved. Any other missing control
+/// refuses.
+pub fn beam_mode(e: Option<&Effect>) -> std::result::Result<BeamMode, String> {
+    let e = e.ok_or_else(|| "no saved state in the strip".to_string())?;
+    const FIXED: &[(u32, f64)] =
+        &[(1, 0.0), (2, 1.0), (3, 0.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0)];
+    const AUTO_SINGLE: &[(u32, f64)] =
+        &[(1, 2.0), (2, 0.0), (3, 1.0), (4, 0.0), (5, 0.0), (21, 0.0), (22, 0.0), (23, 0.0), (42, 0.0), (43, 1.0)];
+    // the unit's defaults for the controls older presets do not save; only
+    // the fixed-beam state of such a preset is characterised
+    const LATER_DEFAULTS: &[(u32, f64)] = &[(42, 0.0), (43, 1.0)];
+    let strict = |id: u32| global(e, id).ok_or_else(|| format!("control {id} missing from the saved state"));
+    let (mode, want, what) = if strict(1)? == 2.0 {
+        (BeamMode::AutoSingle, AUTO_SINGLE, "of automatic selection, only the one-beam state is characterised")
+    } else {
+        (BeamMode::Fixed, FIXED, "only the fixed-beam mode and automatic selection over one beam are characterised")
+    };
+    for &(id, v) in want {
+        let x = match (strict(id), mode) {
+            (Err(_), BeamMode::Fixed) if LATER_DEFAULTS.iter().any(|(k, _)| *k == id) => {
+                LATER_DEFAULTS.iter().find(|(k, _)| *k == id).map(|(_, d)| *d).unwrap()
+            }
+            (x, _) => x?,
+        };
+        if x != v {
+            return Err(format!("control {id} is {x}: {what}"));
+        }
+    }
+    Ok(mode)
 }
 
 fn need_param(e: &Effect, id: u32, what: &str) -> Result<f64> {
@@ -977,6 +1150,9 @@ pub fn static_params(g: &Graph, params: &BTreeMap<String, f64>) -> Result<BTreeM
         return Err(bad(format!("parameter box {} never resolves (a cycle or a missing input)", bx.name)));
     }
     for l in &g.box_param_links {
+        if trackpad_latency_link(g, l) {
+            continue;
+        }
         let Some(bx) = g.find_box(&l.to.node) else { return Err(bad(format!("link to unknown box {}", l.to.node))) };
         if parameter_box(bx) {
             continue;
@@ -1001,6 +1177,100 @@ pub struct Nest<'a> {
     pub fs: f64,
     /// See [`Options::dev_drop_tone_types`]; `dropped` lists what it hit.
     pub dev_drop_tone_types: u64,
+}
+
+/// The region between a `split` box and the `join` that gathers its
+/// outputs back, as a stand-alone graph (input wired to the split, the
+/// join wired to the output) for [`nested`]. Every path out of the split
+/// must reach that one join without leaving the region.
+fn split_region(g: &Graph, split: &str) -> Result<(Graph, String, Vec<String>)> {
+    let mut members: Vec<String> = Vec::new();
+    let mut join: Option<String> = None;
+    let mut todo: Vec<String> = vec![split.to_string()];
+    while let Some(n) = todo.pop() {
+        for w in g.wires.iter().filter(|w| w.src.node == n) {
+            let d = &w.dst.node;
+            let bx = g.find_box(d).ok_or_else(|| bad(format!("split region of {split}: {d} is not a box")))?;
+            if subtype(bx) == "join" {
+                match &join {
+                    Some(j) if j != d => {
+                        return Err(bad(format!("split region of {split}: two joins ({j}, {d})")));
+                    }
+                    _ => join = Some(d.clone()),
+                }
+                continue;
+            }
+            if subtype(bx) == "split" || members.len() > 64 {
+                return Err(bad(format!("split region of {split}: nested split or too large at {d}")));
+            }
+            if !members.contains(d) {
+                members.push(d.clone());
+                todo.push(d.clone());
+            }
+        }
+    }
+    let join = join.ok_or_else(|| bad(format!("split region of {split}: no join")))?;
+    // every input of every member and of the join comes from inside the region
+    let inside = |n: &str| n == split || members.iter().any(|m| m == n);
+    for w in g.wires.iter().filter(|w| w.dst.node == join || members.contains(&w.dst.node)) {
+        if !inside(&w.src.node) {
+            return Err(bad(format!("split region of {split}: {} feeds {} from outside", w.src.node, w.dst.node)));
+        }
+    }
+    let (i, o) = ("__region_in".to_string(), "__region_out".to_string());
+    let keep = |n: &str| n == split || n == join || members.iter().any(|m| m == n);
+    let mut sub = g.clone();
+    sub.inputs = vec![i.clone()];
+    sub.outputs = vec![o.clone()];
+    sub.boxes.retain(|b| keep(&b.name));
+    let into_split = g
+        .wires
+        .iter()
+        .find(|w| w.dst.node == split)
+        .cloned()
+        .ok_or_else(|| bad(format!("split region of {split}: nothing feeds the split")))?;
+    let out_of_join = g
+        .wires
+        .iter()
+        .find(|w| w.src.node == join && w.src.port == 0)
+        .cloned()
+        .ok_or_else(|| bad(format!("split region of {split}: the join feeds nothing")))?;
+    let mut wires: Vec<dspg::Wire> =
+        g.wires.iter().filter(|w| keep(&w.src.node) && keep(&w.dst.node)).cloned().collect();
+    let mut a = into_split;
+    a.src = dspg::Endpoint { node: i, port: 0 };
+    let mut z = out_of_join;
+    z.dst = dspg::Endpoint { node: o, port: 0 };
+    wires.insert(0, a);
+    wires.push(z);
+    sub.wires = wires;
+    // Graph parameters reach the region's boxes unchanged: keep the
+    // declarations and every link into a region box (the caller passes the
+    // resolved values). A link that crosses the region boundary (a
+    // parameter box outside driving a box inside, or the reverse) or a
+    // property link into the region cannot be preserved: refuse.
+    for l in &g.box_param_links {
+        if keep(&l.from.node) != keep(&l.to.node) {
+            return Err(bad(format!(
+                "split region of {split}: parameter link {} -> {} crosses the region",
+                l.from.node, l.to.node
+            )));
+        }
+    }
+    if let Some(l) = g.box_property_links.iter().find(|l| keep(&l.from.node) || keep(&l.to.node)) {
+        return Err(bad(format!(
+            "split region of {split}: property link {} -> {} not carried",
+            l.from.node, l.to.node
+        )));
+    }
+    if let Some(l) = g.property_links.iter().find(|l| keep(&l.target.node)) {
+        return Err(bad(format!("split region of {split}: property {} -> {} not carried", l.name, l.target.node)));
+    }
+    sub.param_links.retain(|l| keep(&l.target.node));
+    sub.box_param_links.retain(|l| keep(&l.from.node) && keep(&l.to.node));
+    sub.box_property_links.clear();
+    sub.property_links.clear();
+    Ok((sub, join, members))
 }
 
 /// A nested graph (`aufx/dspg` box) flattened into one voicing chain: its
@@ -1172,15 +1442,15 @@ fn beamformer(
     fs: u32,
     opts: &Options,
     notes: &mut Vec<String>,
-) -> Result<Beam> {
+) -> Result<(Beam, BeamMode)> {
     if e.is_some_and(|e| e.bypass) {
         return Err(bad(format!("{name}: a bypassed beamformer is not characterised")));
     }
-    beam_mode(e).map_err(|m| bad(format!("{name}: {m}")))?;
+    let mode = beam_mode(e).map_err(|m| bad(format!("{name}: {m}")))?;
     let bins = stft.map(|s| s.bins()).unwrap_or(0);
     let p = box_path(b, props, name, PROP_BEAM_FILE)?
         .ok_or_else(|| bad(format!("{name}: the property strip names no coefficient file")))?;
-    beam(&plist_dict(b, &p)?, mics, bins, fs, opts.beam_eq, notes)
+    Ok((beam(&plist_dict(b, &p)?, mics, bins, fs, opts.beam_eq, notes)?, mode))
 }
 
 struct FanCtx<'a> {
@@ -1261,13 +1531,13 @@ fn fan_out(c: &FanCtx<'_>, node: &str, r: &mut Report) -> Result<Fan> {
     let mut mk = |name: &str, r: &mut Report| -> Result<Beam> {
         let e = c.strip.effect(name);
         let bx = g.find_box(name).unwrap();
-        let bm = beamformer(c.b, c.props, name, e, mics, c.stft, c.fs, c.opts, &mut r.notes)?;
+        let (bm, mode) = beamformer(c.b, c.props, name, e, mics, c.stft, c.fs, c.opts, &mut r.notes)?;
         r.stage(
             name,
             &kind_name(bx),
             "freq",
             if c.opts.beam_eq && name == main { Status::Approximate } else { Status::Exact },
-            format!("fixed beam over {mics} microphones, fixed-beam mode (adaptive blend not engaged)"),
+            format!("fixed beam over {mics} microphones, {}", mode.detail()),
         );
         out.push(name.to_string());
         Ok(bm)
@@ -1295,18 +1565,13 @@ fn fan_out(c: &FanCtx<'_>, node: &str, r: &mut Report) -> Result<Fan> {
         &lname,
         &kind_name(lbox),
         "freq",
-        Status::Uncharacterised,
+        Status::Approximate,
         format!(
-            "low-frequency blend (law from the behaviour summary, not yet measured against the unit): beam {main}, comparison {cmp}, blend reference {bl}; boost limit under {} Hz, crossover {}..{} Hz",
+            "low-frequency blend (law from the behaviour summary, measured against the unit's whole-graph renders): beam {main}, comparison {cmp}, blend reference {bl}; boost limit under {} Hz, crossover {}..{} Hz",
             law.cutoff_hz, law.xover_min_hz, law.xover_max_hz
         ),
     );
-    r.todo("lwbo law from the clean summary only (target search, hold/smoother order, crossfade width); no black-box renders");
-    if !c.opts.allow_partial {
-        r.refusals.push(format!(
-            "{lname} (aufx/lwbo) is not yet measured against the unit; --allow-partial carries the summary law"
-        ));
-    }
+    r.todo("lwbo: low-level and tone-in-noise residuals against the unit's renders (broadband, wind-like, steered and onset input match within 43-60 dB)");
     if !beams.iter().all(|x| out.contains(x)) {
         return Err(bad(format!("{node} feeds a beamformer the blend unit does not take")));
     }
@@ -1397,6 +1662,9 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
     let mut refs: Vec<Beam> = Vec::new();
     let mut freq: Vec<mic::FreqStage> = Vec::new();
     let mut sens_hop: Option<usize> = None;
+    // a frequency-placed suppressor's extra block, until a trackpad block takes it
+    let mut freq_sens_block = false;
+    let mut freq_sens_count = 0usize;
     let mut domain = Domain::PreTime;
     let mut node = input.clone();
     let mut visited = vec![input.clone()];
@@ -1430,6 +1698,36 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
             }
             continue;
         }
+        if domain == Domain::PostTime && next.len() == 2 {
+            match trackpad_block(&g, &strip, &node, fs) {
+                Ok((mix, names)) if freq_sens_block => {
+                    freq_sens_block = false;
+                    for n in &names {
+                        let bx = g.find_box(n).unwrap();
+                        let detail = if subtype(bx) == "nnet" {
+                            "trackpad block, neural unit bypassed: one block of delay (black-box exact), carried by the \
+                             frequency-placed suppressor's block"
+                        } else {
+                            "part of the trackpad block"
+                        };
+                        r.stage(n, &kind_name(bx), "time", Status::Exact, detail);
+                    }
+                    visited.extend(names);
+                    node = mix;
+                    continue;
+                }
+                Ok(_) => {
+                    r.refusals.push(format!(
+                        "{node}: a trackpad block (one block of delay) without a frequency-placed suppressor to carry it"
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    r.refusals.push(err.to_string());
+                    break;
+                }
+            }
+        }
         let [nx] = next.as_slice() else {
             r.refusals.push(format!("{node} feeds {next:?}: the chain is not a single path"));
             break;
@@ -1452,6 +1750,61 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
         if (fan.len() as u32) != bx.inputs {
             r.refusals.push(format!("{nx}: {} of its {} inputs come from {node}", fan.len(), bx.inputs));
             break;
+        }
+        // A split that fans the channels into per-channel boxes and a join
+        // that gathers them back: carry the region as one sub-graph stage
+        // (the nested-graph compiler already flattens split/join routing,
+        // gains and filter boxes).
+        if subtype(bx) == "split" && domain != Domain::Freq {
+            match split_region(&g, &nx) {
+                Ok((sub_g, join, members)) => {
+                    let mut dropped = Vec::new();
+                    let nest = Nest {
+                        graph: &sub_g,
+                        strip: &strip,
+                        props: props.as_ref(),
+                        parent_params: &graph_params,
+                        width: in_w,
+                        fs: fs as f64,
+                        dev_drop_tone_types: opts.dev_drop_tone_types,
+                    };
+                    let stages = if domain == Domain::PostTime { &mut post } else { &mut pre };
+                    match nested(&nest, &mut r.notes, &mut dropped) {
+                        Ok(spec) => {
+                            let n = spec.nodes.len();
+                            stages.push(Stage::Graph(spec));
+                            let dom = "time";
+                            r.stage(
+                                &nx,
+                                "split",
+                                dom,
+                                Status::Exact,
+                                format!("split/join region ({}) flattened to {n} nodes", members.join(", ")),
+                            );
+                            if !dropped.is_empty() {
+                                r.refusals.push(format!(
+                                    "{nx}: development option switched off {} (analysis only, never a blob)",
+                                    dropped.join(", ")
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            r.stage(&nx, "split", "time", Status::Refused, err.to_string());
+                            r.refusals.push(err.to_string());
+                            break;
+                        }
+                    }
+                    visited.extend(members);
+                    visited.push(join.clone());
+                    node = join;
+                    continue;
+                }
+                Err(err) => {
+                    r.stage(&nx, "split", "time", Status::Refused, err.to_string());
+                    r.refusals.push(err.to_string());
+                    break;
+                }
+            }
         }
         let e = strip.effect(&nx);
         let ov = overrides.get(&nx).cloned().unwrap_or_default();
@@ -1511,7 +1864,7 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                      decaying term with the high-pass poles); steady state exact",
                 );
             }
-            ("gain" | "dbgn", Domain::PreTime | Domain::PostTime) => match gain_db(&nx, &sub, e, &ov) {
+            ("gain" | "dbgn", d) if *d != Domain::Freq || beam_p.is_none() => match gain_db(&nx, &sub, e, &ov) {
                 Ok((db, false)) => {
                     stages.push(Stage::Gain { db });
                     r.stage(&nx, &kind, dom, Status::Exact, format!("{db:+.2} dB"));
@@ -1669,21 +2022,21 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                 }
             }
             ("bmfd", Domain::Freq) if beam_p.is_none() => {
-                let res = (|| -> Result<Beam> {
+                let res = (|| -> Result<(Beam, BeamMode)> {
                     if out_w != 1 {
                         return Err(bad(format!("{nx}: output 0 carries {out_w} channels")));
                     }
                     beamformer(b, props.as_ref(), &nx, e, in_w, stft, fs, opts, &mut r.notes)
                 })();
                 match res {
-                    Ok(bm) => {
+                    Ok((bm, mode)) => {
                         beam_p = Some(bm);
                         r.stage(
                             &nx,
                             &kind,
                             "freq",
                             if opts.beam_eq { Status::Approximate } else { Status::Exact },
-                            format!("fixed beam over {in_w} microphones, fixed-beam mode (adaptive blend not engaged)"),
+                            format!("fixed beam over {in_w} microphones, {}", mode.detail()),
                         );
                         if opts.beam_eq {
                             r.todo("development option: EQSelection applied to the uplink (the unit does not)");
@@ -1697,7 +2050,9 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                 node = nx;
                 continue;
             }
-            ("sens", Domain::PreTime) if in_w == out_w => {
+            ("sens", Domain::PreTime | Domain::Freq)
+                if in_w == out_w && (domain == Domain::PreTime || beam_p.is_none()) =>
+            {
                 let res = (|| -> Result<mic::sens::Sens> {
                     let e = e.ok_or_else(|| bad(format!("{nx}: no preset in the strip")))?;
                     let hop = g
@@ -1718,8 +2073,20 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                             r.refusals.push(format!("{nx}: suppressors on different blocks"));
                         }
                         sens_hop = Some(sp.hop);
+                        let placed = if domain == Domain::Freq {
+                            freq_sens_count += 1;
+                            if freq_sens_count > 1 {
+                                r.refusals.push(format!(
+                                    "{nx}: a second frequency-placed suppressor (one trackpad block carries one block)"
+                                ));
+                            }
+                            freq_sens_block = true;
+                            "; after the analysis: carried before the transform (black-box equal, one block later)"
+                        } else {
+                            ""
+                        };
                         let detail = format!(
-                            "noise-floor suppressor, {} microphones, block {}, Burg order {}{}",
+                            "noise-floor suppressor, {} microphones, block {}, Burg order {}{}{placed}",
                             sp.mics,
                             sp.hop,
                             sp.order,
@@ -1763,6 +2130,17 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
             r.refusals.push(format!("{nx}: {in_w} channels in, {out_w} out"));
         }
         node = nx;
+    }
+    if freq_sens_block {
+        // measured: the same output as the unit, one block later; the
+        // blob's latency says so, so a host aligns it
+        r.notes.push(
+            "the frequency-placed suppressor runs one block later than the unit (no trackpad block absorbs it): \
+             lag-aligned approximate parity with the unit, one block (10 ms at 48 kHz) more latency than macOS, \
+             carried in the blob's latency"
+                .into(),
+        );
+        r.todo("frequency-placed suppressor: one block more latency than the unit (a frequency-domain suppressor stage would remove it)");
     }
     // every box off the path must be a dead end, parameter logic, or bypassed
     for bx in &g.boxes {

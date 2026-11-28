@@ -61,6 +61,11 @@ fn be(v: &[f32]) -> Value {
 /// A beam file: one beam, `mics` microphones, real weights `w[m]` on
 /// every bin.
 fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
+    beam_file_of(mics, w, 1)
+}
+
+/// The same file declaring `beams` beams (only beam 0 is written).
+fn beam_file_of(mics: usize, w: &[f32], beams: i128) -> Vec<u8> {
     let mut re = Vec::new();
     let mut im = Vec::new();
     for (m, wm) in w.iter().enumerate().take(mics) {
@@ -87,7 +92,7 @@ fn beam_file(mics: usize, w: &[f32]) -> Vec<u8> {
     binary::write(&dict(vec![
         ("Beam0", beam0),
         ("SampleRate", i(48_000)),
-        ("nBeams", i(1)),
+        ("nBeams", i(beams)),
         ("nCoefficients", i(BINS as i128)),
         ("nMicsUsed", i(mics as i128)),
     ]))
@@ -98,7 +103,7 @@ fn sens_file(mics: usize, power: f32, block: f64) -> Vec<u8> {
     let mut kv = vec![("BlockSize", r(block)), ("NumberOfChannels", i(mics as i128)), ("SampleRate", r(48_000.0))];
     let names: Vec<String> = (0..mics).map(|m| format!("NoiseProfile{m}")).collect();
     for n in &names {
-        kv.push((n.as_str(), be(&vec![power; BINS])));
+        kv.push((n.as_str(), be(&vec![power; block as usize + 1])));
     }
     binary::write(&dict(kv))
 }
@@ -327,6 +332,291 @@ impl Fixture {
 
 fn partial() -> mic::Options {
     mic::Options { allow_partial: true, ..Default::default() }
+}
+
+/// `beam_state(true)` without the controls in `drop`.
+fn beam_state_without(drop: &[u32]) -> ParamState {
+    let mut st = beam_state(true);
+    st.sections[0].params.retain(|(id, _)| !drop.contains(id));
+    st
+}
+
+#[test]
+fn an_older_beam_preset_without_the_later_controls_is_the_fixed_beam() {
+    let base =
+        mic::compile(&Fixture::new().tree("mic-beam-later"), &mic::Options::default(), &mut Diagnostics::default())
+            .unwrap();
+    assert!(!base.refused(), "{:?}", base.report.refusals);
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &beam_state_without(&[42, 43]), false, None);
+    let c = mic::compile(&f.tree("mic-beam-older"), &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    assert_eq!(c.params.unwrap(), base.params.unwrap());
+}
+
+#[test]
+fn automatic_selection_without_the_later_controls_refuses() {
+    // the defaults are characterised for the fixed-beam state only
+    for drop in [42u32, 43] {
+        let mut st = auto_beam_state(&[]);
+        st.sections[0].params.retain(|(id, _)| *id != drop);
+        let mut f = Fixture::new();
+        f.effects[3] = unit_effect("Beam", "bmfd", &st, false, None);
+        let c =
+            mic::compile(&f.tree(&format!("mic-beam-auto-no{drop}")), &partial(), &mut Diagnostics::default()).unwrap();
+        assert!(
+            c.refused() && c.report.refusals.iter().any(|r| r.contains(&format!("control {drop} missing"))),
+            "{drop}: {:?}",
+            c.report.refusals
+        );
+    }
+}
+
+#[test]
+fn a_beam_preset_missing_another_control_refuses() {
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &beam_state_without(&[21]), false, None);
+    let c = mic::compile(&f.tree("mic-beam-missing"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(
+        c.refused() && c.report.refusals.iter().any(|r| r.contains("control 21 missing")),
+        "{:?}",
+        c.report.refusals
+    );
+}
+
+/// [`beam_file`] at `bins` bins (the trackpad block needs block 480).
+fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
+    let mut re = Vec::new();
+    let mut im = Vec::new();
+    for (m, wm) in w.iter().enumerate().take(mics) {
+        re.push((format!("Mic{m}"), be(&vec![*wm; bins])));
+        im.push((format!("Mic{m}"), be(&vec![0.0; bins])));
+    }
+    let as_dict = |v: Vec<(String, Value)>| {
+        let mut d = aurora_speaker_tuning::plist::Dict::new();
+        for (k, x) in v {
+            d.insert_unique(k, x);
+        }
+        Value::Dict(d)
+    };
+    let beam0 = dict(vec![
+        ("Azimuth", r(0.0)),
+        ("Description", s("Beam0")),
+        ("Distance", r(1.0)),
+        ("EQSelection", be(&vec![1.0; bins])),
+        ("Elevation", r(90.0)),
+        ("ImagCoefficients", as_dict(im)),
+        ("NonZeroMics", be(&vec![1.0; mics])),
+        ("RealCoefficients", as_dict(re)),
+    ]);
+    binary::write(&dict(vec![
+        ("Beam0", beam0),
+        ("SampleRate", i(48_000)),
+        ("nBeams", i(1)),
+        ("nCoefficients", i(bins as i128)),
+        ("nMicsUsed", i(mics as i128)),
+    ]))
+}
+
+/// The base graph with the suppressor and pre-gain moved after the analysis
+/// (`freq_sens`) and/or a trackpad block after the synthesis (`trackpad`).
+fn neo_graph(freq_sens: bool, trackpad: bool) -> String {
+    // the trackpad block is characterised at block 480 only
+    let mut g = graph(None).replace(&format!("[def blockSize {HOP}]"), "[def blockSize 480]");
+    if freq_sens {
+        let time = "wire Rb Sens ([fs] [numChansIn] [blockSize])\nwire Sens Pre ([fs] [numChansIn] [blockSize])\n\
+                    wire Pre A ([fs] [numChansIn] [blockSize])\nwire A (Beam 0) (freq [fs] [numChansIn] [blockSize])\n\
+                    wire A (Beam 1) (freq [fs] [numChansIn] [blockSize])\n";
+        assert!(g.contains(time));
+        g = g.replace(
+            time,
+            "wire Rb A ([fs] [numChansIn] [blockSize])\nwire A Sens (freq [fs] [numChansIn] [blockSize])\n\
+             wire Sens Pre (freq [fs] [numChansIn] [blockSize])\nwire Pre (Beam 0) (freq [fs] [numChansIn] [blockSize])\n\
+             wire Pre (Beam 1) (freq [fs] [numChansIn] [blockSize])\n",
+        );
+    }
+    if trackpad {
+        let path = "wire S Eq ([fs] 1 [blockSize])\n";
+        assert!(g.contains(path));
+        g = g.replace(
+            path,
+            "box Tp (aufx nnet appl) 1 1\nbox Td delay 1 1\nbox Tn adif 2 1\nbox Ta dbgn 1 1\nbox Tm asum 2 1\n\
+             wire S Tp ([fs] 1 [blockSize])\nwire S Td ([fs] 1 [blockSize])\nwire Td (Tn 0) ([fs] 1 [blockSize])\n\
+             wire Tp (Tn 1) ([fs] 1 [blockSize])\nwire Tn Ta ([fs] 1 [blockSize])\nwire Tp (Tm 0) ([fs] 1 [blockSize])\n\
+             wire Ta (Tm 1) ([fs] 1 [blockSize])\nwire Tm Eq ([fs] 1 [blockSize])\nwireParam (Tp 14 0 0) (Td 0 0 0)\n",
+        );
+    }
+    g
+}
+
+fn neo_fixture(freq_sens: bool, trackpad: bool, unit_bypassed: bool) -> Fixture {
+    let mut f = Fixture::new();
+    f.graph = neo_graph(freq_sens, trackpad);
+    f.sens = sens_file(2, 0.0, 480.0);
+    f.beam = beam_file_n(2, &[0.5, 0.5], 481);
+    if trackpad {
+        f.effects.push(unit_effect("Tp", "nnet", &state(&[(0, 0.0)]), unit_bypassed, None));
+    }
+    f
+}
+
+#[test]
+fn a_frequency_placed_suppressor_with_a_bypassed_trackpad_block_is_the_time_domain_chain() {
+    let base = mic::compile(
+        &neo_fixture(false, false, true).tree("mic-neo-base"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(!base.refused(), "{:?}", base.report.refusals);
+    let c = mic::compile(
+        &neo_fixture(true, true, true).tree("mic-neo"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    let st: Vec<(&str, &Status)> = c.report.stages.iter().map(|s| (s.name.as_str(), &s.status)).collect();
+    for n in ["Tp", "Td", "Tn", "Ta", "Tm"] {
+        assert!(st.contains(&(n, &Status::Exact)), "{st:?}");
+    }
+    // the suppressor's extra block is the trackpad block's delay: the same
+    // engine as the time-domain graph without the block
+    assert_eq!(c.params.unwrap(), base.params.unwrap());
+}
+
+#[test]
+fn a_trackpad_block_without_a_frequency_placed_suppressor_refuses() {
+    let c = mic::compile(
+        &neo_fixture(false, true, true).tree("mic-neo-tp-alone"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains("trackpad block")), "{:?}", c.report.refusals);
+}
+
+#[test]
+fn a_frequency_placed_suppressor_without_a_trackpad_block_is_one_block_later() {
+    let base = mic::compile(
+        &neo_fixture(false, false, true).tree("mic-neo-sens-alone-base"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    let c = mic::compile(
+        &neo_fixture(true, false, true).tree("mic-neo-sens-alone"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    // the time-domain chain, and the report says it is one block later than the unit
+    assert!(c.report.notes.iter().any(|n| n.contains("one block later")), "{:?}", c.report.notes);
+    assert_eq!(c.params.unwrap(), base.params.unwrap());
+    // the extra block is in the serialized latency: one block more than the
+    // same graph with the suppressor bypassed (the unit's timing)
+    let unit = common::test_unit();
+    let m = Machine::with_unit("j999", &unit).unwrap();
+    let latency = |f: &Fixture, name: &str| {
+        let (blob, report) = mic::compile_blob(
+            &f.installed(name, "j999", &unit),
+            &m,
+            &mic::Options::default(),
+            false,
+            &mut Diagnostics::default(),
+        )
+        .unwrap();
+        let (h, _) = artifact::decode(&blob.expect("a blob")).unwrap();
+        assert_eq!(h.latency as usize, report.latency_frames);
+        h.latency as usize
+    };
+    let live = latency(&neo_fixture(true, false, true), "mic-neo-sens-alone-blob");
+    let mut off = neo_fixture(true, false, true);
+    off.effects[1] = unit_effect("Sens", "sens", &sens_state(6.0), true, None);
+    let bypassed = latency(&off, "mic-neo-sens-off-blob");
+    assert_eq!(live, bypassed + 480);
+}
+
+/// Compile `f` with the graph text changed by `edit` and expect a refusal mentioning `why`.
+fn neo_mutation_refuses(name: &str, edit: impl Fn(&str) -> String, why: &str) {
+    let mut f = neo_fixture(true, true, true);
+    let g = edit(&f.graph);
+    assert_ne!(g, f.graph, "{name}: the edit changed nothing");
+    f.graph = g;
+    // fails closed either way: a refusal, or an error before the walk
+    match mic::compile(&f.tree(name), &mic::Options::default(), &mut Diagnostics::default()) {
+        Ok(c) => {
+            assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains(why)), "{name}: {:?}", c.report.refusals)
+        }
+        Err(e) => assert!(e.to_string().contains(why), "{name}: {e}"),
+    }
+}
+
+#[test]
+fn a_trackpad_block_with_another_latency_parameter_refuses() {
+    neo_mutation_refuses(
+        "mic-neo-tp-param",
+        |g| g.replace("wireParam (Tp 14 0 0) (Td 0 0 0)", "wireParam (Tp 13 0 0) (Td 0 0 0)"),
+        "parameter link from Tp",
+    );
+}
+
+#[test]
+fn a_trackpad_block_with_swapped_difference_ports_refuses() {
+    neo_mutation_refuses(
+        "mic-neo-tp-port",
+        |g| {
+            g.replace("wire Td (Tn 0)", "wire Td (Tn X)")
+                .replace("wire Tp (Tn 1)", "wire Tp (Tn 0)")
+                .replace("wire Td (Tn X)", "wire Td (Tn 1)")
+        },
+        "differ",
+    );
+}
+
+#[test]
+fn a_trackpad_block_with_another_writer_into_the_delay_refuses() {
+    neo_mutation_refuses(
+        "mic-neo-tp-writer",
+        |g| g.replace("wireGraphParam mvol (Vol 0)\n", "wireGraphParam mvol (Vol 0)\nwireGraphParam mvol (Td 0)\n"),
+        "writes into the block",
+    );
+}
+
+#[test]
+fn a_second_frequency_placed_suppressor_refuses() {
+    let mut f = neo_fixture(true, true, true);
+    f.graph = f
+        .graph
+        .replace("box Sens (aufx sens appl) 1 1\n", "box Sens (aufx sens appl) 1 1\nbox Sens2 (aufx sens appl) 1 1\n")
+        .replace(
+            "wire Sens Pre (freq [fs] [numChansIn] [blockSize])",
+            "wire Sens Sens2 (freq [fs] [numChansIn] [blockSize])\nwire Sens2 Pre (freq [fs] [numChansIn] [blockSize])",
+        );
+    f.effects.push(unit_effect("Sens2", "sens", &sens_state(6.0), false, None));
+    f.props.push(("Sens2".into(), 1000, "mic_sens.plist".into()));
+    let c = mic::compile(&f.tree("mic-neo-two-sens"), &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(
+        c.refused() && c.report.refusals.iter().any(|r| r.contains("second frequency-placed suppressor")),
+        "{:?}",
+        c.report.refusals
+    );
+}
+
+#[test]
+fn a_trackpad_block_with_a_live_neural_unit_refuses() {
+    let c = mic::compile(
+        &neo_fixture(true, true, false).tree("mic-neo-tp-live"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
+    assert!(
+        c.refused() && c.report.refusals.iter().any(|r| r.contains("only a bypassed neural unit")),
+        "{:?}",
+        c.report.refusals
+    );
 }
 
 #[test]
@@ -640,6 +930,85 @@ fn a_beamformer_outside_the_fixed_beam_mode_refuses() {
     assert!(c.report.refusals.iter().any(|r| r.contains("fixed-beam mode")), "{:?}", c.report.refusals);
 }
 
+/// A beamformer preset selecting automatically over beam 0 alone, with
+/// `change` on top (made-up blend controls).
+fn auto_beam_state(change: &[(u32, f32)]) -> ParamState {
+    let mut v = vec![
+        (0, 0.0),
+        (1, 2.0),
+        (2, 0.0),
+        (3, 1.0),
+        (4, 0.0),
+        (5, 0.0),
+        (21, 0.0),
+        (22, 0.0),
+        (23, 0.0),
+        (31, -10.0),
+        (32, 900.0),
+        (37, 150.0),
+        (42, 0.0),
+        (43, 1.0),
+    ];
+    for (id, x) in change {
+        v.iter_mut().find(|(i, _)| i == id).unwrap().1 = *x;
+    }
+    state(&v)
+}
+
+#[test]
+fn automatic_selection_over_one_beam_is_the_fixed_beam() {
+    let fixed =
+        mic::compile(&Fixture::new().tree("mic-beam-fixed"), &mic::Options::default(), &mut Diagnostics::default())
+            .unwrap();
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &auto_beam_state(&[]), false, None);
+    let auto = mic::compile(&f.tree("mic-beam-auto"), &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!auto.refused(), "{:?}", auto.report.refusals);
+    let stage = auto.report.stages.iter().find(|s| s.name == "Beam").unwrap();
+    assert_eq!(stage.status, Status::Exact);
+    assert!(stage.detail.contains("automatic selection over its one beam"), "{}", stage.detail);
+    // the same engine program as the fixed-beam mode of the same file
+    assert!(auto.params.is_some());
+    assert_eq!(auto.params, fixed.params);
+}
+
+#[test]
+fn automatic_selection_outside_the_one_beam_state_refuses() {
+    // a real candidate range, another algorithm or mode, the metric's EQ
+    // and normalisations, the switch crossfade, switching not permitted
+    for change in [
+        [(5, 1.0)],
+        [(4, 1.0)],
+        [(3, 0.0)],
+        [(3, 2.0)],
+        [(1, 1.0)],
+        [(1, 3.0)],
+        [(2, 1.0)],
+        [(21, 1.0)],
+        [(22, 1.0)],
+        [(23, 1.0)],
+        [(42, 1.0)],
+        [(43, 0.0)],
+    ] {
+        let mut f = Fixture::new();
+        f.effects[3] = unit_effect("Beam", "bmfd", &auto_beam_state(&change), false, None);
+        let c = mic::compile(&f.tree("mic-beam-auto-odd"), &partial(), &mut Diagnostics::default()).unwrap();
+        assert!(c.refused(), "{change:?}");
+        let stage = c.report.stages.iter().find(|s| s.name == "Beam").unwrap();
+        assert_eq!(stage.status, Status::Refused, "{change:?}");
+    }
+}
+
+#[test]
+fn automatic_selection_over_several_beams_refuses() {
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &auto_beam_state(&[]), false, None);
+    f.beam = beam_file_of(2, &[0.5, 0.5], 2);
+    let c = mic::compile(&f.tree("mic-beam-auto-two"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(c.refused());
+    assert!(c.report.refusals.iter().any(|r| r.contains("2 beams")), "{:?}", c.report.refusals);
+}
+
 /// The fixture's graph with a second beamformer (a delay-and-sum on the
 /// analysis) and a low-frequency blend unit after the main beam.
 fn blend_graph() -> String {
@@ -689,15 +1058,13 @@ fn a_low_frequency_blend_after_two_beamformers_compiles_and_runs() {
     f.files.push(("mic_das.plist".into(), beam_file(2, &[1.0, 0.0])));
     f.beam = beam_file(2, &[1.0, 1.0]);
     let b = f.tree("mic-lwbo");
-    // not yet measured against the unit: refused by default, partial on request
-    let d = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
-    assert!(d.refused() && d.report.refusals.iter().any(|r| r.contains("aufx/lwbo")), "{:?}", d.report.refusals);
-    let opts = partial();
+    // measured against the unit: a default compile carries it, whole
+    let opts = mic::Options::default();
     let c = mic::compile(&b, &opts, &mut Diagnostics::default()).unwrap();
     assert!(!c.refused(), "{:?}", c.report.refusals);
-    assert!(c.report.partial);
+    assert!(!c.report.partial);
     let st: Vec<(&str, &Status)> = c.report.stages.iter().map(|s| (s.name.as_str(), &s.status)).collect();
-    assert!(st.contains(&("Das", &Status::Exact)) && st.contains(&("Lw", &Status::Uncharacterised)), "{st:?}");
+    assert!(st.contains(&("Das", &Status::Exact)) && st.contains(&("Lw", &Status::Approximate)), "{st:?}");
     let p = c.params.unwrap();
     assert_eq!(p.refs.len(), 1);
     assert!(matches!(p.freq[0], sgv2_core::mic::FreqStage::LowBand { compare: 0, blend: 0, .. }));
@@ -766,4 +1133,95 @@ fn the_phase_companion_is_a_butterworth_allpass() {
     let s = b2[0];
     assert!((s.a1 - (-2.0 * w0.cos() / a0)).abs() < 1e-9 && (s.a2 - (1.0 - alpha) / a0).abs() < 1e-9, "{s:?}");
     assert!((s.b0 - s.a2).abs() < 1e-12 && (s.b1 - s.a1).abs() < 1e-12 && (s.b2 - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn per_microphone_trims_between_a_split_and_a_join_are_carried() {
+    let tone = |e: &mut Engine| {
+        let n = 48_000;
+        let x: Vec<f32> =
+            (0..n).map(|k| 0.1 * (2.0 * std::f64::consts::PI * 1000.0 * k as f64 / 48_000.0).sin() as f32).collect();
+        let mut y = vec![0.0f32; n];
+        for at in (0..n).step_by(128) {
+            e.process(&[&x[at..at + 128], &x[at..at + 128]], &mut y[at..at + 128], 128);
+        }
+        let tail = &y[24_000..24_000 + 48 * 400];
+        (tail.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / tail.len() as f64).sqrt()
+    };
+    let base = Fixture::new().tree("mic-trim-base");
+    let p0 = mic::compile(&base, &mic::Options::default(), &mut Diagnostics::default()).unwrap().params.unwrap();
+    let r0 = tone(&mut Engine::new(p0).unwrap());
+
+    let mut f = Fixture::new();
+    f.graph = graph(None)
+        .replace(
+            "wire Rb Sens ([fs] [numChansIn] [blockSize])\n",
+            "wire Rb Sp ([fs] [numChansIn] [blockSize])\n\
+             wire (Sp 0) T0 ([fs] 1 [blockSize])\n\
+             wire (Sp 1) T1 ([fs] 1 [blockSize])\n\
+             wire T0 (Jn 0) ([fs] 1 [blockSize])\n\
+             wire T1 (Jn 1) ([fs] 1 [blockSize])\n\
+             wire Jn Sens ([fs] [numChansIn] [blockSize])\n",
+        )
+        .replace(
+            "box Eq (aufx tmst appl) 1 1\n",
+            "box Eq (aufx tmst appl) 1 1\nbox Sp split 1 2\nbox Jn join 2 1\nbox T0 dbgn 1 1\nbox T1 dbgn 1 1\n",
+        );
+    let six = 20.0 * 2f64.log10();
+    f.effects.push(unit_effect("T0", "dbgn", &state(&[(0, six as f32), (1, 0.0)]), false, Some("dbgain")));
+    f.effects.push(unit_effect("T1", "dbgn", &state(&[(0, six as f32), (1, 0.0)]), false, Some("dbgain")));
+    let b = f.tree("mic-trim");
+    let c = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    assert!(c.report.stages.iter().any(|s| s.name == "Sp" && s.status == Status::Exact), "{:?}", c.report.stages);
+    let r1 = tone(&mut Engine::new(c.params.unwrap()).unwrap());
+    assert!((r1 / r0 - 2.0).abs() < 2e-3, "trimmed {r1} vs base {r0}");
+}
+
+#[test]
+fn an_outer_graph_default_driving_a_trim_inside_a_split_region_is_carried() {
+    let tone = |e: &mut Engine| {
+        let n = 48_000;
+        let x: Vec<f32> =
+            (0..n).map(|k| 0.1 * (2.0 * std::f64::consts::PI * 1000.0 * k as f64 / 48_000.0).sin() as f32).collect();
+        let mut y = vec![0.0f32; n];
+        for at in (0..n).step_by(128) {
+            e.process(&[&x[at..at + 128], &x[at..at + 128]], &mut y[at..at + 128], 128);
+        }
+        let tail = &y[24_000..24_000 + 48 * 400];
+        (tail.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / tail.len() as f64).sqrt()
+    };
+    let base = Fixture::new().tree("mic-param-base");
+    let p0 = mic::compile(&base, &mic::Options::default(), &mut Diagnostics::default()).unwrap().params.unwrap();
+    let r0 = tone(&mut Engine::new(p0).unwrap());
+
+    // the trims' saved state is 0 dB; the graph parameter's default (+6.02 dB)
+    // drives both through the outer graph's links
+    let six = 20.0 * 2f64.log10();
+    let mut f = Fixture::new();
+    f.graph = graph(None)
+        .replace(
+            "wire Rb Sens ([fs] [numChansIn] [blockSize])\n",
+            "wire Rb Sp ([fs] [numChansIn] [blockSize])\n\
+             wire (Sp 0) T0 ([fs] 1 [blockSize])\n\
+             wire (Sp 1) T1 ([fs] 1 [blockSize])\n\
+             wire T0 (Jn 0) ([fs] 1 [blockSize])\n\
+             wire T1 (Jn 1) ([fs] 1 [blockSize])\n\
+             wire Jn Sens ([fs] [numChansIn] [blockSize])\n",
+        )
+        .replace(
+            "box Eq (aufx tmst appl) 1 1\n",
+            "box Eq (aufx tmst appl) 1 1\nbox Sp split 1 2\nbox Jn join 2 1\nbox T0 dbgn 1 1\nbox T1 dbgn 1 1\n",
+        )
+        .replace(
+            "param mvol 0\n",
+            &format!("param mvol 0\nparam tdb {six}\nwireGraphParam tdb (T0 0)\nwireGraphParam tdb (T1 0)\n"),
+        );
+    f.effects.push(unit_effect("T0", "dbgn", &state(&[(0, 0.0), (1, 0.0)]), false, Some("dbgain")));
+    f.effects.push(unit_effect("T1", "dbgn", &state(&[(0, 0.0), (1, 0.0)]), false, Some("dbgain")));
+    let b = f.tree("mic-param-trim");
+    let c = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    let r1 = tone(&mut Engine::new(c.params.unwrap()).unwrap());
+    assert!((r1 / r0 - 2.0).abs() < 2e-3, "parameter-driven trim {r1} vs base {r0}");
 }

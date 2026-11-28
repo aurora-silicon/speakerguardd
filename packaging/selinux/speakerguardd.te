@@ -16,6 +16,8 @@ manage_dirs_pattern(speakerguardd_t, speakerguardd_runtime_t, speakerguardd_runt
 manage_files_pattern(speakerguardd_t, speakerguardd_runtime_t, speakerguardd_runtime_t)
 # The engine page is shared memory.
 allow speakerguardd_t speakerguardd_runtime_t:file map;
+# The idle loop watches the helper directory and its runtime parents via inotify.
+allow speakerguardd_t speakerguardd_runtime_t:dir watch;
 files_pid_filetrans(speakerguardd_t, speakerguardd_runtime_t, { dir file })
 
 # The tuning bundle in the vendor firmware tree, and the ESP fallback.

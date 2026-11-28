@@ -25,12 +25,14 @@
 
 /// Quiet this long (no grant, no demand) before going idle.
 pub const IDLE_AFTER_NS: u64 = 500_000_000;
-/// The loop's tick while idle. A new report wakes it at once; where the
-/// report's directory cannot be watched the loop keeps its 10 ms tick.
+/// The loop's tick while idle: stays at half of `sgv2_lv2::page::AMPS_STALE_NS`
+/// (500 ms) so the idle `Amps::Held` word never expires before a wake's
+/// pre-roll. A new report wakes it at once; where the report's directory
+/// cannot be watched the loop keeps its 10 ms tick.
 pub const IDLE_TICK_NS: u64 = 250_000_000;
 /// The pollers' period while idle. Their snapshots are then older than the
 /// RT loop accepts as proof, which is harmless with nothing to grant.
-pub const IDLE_POLL_NS: u64 = 100_000_000;
+pub const IDLE_POLL_NS: u64 = 1_000_000_000;
 /// After leaving idle, the next tick comes this soon: long enough for the
 /// woken pollers to take fresh readings.
 pub const WAKE_TICK_NS: u64 = 2_000_000;
