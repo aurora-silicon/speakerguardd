@@ -1544,3 +1544,42 @@ fn repeated_gaps_never_relax_on_an_unjudged_sense() {
     }
     assert_eq!(max_adj, 0.0, "the correction relaxed on a sense the guard never judged");
 }
+
+/// REVIEW6 on #290: a second gap while a restarted trend re-qualifies must
+/// restart the trend again. Burst B (half a ring) after the first gap reads
+/// a cool coil, burst C (half a ring) after a second gap a hot one, the
+/// model rising monotonically across both. Sharing one ring across the
+/// second gap, B + C would judge as an honest rise and end the
+/// re-qualification, so C would relax on windows the guard never judged
+/// together; restarted at C, half a ring is not judged and nothing relaxes.
+#[test]
+fn second_gap_during_requalification_restarts_the_trend() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    gap_episode(&mut rp, upw);
+    let gap = (25.0 * 48_000.0 / 256.0) as usize;
+    let mut max_adj = 0.0f64;
+    // burst B: four windows, coil 40 C, model 55 -> 61.9 C
+    for k in 0..4 {
+        let o = replay_window(&mut rp, upw, coil_r(tc, 40.0), 55.0 + 2.3 * k as f64);
+        assert!(!o.2, "burst B window {k}");
+        max_adj = max_adj.max(o.0);
+    }
+    // second gap, the model held at its last value (monotonic overall)
+    for k in 0..gap {
+        if k % upw == 0 {
+            assert!(!rp.window(0.0, 0.0), "a silent window is rejected");
+        }
+        let o = rp.update(61.9, 0.0);
+        max_adj = max_adj.max(o.0);
+    }
+    // burst C: four windows, coil 80 C, model 70 -> 76.9 C
+    for k in 0..4 {
+        let o = replay_window(&mut rp, upw, coil_r(tc, 80.0), 70.0 + 2.3 * k as f64);
+        assert!(!o.2, "burst C window {k}");
+        max_adj = max_adj.max(o.0);
+    }
+    assert_eq!(max_adj, 0.0, "a ring spanning the second gap re-qualified the trend");
+}

@@ -1139,6 +1139,19 @@ impl Cl {
             self.fresh = false;
             self.guard(t_ol, driven);
         }
+        // a measurement older than one window (plus this update) is stale:
+        // only a fresh T_CL relaxes (the raw target returns to the base at
+        // once; the smoother then decays with TlimErrDecayTime, the
+        // reference law), and the guard only runs on accepted windows. The
+        // age advances while the limit is held below too: a second gap
+        // during a re-qualification must restart the trend again, not let
+        // the next burst share a ring with the one before the gap.
+        if self.active {
+            self.age = self.age.saturating_add(self.upd);
+            if self.age > self.window.saturating_add(self.upd) {
+                self.valid = false;
+            }
+        }
         // a tripped guard drops any relaxation at once (TlimAdj -> 0), and
         // so does a trend that restarted after a gap until it re-qualifies
         if self.implausible || self.requalify {
@@ -1147,14 +1160,6 @@ impl Cl {
         }
         if !self.active {
             return base;
-        }
-        // a measurement older than one window (plus this update) is stale:
-        // only a fresh T_CL relaxes (the raw target returns to the base at
-        // once; the smoother then decays with TlimErrDecayTime, the
-        // reference law), and the guard only runs on accepted windows
-        self.age = self.age.saturating_add(self.upd);
-        if self.age > self.window.saturating_add(self.upd) {
-            self.valid = false;
         }
         // max/min, not clamp: a NaN error falls back to the plain base.
         let relax = if self.relax_allowed() { (t_ol - self.t_cl).max(0.0).min(self.cap) } else { 0.0 };
