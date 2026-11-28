@@ -107,6 +107,21 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@390c00000/audio",
+  "compatible": [
+   "apple,t8142-aop-audio",
+   "apple,t8152-aop-audio"
+  ],
+  "dma_names": [
+   "cout",
+   "cin",
+   "spkr",
+   "sense",
+   "hpai"
+  ],
+  "chassis": "J815"
+ },
  "tuning": {
   "tuning": {
    "aid": "-",

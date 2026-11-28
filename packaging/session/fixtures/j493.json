@@ -91,6 +91,17 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@24ac00000/audio",
+  "compatible": [
+   "apple,t8112-aop-audio",
+   "apple,aop-audio"
+  ],
+  "dma_names": [
+   "dma"
+  ],
+  "chassis": "J493"
+ },
  "tuning": {
   "tuning": {
    "aid": "-",

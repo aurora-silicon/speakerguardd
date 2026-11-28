@@ -1297,6 +1297,259 @@ def tuning_dump(cli_args, cli="aurora-speaker-tuning", strict=False):
         raise Refused(f"{cli} dump --json gave no JSON (exit {r.returncode}): {r.stderr.strip()[-300:]}")
 
 
+# ---------------------------------------------------------------- microphones
+#
+# The built-in microphone array (the "hpai" stream of the AOP audio
+# service). What the kernel's drivers fix per audio block, keyed by the
+# block's device-tree compatible like TRANSPORTS:
+# - dma: the dma-names entry the driver takes the array's stream from; a Mac
+#   whose audio node lists none has no array (Mac mini, Mac Studio);
+# - card: the suffix of the card the driver registers the array on
+#   ("Apple<apple,chassis-name><suffix>");
+# - dev: the array's capture PCM on that card (its PCM id is "hpai");
+# - channels, rate: the PCM's only layout.
+MIC_PCM_ID = "hpai"
+MIC_TRANSPORTS = {
+    # sound/soc/apple/aop_audio.rs (the PDM microphones, T8103 to T6041)
+    "apple,aop-audio": {"dma": "dma", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+    "apple,t6030-aop-audio": {"dma": "dma", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+    "apple,t6041-aop-audio": {"dma": "dma", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+    # sound/soc/apple/aop_t8140.rs: PCM 0 of its card is the low-power microphone
+    "apple,t8140-aop-audio": {"dma": "hpai", "card": "AOP", "dev": 1, "channels": 2, "rate": 48000},
+    # sound/soc/apple/t8152_aop_audio.rs (T8142, T6050, T8152)
+    "apple,t8152-aop-audio": {"dma": "hpai", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+}
+MIC_TRANSPORTS["apple,t8142-aop-audio"] = MIC_TRANSPORTS["apple,t8152-aop-audio"]
+MIC_TRANSPORTS["apple,t6050-aop-audio"] = MIC_TRANSPORTS["apple,t8152-aop-audio"]
+# The sgv2_mic plugin's variants (crates/sgv2-lv2/src/mic.rs VARIANTS).
+MIC_PLUGIN_MAX = 4
+
+
+def _okay(node, root):
+    """Whether a device-tree node and every node above it is enabled."""
+    node, root = os.path.realpath(node), os.path.realpath(root)
+    while True:
+        status = os.path.join(node, "status")
+        if os.path.exists(status) and _str(_read(status)) not in ("okay", "ok"):
+            return False
+        if node == root or os.path.dirname(node) == node:
+            return True
+        node = os.path.dirname(node)
+
+
+def read_mic_dt(root="/proc/device-tree"):
+    """The built-in microphone array of the running Mac, from its device
+    tree, or None when it has none: the enabled AOP audio node (a node named
+    "audio" whose compatible MIC_TRANSPORTS knows) that lists the array's
+    stream in dma-names. {node, compatible, dma_names, chassis}."""
+    root = os.path.realpath(root)
+    found = []
+    for d, dirs, files in os.walk(root):
+        dirs.sort()
+        if os.path.basename(d) != "audio" or "compatible" not in files:
+            continue
+        compatible = _strs(_read(os.path.join(d, "compatible")))
+        if not any(c in MIC_TRANSPORTS for c in compatible) or not _okay(d, root):
+            continue
+        names = _strs(_read(os.path.join(d, "dma-names"))) if "dma-names" in files else []
+        chassis = _str(_read(os.path.join(d, "apple,chassis-name"))) if "apple,chassis-name" in files else None
+        found.append({"node": os.path.relpath(d, root), "compatible": compatible, "dma_names": names, "chassis": chassis})
+    found = [m for m in found if mic_transport(m)["dma"] in m["dma_names"]]
+    if not found:
+        return None
+    if len(found) != 1:
+        raise Refused(f"{len(found)} AOP audio nodes with a microphone array in the device tree (want 1)")
+    return found[0]
+
+
+def read_mic_dtb(path):
+    """read_mic_dt() on a compiled device tree (.dtb)."""
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.join(d, "dt")
+        os.makedirs(root)
+        _fdt_to_dir(_read(path), root)
+        return read_mic_dt(root)
+
+
+def mic_transport(mic):
+    for c in mic["compatible"]:
+        if c in MIC_TRANSPORTS:
+            return MIC_TRANSPORTS[c]
+    raise Refused(f"no microphone transport is known for {mic['compatible']}")
+
+
+def describe_mic(mic):
+    """The array's description, from the device tree's node alone (the
+    driver's rules): {key, card, dev, channels, rate}. The key is the
+    chassis the card is named for, as the speaker graph's machine key."""
+    t = mic_transport(mic)
+    chassis = mic.get("chassis")
+    if not chassis or not re.fullmatch(r"[A-Za-z0-9]+", chassis):
+        raise Refused(f"the device tree's {mic['node']} node names no chassis (apple,chassis-name {chassis!r})")
+    if not 1 <= t["channels"] <= MIC_PLUGIN_MAX:
+        raise Refused(f"no microphone plugin takes {t['channels']} channels")
+    return {"key": chassis.lower(), "card": f"Apple{chassis}{t['card']}", "dev": t["dev"],
+            "channels": t["channels"], "rate": t["rate"]}
+
+
+def live_mic_pcm(desc, proc="/proc/asound"):
+    """The array's capture PCM device on the running card `desc` names: the
+    card's capture PCM whose id is MIC_PCM_ID (as the speaker PCM is found
+    by its id), else the driver's fixed one if the card has it. None
+    without the card or the PCM."""
+    card = os.path.join(proc, desc["card"])
+    try:
+        names = sorted(os.listdir(card))
+    except OSError:
+        return None
+    fixed = None
+    for d in names:
+        m = re.fullmatch(r"pcm(\d+)c", d)
+        if not m:
+            continue
+        try:
+            with open(os.path.join(card, d, "info")) as f:
+                info = dict(l.split(": ", 1) for l in f.read().splitlines() if ": " in l)
+        except OSError:
+            continue
+        if re.sub(r"\s*\(\*\)$", "", info.get("id", "").strip()) == MIC_PCM_ID:
+            return int(m.group(1))
+        if int(m.group(1)) == desc["dev"]:
+            fixed = desc["dev"]
+    return fixed
+
+
+# The microphone blob's header (crates/sgv2-core/src/mic/artifact.rs), as
+# far as provisioning binds it. MIC_BLOB_VERSION is the artifact's VERSION:
+# the plugin refuses any other (silence), so a blob of another version is
+# never kept (test_provision checks the two constants agree).
+MIC_BLOB_MAGIC = b"SGV2MIC\0"
+MIC_BLOB_VERSION = 2
+MIC_BLOB_HEADER = 76
+MIC_BLOB_MAX = 4 * 1024 * 1024
+MIC_FLAG_PARTIAL = 1
+
+
+def mic_blob_header(data):
+    """{version, partial, rate, mics, latency, machine, unit_bound} of a
+    microphone blob whose framing holds (magic, lengths, CRC-32). Refuses
+    anything else. The version is reported, not judged."""
+    import zlib
+
+    if len(data) < MIC_BLOB_HEADER + 4 or len(data) > MIC_BLOB_MAX or data[:8] != MIC_BLOB_MAGIC:
+        raise Refused("not a microphone blob (length or magic)")
+    u32 = lambda at: int.from_bytes(data[at : at + 4], "little")  # noqa: E731
+    if MIC_BLOB_HEADER + u32(72) + 4 != len(data):
+        raise Refused("the microphone blob's payload length does not match its size")
+    if zlib.crc32(data[:-4]) != u32(len(data) - 4):
+        raise Refused("the microphone blob's checksum does not match")
+    machine = data[28:36].split(b"\0", 1)[0]
+    try:
+        machine = machine.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refused("the microphone blob names no board") from None
+    return {"version": u32(8), "partial": bool(u32(12) & MIC_FLAG_PARTIAL), "rate": u32(16), "mics": u32(20),
+            "latency": u32(24), "machine": machine, "unit_bound": any(data[40:72])}
+
+
+def mic_blob_errors(h, board, desc):
+    """Why the plugin's variant for `desc` on `board` would refuse (or must
+    not run) a blob with header `h`: [] when it is this Mac's, complete, and
+    of the version this package's plugin takes."""
+    errs = []
+    if h["version"] != MIC_BLOB_VERSION:
+        errs.append(f"blob version {h['version']}, the plugin takes {MIC_BLOB_VERSION}")
+    if h["partial"]:
+        errs.append("a partial design (stages carried as identity)")
+    if h["machine"] != board:
+        errs.append(f"compiled for {h['machine'] or 'no board'}, this Mac is {board}")
+    if h["rate"] != desc["rate"]:
+        errs.append(f"compiled for {h['rate']} Hz, the microphone PCM runs at {desc['rate']} Hz")
+    if h["mics"] != desc["channels"]:
+        errs.append(f"compiled for {h['mics']} microphones, the microphone PCM has {desc['channels']}")
+    return errs
+
+
+MIC_PLUGIN_URI = "https://aurora-silicon.org/lv2/sgv2#mic-{}ch"
+# Where the packaged bundle's library is, under a system LV2 directory.
+MIC_PLUGIN_LIB = os.path.join("sgv2.lv2", "libsgv2_lv2.so")
+
+
+def mic_plugin_health(lib, blob, mics, rate, frames=512):
+    """Loads the packaged plugin's microphone variant for `mics` channels as
+    a host does, on blob `blob`, runs one block of silence and returns its
+    (health, latency) outputs (health 0: it runs the blob; 1: it refused it
+    and is silent).
+    The plugin reads the board from this Mac's device tree. Refuses when
+    the library or the variant cannot be loaded. Run in a process of its
+    own (speakerguardd-selfcheck mic): it loads native code."""
+    import ctypes
+
+    class Descriptor(ctypes.Structure):
+        _fields_ = [("uri", ctypes.c_char_p),
+                    ("instantiate", ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_double, ctypes.c_char_p, ctypes.c_void_p)),
+                    ("connect_port", ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)),
+                    ("activate", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                    ("run", ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)),
+                    ("deactivate", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                    ("cleanup", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                    ("extension_data", ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p))]
+
+    try:
+        so = ctypes.CDLL(lib)
+        entry = so.lv2_descriptor
+    except (OSError, AttributeError) as e:
+        raise Refused(f"the plugin library {lib} cannot be loaded ({e})") from None
+    entry.restype = ctypes.POINTER(Descriptor)
+    entry.argtypes = [ctypes.c_uint32]
+    uri = MIC_PLUGIN_URI.format(mics).encode()
+    desc = None
+    for i in range(256):
+        d = entry(i)
+        if not d:
+            break
+        if d.contents.uri == uri:
+            desc = d
+            break
+    if desc is None:
+        raise Refused(f"{lib} has no {uri.decode()} plugin")
+    old = os.environ.get("SGV2_MIC_PARAMS")
+    os.environ["SGV2_MIC_PARAMS"] = blob
+    try:
+        h = desc.contents.instantiate(desc, float(rate), os.path.dirname(lib).encode(), None)
+    finally:
+        if old is None:
+            del os.environ["SGV2_MIC_PARAMS"]
+        else:
+            os.environ["SGV2_MIC_PARAMS"] = old
+    if not h:
+        raise Refused(f"the {uri.decode()} plugin did not instantiate")
+    try:
+        # ports: the microphones, the output, latency, health
+        audio = [(ctypes.c_float * frames)() for _ in range(mics + 1)]
+        latency, health = ctypes.c_float(-1.0), ctypes.c_float(-1.0)
+        for i, buf in enumerate(audio):
+            desc.contents.connect_port(h, i, ctypes.cast(buf, ctypes.c_void_p))
+        desc.contents.connect_port(h, mics + 1, ctypes.cast(ctypes.byref(latency), ctypes.c_void_p))
+        desc.contents.connect_port(h, mics + 2, ctypes.cast(ctypes.byref(health), ctypes.c_void_p))
+        if desc.contents.activate:
+            desc.contents.activate(h)
+        desc.contents.run(h, frames)
+        return int(health.value), int(latency.value)
+    finally:
+        desc.contents.cleanup(h)
+
+
+def mic_plugin_lib(dirs):
+    """The packaged plugin library, in the first of the system LV2
+    directories `dirs` that has it."""
+    for d in dirs:
+        lib = os.path.join(d, MIC_PLUGIN_LIB)
+        if os.path.isfile(lib):
+            return lib
+    raise Refused("the packaged sgv2 LV2 plugin is in none of " + ", ".join(dirs))
+
+
 def main(argv):
     import argparse
 
