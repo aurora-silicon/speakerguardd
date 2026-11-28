@@ -235,3 +235,87 @@ class RunRevalidatesBeforeStoring(unittest.TestCase):
             with self.assertRaises(up.Retry):
                 up._cmd_run(a)
         self.assertEqual(stored, [])
+
+
+class Boundaries(unittest.TestCase):
+    """Second review of #299: unreadable/empty card ids, a late wake past the budget, local staging failures."""
+
+    def test_unreadable_ids_both_times_refuse_to_proceed(self):
+        for ids in ({}, {"1": ""}):
+            with self.subTest(ids=ids), mock.patch.object(up, "interface_mode", return_value=("dual", "1")), \
+                    mock.patch.object(up, "card_identity", side_effect=lambda c: ids.get(c)):
+                with self.assertRaises(up.Retry):
+                    up.same_speaker_card("dual", "1", ids.get("1"))
+
+    def test_run_needs_a_readable_id_before_fetching(self):
+        fetched = []
+
+        class Ident:
+            unit, board, acoustic = "u" * 64, "j413", 13
+
+            def __init__(self, adt):
+                pass
+
+            def matches_dt(self):
+                return True
+        for bad in (None, ""):
+            with self.subTest(id=bad), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(up.collect, "Identity", Ident), \
+                    mock.patch.object(up, "interface_mode", return_value=("dual", "1")), \
+                    mock.patch.object(up, "card_identity", return_value=bad), \
+                    mock.patch.object(up, "playback_proof", return_value=True), \
+                    mock.patch.object(up, "acquire", side_effect=lambda i, a: fetched.append(1)), \
+                    mock.patch.object(up, "say"):
+                with self.assertRaises(up.Retry) as cm:
+                    up._cmd_run(mock.Mock(store=d, adt=None, at_boot=False))
+                self.assertIn("ALSA id", str(cm.exception))
+        self.assertEqual(fetched, [])
+
+    def test_late_wake_starts_no_attempt_after_budget(self):
+        c = Clock()
+        calls = []
+
+        def fake(identity, a):
+            calls.append(c.t)
+            raise up.Unreachable("dns")
+
+        def late_sleep(s):
+            c.t += 400  # the machine slept through the budget
+        with mock.patch.object(up, "acquire", fake):
+            with self.assertRaises(up.Unreachable):
+                up.acquire_waiting(None, None, 180, sleep=late_sleep, clock=c)
+        self.assertEqual(calls, [0.0])
+
+    def test_local_enospc_is_not_retried_as_unreachable(self):
+        import errno as _errno
+        with tempfile.TemporaryDirectory() as d:
+            a = mock.Mock(ipsw=None)
+            ident = mock.Mock(board="j413", acoustic=13)
+            rng = mock.Mock(fetched=0)
+            with mock.patch.object(up.ipsw, "open_system", return_value=(object(), rng, "26B123", "https://x/y.ipsw")), \
+                    mock.patch.object(up.ipsw, "pin", side_effect=up.ipsw.IpswError("no pin")), \
+                    mock.patch.object(up.unit, "installer_fill_build", return_value=None), \
+                    mock.patch.object(up.collect, "stage", side_effect=OSError(_errno.ENOSPC, "No space left on device")), \
+                    mock.patch.object(up, "say"):
+                with self.assertRaises(up.Retry) as cm:
+                    up.from_ipsw(ident, a, None, False, d)
+        self.assertNotIsInstance(cm.exception, up.Unreachable)
+        self.assertIn("on this Mac", str(cm.exception))
+
+    def test_network_oserror_stays_unreachable(self):
+        import errno as _errno
+        for e in (OSError(_errno.ECONNRESET, "reset"), TimeoutError("timed out"),
+                  up.urllib.error.URLError("Temporary failure in name resolution")):
+            with self.subTest(e=e):
+                self.assertFalse(up.local_failure(e) if isinstance(e, OSError) else False)
+
+    def test_acquire_waiting_does_not_repeat_local_failure(self):
+        calls = []
+
+        def fake(identity, a):
+            calls.append(1)
+            raise up.Retry("staging the restore image's files failed on this Mac: ENOSPC")
+        with mock.patch.object(up, "acquire", fake):
+            with self.assertRaises(up.Retry):
+                up.acquire_waiting(None, None, 180, sleep=lambda s: None)
+        self.assertEqual(calls, [1])

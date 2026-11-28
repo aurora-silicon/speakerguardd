@@ -27,6 +27,7 @@ this Mac's own tuning, and back.
 """
 import argparse
 import contextlib
+import errno
 import fcntl
 import glob
 import hashlib
@@ -40,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 
 from . import collect, ipsw, unit
 from .asahi_firmware import aea_ro, apfs_ro
@@ -193,7 +195,11 @@ def from_ipsw(identity, a, spid, known, scratch):
     st = tempfile.mkdtemp(prefix="stage-", dir=scratch)
     try:
         collect.stage(vol, identity.acoustic, st)
-    except (aea_ro.AeaUnavailable, OSError) as e:
+    except aea_ro.AeaUnavailable as e:
+        raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
+    except OSError as e:
+        if local_failure(e):
+            raise Retry(f"staging the restore image's files failed on this Mac: {e}") from None
         raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
     except (aea_ro.AeaError, apfs_ro.ApfsError) as e:
         raise collect.CollectError(f"macOS {build} restore image: {e}") from None
@@ -222,6 +228,18 @@ def with_fill(identity, b, component, dirs):
                   + ". The speakers stay as they are")
 
 
+# A write or open failing on this Mac (the staging directory on /run is full,
+# read-only or not ours) is no network outage: retrying it for minutes only
+# repeats it.
+LOCAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES, errno.EPERM,
+                          errno.EMFILE, errno.ENFILE, errno.ENOMEM})
+
+
+def local_failure(e):
+    """Whether an OSError from staging is this Mac's own (not the network)."""
+    return not isinstance(e, urllib.error.URLError) and e.errno in LOCAL_ERRNOS
+
+
 def acquire_waiting(identity, a, wait, sleep=time.sleep, clock=time.monotonic):
     """acquire(), starting a new attempt every 5 s while the pinned restore
     image cannot be reached, as long as the attempt starts within `wait`
@@ -236,6 +254,10 @@ def acquire_waiting(identity, a, wait, sleep=time.sleep, clock=time.monotonic):
             if clock() + 5 > deadline:
                 raise
             sleep(5)
+            if clock() > deadline:
+                # A late wake (a suspend, a loaded boot) starts no attempt
+                # after the budget.
+                raise
 
 
 def acquire(identity, a):
@@ -485,9 +507,10 @@ def same_speaker_card(mode, card, ident):
     take minutes at boot, before anything changes provisioning or the
     protection switch."""
     now_mode, now_card = interface_mode()
-    if (now_mode, now_card) != (mode, card) or card_identity(card) != ident:
+    now_ident = card_identity(now_card) if now_card is not None else None
+    if not ident or not now_ident or (now_mode, now_card) != (mode, card) or now_ident != ident:
         raise Retry(f"the speaker card changed during the fetch (was {mode} on card {card} {ident}, now "
-                    f"{now_mode} on card {now_card} {card_identity(now_card) if now_card else None}): "
+                    f"{now_mode} on card {now_card} {now_ident}): "
                     "nothing changed, try again")
 
 
@@ -897,6 +920,8 @@ def _cmd_run(a):
             "('aurora-speaker-upgrade run' switches by hand)")
         return EXIT_OK
     ident = card_identity(card)
+    if not ident:
+        raise Retry(f"cannot read the speaker card's ALSA id (card {card}): nothing changed, try again")
     b, prov = acquire_waiting(identity, a, NET_WAIT_S if getattr(a, "at_boot", False) else 0)
     same_speaker_card(mode, card, ident)
     store.ensure()
