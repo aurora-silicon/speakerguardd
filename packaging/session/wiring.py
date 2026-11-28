@@ -344,16 +344,86 @@ def _links(snd, root, phandles, sysfs):
     return links
 
 
-def audio_stack(sound, root="/proc/device-tree", modules="/sys/module"):
+def _speaker_path_modules(dt_nodes, root, modules="/sys/module", sysfs="/sys"):
+    """Sorted names of loaded kernel modules bound to `dt_nodes` (or their
+    device-tree ancestors, such as an AOP MFD parent or I2C controller) and
+    their transitive module dependencies via `<modules>/*/holders`.
+
+    Hashing only this closure keeps the audio fingerprint invariant when
+    unrelated software-only sound modules (`snd_seq_dummy`, `snd_hrtimer`,
+    `snd_usb_audio`, ...) load later in the boot. No name lists."""
+    targets = set()
+    for node in dt_nodes:
+        cur = os.path.realpath(node)
+        while cur and cur != root and cur.startswith(root + os.sep):
+            targets.add(cur)
+            cur = os.path.dirname(cur)
+    if not targets:
+        return []
+
+    seeds = set()
+    bus_root = os.path.join(sysfs, "bus")
+    try:
+        buses = sorted(os.listdir(bus_root))
+    except OSError:
+        buses = []
+    for bus in buses:
+        dev_dir = os.path.join(bus_root, bus, "devices")
+        try:
+            devs = os.listdir(dev_dir)
+        except OSError:
+            continue
+        for dev in devs:
+            p = os.path.join(dev_dir, dev)
+            of_node = os.path.join(p, "of_node")
+            mod_link = os.path.join(p, "driver", "module")
+            if not (os.path.exists(of_node) and os.path.exists(mod_link)):
+                continue
+            try:
+                if os.path.realpath(of_node) in targets:
+                    seeds.add(os.path.basename(os.path.realpath(mod_link)))
+            except OSError:
+                continue
+
+    if not seeds:
+        return []
+
+    deps = {}
+    try:
+        mod_names = os.listdir(modules)
+    except OSError:
+        mod_names = []
+    for m in mod_names:
+        holders_dir = os.path.join(modules, m, "holders")
+        try:
+            holders = os.listdir(holders_dir)
+        except OSError:
+            continue
+        for holder in holders:
+            deps.setdefault(holder, set()).add(m)
+
+    seen = set(seeds)
+    stack = list(seeds)
+    while stack:
+        cur_mod = stack.pop()
+        for dep in deps.get(cur_mod, ()):
+            if dep not in seen:
+                seen.add(dep)
+                stack.append(dep)
+    return sorted(seen)
+
+
+def audio_stack(sound, root="/proc/device-tree", modules="/sys/module", sysfs="/sys"):
     """A fingerprint (16 hex digits) of what carries the speaker and sense
     words on this boot, beyond the kernel release: the speaker card's node
     `sound` (relative to `root`, with everything under it), the nodes its
     links' `sound-dai` lists point at (the serializer and amp nodes, their
-    own properties), and the build ID of every loaded sound module (and of
-    the AOP core). A
-    rebuilt module or a changed device tree under the same release (the
-    J615's MCA receiver moved one bit clock by a module and a DT property)
-    changes it. "-" when `sound` is not in the tree."""
+    own properties), and the build ID of the loaded modules bound to those
+    nodes (and their DT ancestors) plus their transitive dependencies via
+    `/sys/module/*/holders`. A rebuilt speaker-path module or a changed
+    device tree under the same release changes it; late-loading software or
+    unrelated sound modules (`snd_seq_dummy`, `snd_hrtimer`, USB audio) do
+    not. "-" when `sound` is not in the tree."""
     root = os.path.realpath(root)
     snd = os.path.join(root, sound)
     if not sound or not os.path.isdir(snd):
@@ -387,15 +457,7 @@ def audio_stack(sound, root="/proc/device-tree", modules="/sys/module"):
                     h.update(f"unresolved {d}/{side}".encode())
     for node in sorted(nodes):
         props(node, False)
-    try:
-        names = sorted(os.listdir(modules))
-    except OSError:
-        names = []
-    for m in names:
-        # the sound modules, and the AOP core the AOP Macs' speaker and
-        # sense rings run through (not its sensor clients)
-        if not (m.startswith("snd") or m == "aop"):
-            continue
+    for m in _speaker_path_modules({snd} | nodes, root, modules, sysfs):
         h.update(f"module {m}\0".encode())
         # the loaded binary: its GNU build ID note (srcversion exists only
         # for modules with a MODULE_VERSION or CONFIG_MODULE_SRCVERSION_ALL)
