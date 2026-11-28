@@ -128,3 +128,50 @@ class RunUsesWait(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AcquireWaiting(unittest.TestCase):
+    """A boot run keeps trying to reach the pinned restore image (on a fresh J413 boot DNS answered only after
+    network-online.target)."""
+
+    def go(self, results, wait):
+        c = Clock()
+        seq = iter(results)
+
+        def fake(identity, a):
+            r = next(seq)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        with mock.patch.object(up, "acquire", fake):
+            try:
+                return up.acquire_waiting(None, None, wait, sleep=c.sleep, clock=c), c.t
+            except up.Retry as e:
+                return e, c.t
+
+    def test_reaches_after_dns(self):
+        got, t = self.go([up.Unreachable("dns")] * 3 + [("b", {"p": 1})], 180)
+        self.assertEqual((got, t), (("b", {"p": 1}), 15))
+
+    def test_gives_up(self):
+        got, t = self.go([up.Unreachable("dns")] * 100, 180)
+        self.assertIsInstance(got, up.Unreachable)
+        self.assertLessEqual(t, 180)
+
+    def test_other_retry_not_waited(self):
+        got, t = self.go([up.Retry("self-check cannot run now")], 180)
+        self.assertNotIsInstance(got, up.Unreachable)
+        self.assertEqual(t, 0)
+
+    def test_refusal_passes_through(self):
+        with mock.patch.object(up, "acquire", side_effect=up.Refused("no tuning")):
+            with self.assertRaises(up.Refused):
+                up.acquire_waiting(None, None, 180, sleep=lambda s: None)
+
+    def test_by_hand_no_wait(self):
+        got, t = self.go([up.Unreachable("dns"), ("b", {})], 0)
+        self.assertIsInstance(got, up.Unreachable)
+        self.assertEqual(t, 0)
+
+    def test_unreachable_is_a_retry(self):
+        self.assertTrue(issubclass(up.Unreachable, up.Retry))

@@ -163,6 +163,7 @@ class OfflineAtBoot(unittest.TestCase):
                     mock.patch.object(up, "interface_mode", return_value=("v2-only", "card")), \
                     mock.patch.object(up, "playback_proof", return_value=True), \
                     mock.patch.object(up, "speaker_id_source", return_value=(None, False, "none")), \
+                    mock.patch.object(up, "NET_WAIT_S", 0), \
                     mock.patch.object(up.Store, "ensure", lambda self: os.makedirs(self.root, exist_ok=True)), \
                     mock.patch.object(up, "say"):
                 try:

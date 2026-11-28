@@ -95,6 +95,11 @@ class Retry(Exception):
     """Cannot run now; nothing changed."""
 
 
+class Unreachable(Retry):
+    """The pinned restore image could not be read now (no network yet, DNS,
+    a timeout, a server error): a boot run waits a while for it."""
+
+
 def say(msg):
     print(f"aurora-speaker-upgrade: {msg}", file=sys.stderr, flush=True)
 
@@ -181,7 +186,7 @@ def from_ipsw(identity, a, spid, known, scratch):
         kw = {"preferred_build": preferred} if preferred else {}
         vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw, **kw)
     except ipsw.IpswUnavailable as e:
-        raise Retry(f"the pinned restore image cannot be read now: {e}") from None
+        raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
     except ipsw.IpswError as e:
         raise collect.CollectError(str(e)) from None
     say(f"macOS {build} restore image ({url.rsplit('/', 1)[-1]}), by ranges")
@@ -189,7 +194,7 @@ def from_ipsw(identity, a, spid, known, scratch):
     try:
         collect.stage(vol, identity.acoustic, st)
     except (aea_ro.AeaUnavailable, OSError) as e:
-        raise Retry(f"the pinned restore image cannot be read now: {e}") from None
+        raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
     except (aea_ro.AeaError, apfs_ro.ApfsError) as e:
         raise collect.CollectError(f"macOS {build} restore image: {e}") from None
     b, sysbuild = collect.collect(st, identity, spid, known)
@@ -215,6 +220,20 @@ def with_fill(identity, b, component, dirs):
                   f"takes on this Mac's macOS {m.get('macos_build')} from the same files; "
                   + ("; ".join(reasons) if reasons else "this unit's installer bundle has none")
                   + ". The speakers stay as they are")
+
+
+def acquire_waiting(identity, a, wait, sleep=time.sleep, clock=time.monotonic):
+    """acquire(), trying again every 5 s for up to `wait` seconds while the
+    pinned restore image cannot be reached. Anything else (a refusal, a
+    retry for another reason) is passed on at once."""
+    deadline = clock() + wait
+    while True:
+        try:
+            return acquire(identity, a)
+        except Unreachable:
+            if clock() + 5 > deadline:
+                raise
+            sleep(5)
 
 
 def acquire(identity, a):
@@ -438,6 +457,10 @@ def interface_mode():
 # card registered 1 s after the run on a fresh boot), and a run that finds no
 # card waits for the next boot.
 CARD_WAIT_S = 120
+# How long a boot run keeps trying to reach the pinned restore image. On a
+# fresh J413 boot network-online.target was reached before DNS answered, and
+# the run gave up until the next boot.
+NET_WAIT_S = 180
 
 
 
@@ -846,7 +869,7 @@ def _cmd_run(a):
             "for this speaker yet, so the boot unit leaves the speakers as they are "
             "('aurora-speaker-upgrade run' switches by hand)")
         return EXIT_OK
-    b, prov = acquire(identity, a)
+    b, prov = acquire_waiting(identity, a, NET_WAIT_S if getattr(a, "at_boot", False) else 0)
     store.ensure()
     if not have or digest(have) != digest(b):
         store.put_bundle(b)

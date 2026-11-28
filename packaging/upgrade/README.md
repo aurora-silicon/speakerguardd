@@ -91,7 +91,11 @@ a speaker card. If the tree has none (no enabled `apple,macaudio` node
 with a Speaker link), the run stops at once with "not now" and says that
 this kernel's device tree lacks the speaker amp nodes. The speakers stay
 at the kernel's own limit, and the next boot on a kernel and boot update
-that carries the nodes tries again. A run by hand does not wait.
+that carries the nodes tries again. A boot run also keeps trying to reach
+the pinned restore image for up to 180 s, every 5 s: on a J413
+`network-online.target` was reached before DNS answered. Only "cannot be
+read now" is tried again; any answer from the image is final. A run by hand
+does not wait for either.
 
 The boot unit also moves a speaker only once protected playback on it is on
 record. speakerguardd v2's gate data (`packaging/session/gate.json`,
