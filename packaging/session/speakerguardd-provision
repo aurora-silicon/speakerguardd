@@ -1335,9 +1335,10 @@ def cmd_graph_user(args, p):
     # The built-in microphone's graph, whatever the speakers' state: both of
     # its files for the user it is provisioned for, or neither
     mic = mic_ready(p, os.getuid())
-    want.update(mic)
+    keep = {**want, **mic}
     prefixes = tuple({os.path.join(p.graph, ""), os.path.join(os.path.realpath(p.graph), "")})
-    for d, cdir in user_conf_dirs().items():
+    dirs = user_conf_dirs()
+    for d, cdir in dirs.items():
         try:
             names = os.listdir(cdir)
         except OSError:
@@ -1347,7 +1348,7 @@ def cmd_graph_user(args, p):
             if not os.path.islink(path):
                 continue
             target = os.readlink(path)
-            if target.startswith(prefixes) and want.get((d, n)) != target:
+            if target.startswith(prefixes) and keep.get((d, n)) != target:
                 unlink(path)
                 log(f"removed {path}")
         for (dd, n), target in want.items():
@@ -1362,11 +1363,51 @@ def cmd_graph_user(args, p):
             os.makedirs(cdir, exist_ok=True)
             os.symlink(target, path)
             log(f"linked {path}")
+    if mic and not link_pair(mic, dirs):
+        mic = {}
     if not seat:
         log(f"{not_seat_reason(conf, st)}: no speaker graph here")
     if not mic and os.path.exists(p.mic_state):
         log("no speakerguardd microphone graph for this session: the distribution's microphone graph is in use")
     return 0
+
+
+def link_pair(pair, dirs):
+    """Link the microphone graph's two files, both or neither. A file of the
+    user's at either name, or a link that cannot be made, leaves neither of
+    ours linked (a WirePlumber rule alone would leave no microphone, the
+    PipeWire file alone two). Only our own links are ever removed; the
+    user's files and every other link stay as they are. True when both are
+    linked."""
+    plan = []
+    for (d, n), target in sorted(pair.items()):
+        if d not in dirs:
+            return unlink_pair(pair, dirs, f"no {d} configuration directory")
+        path = os.path.join(dirs[d], n)
+        if os.path.islink(path) and os.readlink(path) == target:
+            continue
+        if os.path.lexists(path):
+            return unlink_pair(pair, dirs, f"{path} exists and is not speakerguardd's")
+        plan.append((path, target))
+    for path, target in plan:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.symlink(target, path)
+        except OSError as e:
+            return unlink_pair(pair, dirs, f"cannot link {path} ({e})")
+        log(f"linked {path}")
+    return True
+
+
+def unlink_pair(pair, dirs, why):
+    """Remove whichever of the microphone graph's links is ours; False."""
+    for (d, n), target in pair.items():
+        path = os.path.join(dirs.get(d, ""), n)
+        if d in dirs and os.path.islink(path) and os.readlink(path) == target:
+            unlink(path)
+            log(f"removed {path}")
+    log(f"{why}: no speakerguardd microphone graph for this session (both files or neither)")
+    return False
 
 
 def not_seat_reason(conf, st):

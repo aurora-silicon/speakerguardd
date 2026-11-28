@@ -2581,6 +2581,59 @@ class Microphone(Base):
         self.assertEqual(self.run_(), 0)
         self.assertNoMic("refused")
 
+    def test_a_user_file_at_one_name_leaves_neither_microphone_link(self):
+        self.assertEqual(self.run_(), 0)
+        g = lambda: prov.cmd_graph_user(self.args("graph-user"), self.p)  # noqa: E731
+        pw = os.path.join(self.home, "pipewire", "pipewire.conf.d", "sgv2-mic-j316.conf")
+        wp = os.path.join(self.home, "wireplumber", "wireplumber.conf.d", "61-sgv2-mic-j316.conf")
+        self.assertEqual(g(), 0)
+        self.assertTrue(os.path.islink(pw) and os.path.islink(wp))
+        before = self.speaker_state()
+        # the user puts a file of their own at the WirePlumber name: our
+        # PipeWire half goes too, their file stays untouched
+        os.unlink(wp)
+        with open(wp, "w") as f:
+            f.write("# the user's own\n")
+        self.assertEqual(g(), 0)
+        self.assertFalse(os.path.lexists(pw))
+        self.assertFalse(os.path.islink(wp))
+        self.assertEqual(open(wp).read(), "# the user's own\n")
+        self.assertEqual(self.speaker_state(), before)
+        # the same at the PipeWire name
+        os.unlink(wp)
+        with open(pw, "w") as f:
+            f.write("# the user's own\n")
+        self.assertEqual(g(), 0)
+        self.assertFalse(os.path.lexists(wp))
+        self.assertEqual(open(pw).read(), "# the user's own\n")
+        # their file gone: both again
+        os.unlink(pw)
+        self.assertEqual(g(), 0)
+        self.assertTrue(os.path.islink(pw) and os.path.islink(wp))
+
+    def test_a_failing_second_microphone_link_removes_the_first(self):
+        self.assertEqual(self.run_(), 0)
+        pw = os.path.join(self.home, "pipewire", "pipewire.conf.d", "sgv2-mic-j316.conf")
+        wp = os.path.join(self.home, "wireplumber", "wireplumber.conf.d", "61-sgv2-mic-j316.conf")
+        real = os.symlink
+        made = []
+
+        def second_fails(target, path):
+            if "mic" in os.path.basename(path):
+                made.append(path)
+                if len(made) == 2:
+                    raise OSError(28, "No space left on device")
+            real(target, path)
+        self.patch(os, "symlink", second_fails)
+        before = self.speaker_state()
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertEqual(len(made), 2)
+        self.assertFalse(os.path.lexists(pw) or os.path.lexists(wp))
+        self.assertEqual(self.speaker_state(), before)
+        self.patch(os, "symlink", real)
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertTrue(os.path.islink(pw) and os.path.islink(wp))
+
     def test_a_session_links_both_files_or_neither(self):
         self.assertEqual(self.run_(), 0)
         g = lambda: prov.cmd_graph_user(self.args("graph-user"), self.p)  # noqa: E731
