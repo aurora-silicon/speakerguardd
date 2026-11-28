@@ -23,6 +23,7 @@ const MATCH_RELATIVE: f64 = 0.035_264_92;
 const CANDIDATE_LOWER: f32 = 0.965_936_3;
 const CANDIDATE_UPPER: f32 = 1.035_265;
 const REPLACE_GAIN: f64 = 0.82;
+const ACTIVE_GAIN: f32 = 0.9999;
 const NOTCH_QUALITY: f64 = 6.0;
 const WET_SMOOTH_HZ: f64 = 5.0;
 /// The first complete analysis block produces the native narrow D1 bank.
@@ -32,13 +33,9 @@ const WARMUP_DECISIONS: u32 = 0;
 struct Candidate {
     frequency_hz: f32,
     multiplier: f32,
-    /// The candidate cell's released record gain: the order key.
+    /// The candidate cell's released record gain: the primary order key.
     record_gain: f32,
-    /// The cell's limit and its record-weighted amplitude; once merged, the
-    /// line's lowest limit and its head's (first candidate's) amplitude.
-    threshold: f32,
-    amplitude: f32,
-    /// What a line that starts a track starts at: `threshold / amplitude`.
+    /// Initial multiplier when this line starts a new track (the head cell's own multiplier).
     /// (`multiplier` becomes the line's deepest cell multiplier once merged.)
     start_multiplier: f32,
 }
@@ -60,13 +57,8 @@ fn analysed_cells(maximum_hz: f64) -> usize {
 
 /// Folds candidates (already in decision order) that see the same line:
 /// one inside an earlier candidate's duplicate band joins it, which keeps
-/// its own frequency but takes the deeper multiplier. Returns the number of
-/// lines, compacted to the front. (Black-box against the installed unit:
-/// dropping the later cell, or keeping the first cell's multiplier, cuts a
-/// line that falls between two cells less than macOS does, by up to
-/// 1.1 dB on the 25G83 parity gate; the deeper one matches.) Its start
-/// multiplier is the lowest limit over its cells against the head cell's
-/// amplitude.
+/// its own frequency and start multiplier while taking the deeper continuation
+/// multiplier. Returns the number of lines, compacted to the front.
 fn merge_same_line(c: &mut [Candidate]) -> usize {
     let mut lines = 0usize;
     for i in 0..c.len() {
@@ -78,8 +70,6 @@ fn merge_same_line(c: &mut [Candidate]) -> usize {
         {
             Some(line) => {
                 line.multiplier = line.multiplier.min(next.multiplier);
-                line.threshold = line.threshold.min(next.threshold);
-                line.start_multiplier = (line.threshold / line.amplitude).clamp(1.0e-6, 1.0);
             }
             None => {
                 c[lines] = next;
@@ -305,7 +295,7 @@ struct Track {
 impl Default for Track {
     fn default() -> Self {
         Track {
-            frequency_hz: 1000.0,
+            frequency_hz: 0.0,
             gain: 1.0,
             audio_section: Section::IDENTITY,
             audio: [FilterState::default(); MAX_CHANNELS],
@@ -323,6 +313,12 @@ pub struct Run {
     delay: Box<[f32]>,
     delay_at: usize,
     history: [f32; FFT],
+    /// Precomputed symmetric analysis window (`w[n] = (1 - cos(2*pi*n/511)) / (2*511)`).
+    window: [f32; FFT],
+    /// Precomputed radix-2 twiddle factors `exp(-j * 2*pi*k / FFT)` for `k in 0..FFT/2`.
+    fft_twiddles: [(f32, f32); FFT / 2],
+    /// Per-cell minimum threshold, constant once the Kill bands are configured.
+    cell_thresholds: [f32; FFT / 2 + 1],
     /// Per-cell gain record of the detector: what the moving sections have
     /// removed from each transform cell, as the analyser sees it.
     bin_gains: [f32; FFT / 2 + 1],
@@ -336,6 +332,7 @@ pub struct Run {
     quadrature_state: [FilterState; QUADRATURE_SECTIONS],
     threshold_db: f64,
     threshold_shape: [Section; BANDS],
+    audio_wet_section: Section,
     tracks: Vec<Track>,
     release: f32,
     warmup: u32,
@@ -355,7 +352,14 @@ impl Run {
         // frames.  Keep those two counts distinct.
         let release = (1.0 - libm::exp(-(ANALYSIS_HOP as f64) / (0.050 * fs))) as f32;
         let maximum_hz = MAX_HZ[p.operation_frequency.min(4) as usize].min(0.49 * fs);
-        Run {
+        let window = core::array::from_fn(|n| {
+            0.5f32 * (1.0 - libm::cosf(2.0 * core::f32::consts::PI * n as f32 / (FFT - 1) as f32)) / (FFT - 1) as f32
+        });
+        let fft_twiddles = core::array::from_fn(|k| {
+            let angle = -2.0 * core::f64::consts::PI * k as f64 / FFT as f64;
+            (libm::cos(angle) as f32, libm::sin(angle) as f32)
+        });
+        let mut run = Run {
             channels,
             fs,
             maximum_hz,
@@ -363,6 +367,9 @@ impl Run {
             delay: vec![0.0; lookahead * channels].into_boxed_slice(),
             delay_at: 0,
             history: [0.0; FFT],
+            window,
+            fft_twiddles,
+            cell_thresholds: [0.0; FFT / 2 + 1],
             bin_gains: [1.0; FFT / 2 + 1],
             history_at: 0,
             history_len: 0,
@@ -382,15 +389,20 @@ impl Run {
             threshold_shape: core::array::from_fn(|i| {
                 let b = p.bands[i];
                 if b.enabled {
-                    threshold_peak(b.gain_db, b.frequency_hz, b.quality, ANALYSIS_RATE)
+                    threshold_peak(b.gain_db, b.frequency_hz, b.quality, fs)
                 } else {
                     Section::IDENTITY
                 }
             }),
+            audio_wet_section: wet_smoother(fs),
             tracks: vec![Track::default(); TRACKS],
             release,
             warmup: WARMUP_DECISIONS,
+        };
+        for bin in 0..=FFT / 2 {
+            run.cell_thresholds[bin] = run.cell_threshold(bin) as f32;
         }
+        run
     }
 
     pub fn reset(&mut self) {
@@ -412,9 +424,10 @@ impl Run {
     }
 
     fn threshold(&self, frequency_hz: f64) -> f64 {
-        let db = self.threshold_shape.iter().fold(self.threshold_db, |v, s| {
-            v + 20.0 * libm::log10(s.magnitude(frequency_hz, ANALYSIS_RATE).max(1.0e-20))
-        });
+        let db = self
+            .threshold_shape
+            .iter()
+            .fold(self.threshold_db, |v, s| v + 20.0 * libm::log10(s.magnitude(frequency_hz, self.fs).max(1.0e-20)));
         libm::pow(10.0, db / 20.0)
     }
 
@@ -441,36 +454,88 @@ impl Run {
         minimum
     }
 
-    fn spectrum(&self, bin: usize) -> (f64, f64) {
-        let centre = bin as f32;
+    /// Computes doubled positive-frequency amplitudes and first-difference
+    /// refined frequencies for bins `0..=last_bin` in a single 512-point
+    /// radix-2 complex FFT by packing the windowed signal in the real lane
+    /// and its windowed first difference in the imaginary lane.
+    fn spectra(&self, last_bin: usize, amplitudes: &mut [f64; FFT / 2 + 1], frequencies: &mut [f64; FFT / 2 + 1]) {
+        let last_bin = last_bin.min(FFT / 2);
         if self.history_len == 0 {
-            return (0.0, centre as f64 * ANALYSIS_RATE / FFT as f64);
+            for bin in 0..=last_bin {
+                amplitudes[bin] = 0.0;
+                frequencies[bin] = bin as f64 * ANALYSIS_RATE / FFT as f64;
+            }
+            return;
         }
-        let step = 2.0f32 * core::f32::consts::PI * centre / FFT as f32;
-        let (ss, cc) = (libm::sinf(step), libm::cosf(step));
-        let (mut s, mut c, mut re, mut im, mut dre, mut dim) = (0.0f32, 1.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        const SHIFT: u32 = u16::BITS - FFT.trailing_zeros();
+        let mut re = [0.0f32; FFT];
+        let mut im = [0.0f32; FFT];
         for n in 0..FFT {
-            let window = 0.5f32 * (1.0 - libm::cosf(2.0 * core::f32::consts::PI * n as f32 / (FFT - 1) as f32))
-                / (FFT - 1) as f32;
-            let at = (self.history_at + n) % FFT;
-            let previous = (at + FFT - 1) % FFT;
+            let at = (self.history_at + n) & (FFT - 1);
+            let previous = (at + FFT - 1) & (FFT - 1);
             let raw = self.history[at];
-            let x = raw * window;
-            let difference = (raw - self.history[previous]) * window;
-            re += x * c;
-            im -= x * s;
-            dre += difference * c;
-            dim -= difference * s;
-            (s, c) = (s * cc + c * ss, c * cc - s * ss);
+            let w = self.window[n];
+            let rev = ((n as u16).reverse_bits() >> SHIFT) as usize;
+            re[rev] = raw * w;
+            im[rev] = (raw - self.history[previous]) * w;
         }
-        let magnitude = libm::sqrtf(re * re + im * im);
-        let q = libm::sqrtf(dre * dre + dim * dim) / (magnitude + 1.0e-40f32);
-        let denominator = libm::sqrt(2.0 * (1.0 - libm::cos(q as f64))).max(1.0e-20);
-        let frequency_hz = (ANALYSIS_RATE / (2.0 * core::f64::consts::PI) * (q * q) as f64 / denominator) as f32;
-        // The analyser compares the doubled positive-frequency magnitude
-        // published by its real-input transform.  This is a peak-domain
-        // comparison; it does not convert the doubled line to RMS.
-        ((2.0f32 * magnitude) as f64, frequency_hz as f64)
+        let mut half = 1usize;
+        while half < FFT {
+            let len = half << 1;
+            let step = FFT / len;
+            let mut base = 0usize;
+            while base < FFT {
+                for j in 0..half {
+                    let (wr, wi) = self.fft_twiddles[j * step];
+                    let even = base + j;
+                    let odd = even + half;
+                    let or = re[odd];
+                    let oi = im[odd];
+                    let tr = wr * or - wi * oi;
+                    let ti = wr * oi + wi * or;
+                    let er = re[even];
+                    let ei = im[even];
+                    re[even] = er + tr;
+                    im[even] = ei + ti;
+                    re[odd] = er - tr;
+                    im[odd] = ei - ti;
+                }
+                base += len;
+            }
+            half = len;
+        }
+        // DC (bin 0): X[0] = re[0], D[0] = im[0].
+        let dc_mag = re[0].abs();
+        let dc_q = im[0].abs() / (dc_mag + 1.0e-40f32);
+        amplitudes[0] = (2.0f32 * dc_mag) as f64;
+        frequencies[0] =
+            (ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * dc_q as f64).clamp(-1.0, 1.0))) as f32 as f64;
+        for bin in 1..=last_bin {
+            let nk = FFT - bin;
+            let (x_re, x_im, d_re, d_im) = if bin == FFT / 2 {
+                (re[bin], 0.0, im[bin], 0.0)
+            } else {
+                (0.5 * (re[bin] + re[nk]), 0.5 * (im[bin] - im[nk]), 0.5 * (im[bin] + im[nk]), 0.5 * (re[nk] - re[bin]))
+            };
+            let magnitude = libm::sqrtf(x_re * x_re + x_im * x_im);
+            let q = libm::sqrtf(d_re * d_re + d_im * d_im) / (magnitude + 1.0e-40f32);
+            // Discrete first-difference magnitude identity: |1 - e^{-j w}| = 2 sin(w / 2).
+            let frequency_hz =
+                (ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * q as f64).clamp(-1.0, 1.0))) as f32;
+            // The analyser compares the doubled positive-frequency magnitude
+            // published by its real-input transform.  This is a peak-domain
+            // comparison; it does not convert the doubled line to RMS.
+            amplitudes[bin] = (2.0f32 * magnitude) as f64;
+            frequencies[bin] = frequency_hz as f64;
+        }
+    }
+
+    #[cfg(test)]
+    fn spectrum(&self, bin: usize) -> (f64, f64) {
+        let mut amplitudes = [0.0; FFT / 2 + 1];
+        let mut frequencies = [0.0; FFT / 2 + 1];
+        self.spectra(bin, &mut amplitudes, &mut frequencies);
+        (amplitudes[bin], frequencies[bin])
     }
 
     fn redesign(&mut self, index: usize) {
@@ -478,64 +543,92 @@ impl Run {
         t.audio_section = audio_rejection(t.frequency_hz as f64, self.fs);
     }
 
-    /// Moves one line's track. A track that is already cutting (gain below
-    /// one) within the match distance continues by the line's deepest cell
-    /// multiplier. A line that starts a track (it lands on an idle track, or
-    /// takes over a released one) starts at its start multiplier: its head
-    /// cell's amplitude against the lowest limit over its cells. Released
-    /// tracks are taken over most-released first, the nearest of equally
-    /// released ones, so idle tracks go before any that still cut.
-    ///
-    /// Black-box against the installed unit (offline renders of its BuzzKill
-    /// box, and the parity gate's own Buzz inputs against the unit's Buzz
-    /// output): a full-level tone that several cells see starts shallower
-    /// than its deepest cell and deepens decision by decision; starting at
-    /// the deepest attenuates up to 1.6 dB faster than the unit from 500 Hz
-    /// to 2 kHz, and up to 3.8 dB on a 1 kHz step up. A second line of the
-    /// same decision does not take over the track the first one has just
-    /// started (a two-line 2 kHz onset would end up 0.4-0.8 dB louder than
-    /// the unit), nor a released track that still cuts while an idle one is
-    /// free (a 250 Hz onset would end up to 1.7 dB louder). The head's own
-    /// limit alone starts a 250 Hz line whose deeper cell has the lower limit
-    /// too shallow (0.3 dB louder settled at a 0.7 volume slider).
+    /// Moves one line's track against the pre-decision snapshot of tracks.
+    /// The first active cutting track (frequency > 0, gain < ACTIVE_GAIN)
+    /// within the match distance owns the line: if unused in this decision it
+    /// retunes and continues by the line's deepest cell multiplier; if already
+    /// used in this decision the candidate is blocked so no second track is
+    /// started for the same spectral region. Otherwise the line takes over the
+    /// most-released unused track above REPLACE_GAIN (nearest on ties): if a
+    /// released track (ACTIVE_GAIN <= gain < 1) already sat at that frequency,
+    /// the line continues from its deepest cell multiplier (retiring the stale
+    /// slot); fresh lines start at the head cell's start multiplier.
     // The index also addresses self.tracks and self.redesign(), which an iterator over used cannot borrow.
     #[allow(clippy::needless_range_loop)]
-    fn update_track(&mut self, frequency_hz: f64, multiplier: f64, start_multiplier: f64, used: &mut [bool; TRACKS]) {
+    fn update_track(
+        &mut self,
+        frequency_hz: f64,
+        multiplier: f64,
+        start_multiplier: f64,
+        snap_freq: &[f32; TRACKS],
+        snap_gain: &[f32; TRACKS],
+        used: &mut [bool; TRACKS],
+    ) {
+        for i in 0..TRACKS {
+            if snap_freq[i] == 0.0 || snap_gain[i] >= ACTIVE_GAIN {
+                continue;
+            }
+            let distance = (frequency_hz - snap_freq[i] as f64).abs() / frequency_hz;
+            if distance < MATCH_RELATIVE {
+                if !used[i] {
+                    let t = &mut self.tracks[i];
+                    t.frequency_hz = frequency_hz as f32;
+                    t.gain = (t.gain * multiplier as f32).clamp(1.0e-6, 1.0);
+                    used[i] = true;
+                    self.redesign(i);
+                }
+                return;
+            }
+        }
+        let mut released_match = None;
+        for i in 0..TRACKS {
+            if used[i] || snap_freq[i] == 0.0 || snap_gain[i] >= 1.0 {
+                continue;
+            }
+            let distance = (frequency_hz - snap_freq[i] as f64).abs() / frequency_hz;
+            if distance < MATCH_RELATIVE {
+                released_match = Some(i);
+                break;
+            }
+        }
         let mut replacement = None;
         let mut replacement_gain = 0.0f32;
         let mut replacement_distance = f64::INFINITY;
         for i in 0..TRACKS {
-            let distance = (frequency_hz - self.tracks[i].frequency_hz as f64).abs() / frequency_hz;
-            if distance < MATCH_RELATIVE && !used[i] {
-                let t = &mut self.tracks[i];
-                t.frequency_hz = frequency_hz as f32;
-                let m = if t.gain < 1.0 { multiplier } else { start_multiplier };
-                t.gain = (t.gain * m as f32).clamp(1.0e-6, 1.0);
-                used[i] = true;
-                self.redesign(i);
-                return;
+            if used[i] {
+                continue;
             }
             let gain = self.tracks[i].gain;
-            let better = gain > replacement_gain || (gain == replacement_gain && distance < replacement_distance);
-            if gain > REPLACE_GAIN as f32 && better {
+            if gain <= REPLACE_GAIN as f32 {
+                continue;
+            }
+            let distance = (frequency_hz - self.tracks[i].frequency_hz as f64).abs() / frequency_hz;
+            if gain > replacement_gain || (gain == replacement_gain && distance < replacement_distance) {
                 replacement = Some(i);
                 replacement_gain = gain;
                 replacement_distance = distance;
             }
         }
         if let Some(i) = replacement {
+            let initial = if let Some(old) = released_match {
+                if old != i {
+                    self.tracks[old].frequency_hz = 0.0;
+                }
+                multiplier
+            } else {
+                start_multiplier
+            };
             let t = &mut self.tracks[i];
             t.frequency_hz = frequency_hz as f32;
-            t.gain = start_multiplier.clamp(1.0e-6, 1.0) as f32;
+            t.gain = initial.clamp(1.0e-6, 1.0) as f32;
             used[i] = true;
             self.redesign(i);
         }
     }
 
     fn analyse(&mut self) {
-        for i in 0..TRACKS {
-            self.tracks[i].gain += self.release * (1.0 - self.tracks[i].gain);
-            self.redesign(i);
+        for track in &mut self.tracks {
+            track.gain += self.release * (1.0 - track.gain);
         }
         // The transformed program uses integer DFT cells; retain one extra
         // cell for candidate neighbour work.
@@ -543,11 +636,7 @@ impl Run {
         let max_bin = bin_count.saturating_sub(1);
         let mut amplitudes = [0.0; FFT / 2 + 1];
         let mut frequencies = [0.0; FFT / 2 + 1];
-        for (bin, value) in amplitudes.iter_mut().enumerate().take(max_bin + 2) {
-            let (amplitude, frequency) = self.spectrum(bin);
-            *value = amplitude;
-            frequencies[bin] = frequency;
-        }
+        self.spectra(max_bin + 1, &mut amplitudes, &mut frequencies);
         // The detector's cell record releases toward one like a track.
         for gain in &mut self.bin_gains {
             *gain += self.release * (1.0 - *gain);
@@ -565,7 +654,7 @@ impl Run {
         let mut pending = [Candidate::default(); TRACKS];
         let mut count = 0usize;
         for bin in 1..=max_bin {
-            let threshold = self.cell_threshold(bin) as f32;
+            let threshold = self.cell_thresholds[bin];
             // The transform reads the dry program; what the sections remove
             // reaches the comparison through the cell record.
             let amplitude = amplitudes[bin] as f32 * self.bin_gains[bin];
@@ -588,8 +677,6 @@ impl Run {
                     frequency_hz,
                     multiplier,
                     record_gain: self.bin_gains[bin],
-                    threshold,
-                    amplitude,
                     start_multiplier: multiplier,
                 };
                 count += 1;
@@ -604,9 +691,22 @@ impl Run {
             }
         }
         let lines = merge_same_line(&mut pending[..count]);
+        let mut snap_freq = [0.0f32; TRACKS];
+        let mut snap_gain = [1.0f32; TRACKS];
+        for i in 0..TRACKS {
+            snap_freq[i] = self.tracks[i].frequency_hz;
+            snap_gain[i] = self.tracks[i].gain;
+        }
         let mut used = [false; TRACKS];
         for c in &pending[..lines] {
-            self.update_track(c.frequency_hz as f64, c.multiplier as f64, c.start_multiplier as f64, &mut used);
+            self.update_track(
+                c.frequency_hz as f64,
+                c.multiplier as f64,
+                c.start_multiplier as f64,
+                &snap_freq,
+                &snap_gain,
+                &mut used,
+            );
         }
         for (gain, update) in self.bin_gains.iter_mut().zip(cell_updates) {
             *gain *= update;
@@ -628,13 +728,12 @@ impl Run {
                 let mut linked = 0.0f32;
                 for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
                     let raw = if buffer[frame].is_finite() { buffer[frame] } else { 0.0 };
-                    if raw.abs() > linked.abs() {
-                        linked = raw;
-                    }
+                    linked += raw;
                     let slot = self.delay_at * self.channels + channel;
                     buffer[frame] = self.delay[slot];
                     self.delay[slot] = raw;
                 }
+                linked /= channels as f32;
                 self.delay_at = (self.delay_at + 1) % self.lookahead;
                 let filtered = filter(self.analysis_lowpass, &mut self.analysis_state, ANALYSIS_GAIN * linked);
                 // Keep the first of every four filtered samples, then pass the
@@ -659,7 +758,7 @@ impl Run {
                 }
                 self.hop = HOST_HOP;
             }
-            let audio_wet_section = wet_smoother(self.fs);
+            let audio_wet_section = self.audio_wet_section;
             for frame in at..at + count {
                 for (channel, buffer) in buffers.iter_mut().take(channels).enumerate() {
                     let mut delayed = buffer[frame];
@@ -741,8 +840,6 @@ mod tests {
             frequency_hz,
             multiplier,
             record_gain,
-            threshold: multiplier,
-            amplitude: 1.0,
             start_multiplier: multiplier,
         };
         // decision order: 1000 Hz first; 1010 Hz is the same line (inside
@@ -750,55 +847,52 @@ mod tests {
         let mut v = [c(1000.0, 0.5, 0.2), c(1010.0, 0.3, 0.4), c(1100.0, 0.8, 0.9), c(990.0, 0.6, 1.0)];
         let n = merge_same_line(&mut v);
         assert_eq!(n, 2);
-        assert_eq!((v[0].frequency_hz, v[0].multiplier, v[0].record_gain), (1000.0, 0.3, 0.2));
-        assert_eq!((v[1].frequency_hz, v[1].multiplier), (1100.0, 0.8));
+        assert_eq!(
+            (v[0].frequency_hz, v[0].multiplier, v[0].start_multiplier, v[0].record_gain),
+            (1000.0, 0.3, 0.5, 0.2)
+        );
+        assert_eq!((v[1].frequency_hz, v[1].multiplier, v[1].start_multiplier), (1100.0, 0.8, 0.8));
         // a shallower same-line cell leaves the line's multiplier alone
         let mut w = [c(500.0, 0.2, 0.5), c(505.0, 0.9, 0.6)];
         assert_eq!(merge_same_line(&mut w), 1);
-        assert_eq!(w[0].multiplier, 0.2);
-        // the start multiplier: the lowest limit over the line's cells
-        // against the head cell's amplitude
-        let mut h = [
-            Candidate {
-                frequency_hz: 245.0,
-                multiplier: 0.8,
-                record_gain: 1.0,
-                threshold: 0.2,
-                amplitude: 0.25,
-                start_multiplier: 0.8,
-            },
-            Candidate {
-                frequency_hz: 250.0,
-                multiplier: 0.6,
-                record_gain: 1.0,
-                threshold: 0.18,
-                amplitude: 0.3,
-                start_multiplier: 0.6,
-            },
-        ];
+        assert_eq!((w[0].multiplier, w[0].start_multiplier), (0.2, 0.2));
+        // the start multiplier stays the head cell's own multiplier
+        let mut h = [c(245.0, 0.8, 1.0), c(250.0, 0.6, 1.0)];
         assert_eq!(merge_same_line(&mut h), 1);
         assert_eq!(h[0].multiplier, 0.6);
-        assert_eq!(h[0].start_multiplier, 0.18f32 / 0.25);
+        assert_eq!(h[0].start_multiplier, 0.8);
         // the band edges are strict
         let mut e = [c(1000.0, 0.5, 0.5), c(1000.0 * CANDIDATE_UPPER, 0.1, 0.6)];
         assert_eq!(merge_same_line(&mut e), 2);
         assert_eq!(e[0].multiplier, 0.5);
     }
 
+    fn snapshot(r: &Run) -> ([f32; TRACKS], [f32; TRACKS]) {
+        let mut sf = [0.0f32; TRACKS];
+        let mut sg = [1.0f32; TRACKS];
+        for i in 0..TRACKS {
+            sf[i] = r.tracks[i].frequency_hz;
+            sg[i] = r.tracks[i].gain;
+        }
+        (sf, sg)
+    }
+
     #[test]
     fn a_line_starts_a_track_at_its_start_multiplier_and_deepens_a_cutting_one() {
         let mut r = Run::new(&Params::default(), 48_000.0, 1);
         let gain_at = |r: &Run, f: f32| r.tracks.iter().find(|t| t.frequency_hz == f).map(|t| t.gain);
-        // an idle track (gain one) within the match distance: the start multiplier
+        // an unassigned idle track is not matched directly: replacement installs it at start_multiplier
+        let (sf, sg) = snapshot(&r);
         let mut used = [false; TRACKS];
-        r.update_track(1010.0, 0.3, 0.6, &mut used);
+        r.update_track(1010.0, 0.3, 0.6, &sf, &sg, &mut used);
         assert_eq!(gain_at(&r, 1010.0), Some(0.6));
-        // a line far from every track takes over a released one: the start multiplier too
-        r.update_track(3000.0, 0.2, 0.7, &mut used);
+        // a second line far from active tracks takes another idle track at start_multiplier
+        r.update_track(3000.0, 0.2, 0.7, &sf, &sg, &mut used);
         assert_eq!(gain_at(&r, 3000.0), Some(0.7));
         // the next decision continues the cutting track by the deepest multiplier
+        let (sf, sg) = snapshot(&r);
         let mut used = [false; TRACKS];
-        r.update_track(1000.0, 0.5, 0.9, &mut used);
+        r.update_track(1000.0, 0.5, 0.9, &sf, &sg, &mut used);
         assert_eq!(gain_at(&r, 1000.0), Some(0.3));
         assert_eq!(r.tracks.iter().filter(|t| t.gain < 1.0).count(), 2);
     }
@@ -808,16 +902,16 @@ mod tests {
         let mut r = Run::new(&Params::default(), 48_000.0, 1);
         r.tracks[0].frequency_hz = 2000.0;
         r.tracks[0].gain = 0.9;
-        // 1900 Hz is outside the match distance of 2000 Hz and nearer to it
-        // than to the idle 1000 Hz tracks; the released track still cuts
+        // 1900 Hz is outside the match distance of 2000 Hz; an idle track is taken over first
+        let (sf, sg) = snapshot(&r);
         let mut used = [false; TRACKS];
-        r.update_track(1900.0, 0.5, 0.85, &mut used);
+        r.update_track(1900.0, 0.5, 0.85, &sf, &sg, &mut used);
         assert_eq!((r.tracks[0].frequency_hz, r.tracks[0].gain), (2000.0, 0.9));
         let started = r.tracks.iter().position(|t| t.frequency_hz == 1900.0).expect("started");
         assert_eq!(r.tracks[started].gain, 0.85);
-        // a second line of the same decision, just outside the match distance,
-        // leaves the just-started (still released-looking) track alone
-        r.update_track(1830.0, 0.4, 0.8, &mut used);
+        // a second line of the same decision, outside the match distance,
+        // leaves the just-started track alone
+        r.update_track(1830.0, 0.4, 0.8, &sf, &sg, &mut used);
         assert_eq!((r.tracks[started].frequency_hz, r.tracks[started].gain), (1900.0, 0.85));
         assert_eq!((r.tracks[0].frequency_hz, r.tracks[0].gain), (2000.0, 0.9));
         assert!(r.tracks.iter().any(|t| t.frequency_hz == 1830.0 && t.gain == 0.8));
@@ -826,9 +920,131 @@ mod tests {
             t.gain = 0.95;
         }
         r.tracks[7].gain = 0.97;
+        let (sf, sg) = snapshot(&r);
         let mut used = [false; TRACKS];
-        r.update_track(5000.0, 0.5, 0.6, &mut used);
+        r.update_track(5000.0, 0.5, 0.6, &sf, &sg, &mut used);
         assert_eq!((r.tracks[7].frequency_hz, r.tracks[7].gain), (5000.0, 0.6));
+    }
+
+    #[test]
+    fn active_track_wins_over_released_ghost_and_blocks_duplicate() {
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        r.tracks[0].frequency_hz = 118.4;
+        r.tracks[0].gain = 0.9999995;
+        r.tracks[1].frequency_hz = 125.9;
+        r.tracks[1].gain = 0.7;
+        let (sf, sg) = snapshot(&r);
+        let mut used = [false; TRACKS];
+        // 122.5 Hz matches active track 1 rather than released track 0
+        r.update_track(122.5, 0.8, 0.8, &sf, &sg, &mut used);
+        assert_eq!((r.tracks[0].frequency_hz, r.tracks[0].gain), (118.4, 0.9999995));
+        assert_eq!((r.tracks[1].frequency_hz, r.tracks[1].gain), (122.5, 0.56));
+        // a second candidate still inside track 1's snapshot match distance is blocked
+        r.update_track(128.0, 0.7, 0.7, &sf, &sg, &mut used);
+        assert_eq!(r.tracks.iter().filter(|t| t.gain < 0.99).count(), 1);
+    }
+
+    #[test]
+    fn released_track_match_continues_in_replacement_slot_and_retires_stale_slot() {
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        r.tracks[0].frequency_hz = 1600.0;
+        r.tracks[0].gain = 0.9999995;
+        let (sf, sg) = snapshot(&r);
+        let mut used = [false; TRACKS];
+        r.update_track(1605.0, 0.3, 0.7, &sf, &sg, &mut used);
+        assert_eq!(r.tracks[0].frequency_hz, 0.0);
+        let installed = r.tracks.iter().position(|t| t.frequency_hz == 1605.0).expect("installed");
+        assert_ne!(installed, 0);
+        assert_eq!(r.tracks[installed].gain, 0.3);
+    }
+
+    #[test]
+    fn stereo_channel_linking_averages_channels() {
+        // Out-of-phase identical sines cancel under arithmetic mean linking,
+        // so no track activates even far above threshold.
+        let p = Params { threshold_db: -40.0, ..Default::default() };
+        let mut r = Run::new(&p, 48_000.0, 2);
+        let mut left = line(1000.0, 0.8, 4 * HOST_HOP);
+        let mut right: Vec<f32> = left.iter().map(|v| -v).collect();
+        r.process(&mut [&mut left, &mut right], 4 * HOST_HOP);
+        assert!(r.tracks.iter().all(|t| t.gain == 1.0));
+        // A single-channel tone has half the amplitude of an in-phase dual-channel tone.
+        let mut r_one = Run::new(&p, 48_000.0, 2);
+        let mut l1 = line(1000.0, 0.8, 4 * HOST_HOP);
+        let mut r1 = vec![0.0f32; 4 * HOST_HOP];
+        r_one.process(&mut [&mut l1, &mut r1], 4 * HOST_HOP);
+        let mut r_both = Run::new(&p, 48_000.0, 2);
+        let mut l2 = line(1000.0, 0.4, 4 * HOST_HOP);
+        let mut r2 = l2.clone();
+        r_both.process(&mut [&mut l2, &mut r2], 4 * HOST_HOP);
+        let min_one = r_one.tracks.iter().map(|t| t.gain).fold(1.0f32, f32::min);
+        let min_both = r_both.tracks.iter().map(|t| t.gain).fold(1.0f32, f32::min);
+        assert!((min_one - min_both).abs() < 1.0e-5, "{min_one} vs {min_both}");
+    }
+
+    #[test]
+    fn threshold_shape_is_designed_at_host_rate() {
+        let mut p = Params { threshold_db: -20.0, ..Default::default() };
+        p.bands[0] = Band { enabled: true, frequency_hz: 2000.0, gain_db: -12.0, quality: 2.0 };
+        let r = Run::new(&p, 48_000.0, 1);
+        let host_sec = threshold_peak(-12.0, 2000.0, 2.0, 48_000.0);
+        let expected = libm::pow(10.0, (-20.0 + 20.0 * libm::log10(host_sec.magnitude(2000.0, 48_000.0))) / 20.0);
+        assert!((r.threshold(2000.0) - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn first_difference_refinement_recovers_high_frequency_tones() {
+        // At 2000 Hz (12 kHz analysis rate, w = pi/3), exact arcsin recovers 2000 Hz
+        // without the small-angle bias of q^2 / sqrt(2*(1 - cos(q))).
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        for (n, slot) in r.history.iter_mut().enumerate().take(FFT) {
+            *slot = libm::sin(2.0 * core::f64::consts::PI * 2000.0 * n as f64 / ANALYSIS_RATE) as f32;
+        }
+        r.history_len = FFT;
+        let bin = libm::round(2000.0 * FFT as f64 / ANALYSIS_RATE) as usize;
+        let (_amp, freq) = r.spectrum(bin);
+        assert!((freq - 2000.0).abs() < 1.0, "expected ~2000 Hz, got {freq}");
+    }
+
+    #[test]
+    fn packed_fft_spectra_matches_direct_dft() {
+        let mut r = Run::new(&Params::default(), 48_000.0, 1);
+        for (n, slot) in r.history.iter_mut().enumerate().take(FFT) {
+            let t = n as f64 / ANALYSIS_RATE;
+            *slot = (0.6 * libm::sin(2.0 * core::f64::consts::PI * 333.0 * t)
+                + 0.35 * libm::cos(2.0 * core::f64::consts::PI * 1777.0 * t + 0.4)
+                + 0.15 * libm::sin(2.0 * core::f64::consts::PI * 4123.0 * t)) as f32;
+        }
+        r.history_at = 73;
+        r.history_len = FFT;
+        let mut amps = [0.0; FFT / 2 + 1];
+        let mut freqs = [0.0; FFT / 2 + 1];
+        r.spectra(FFT / 2, &mut amps, &mut freqs);
+        for bin in 0..=FFT / 2 {
+            let (mut re, mut im, mut dre, mut dim) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for n in 0..FFT {
+                let at = (r.history_at + n) % FFT;
+                let prev = (at + FFT - 1) % FFT;
+                let w = r.window[n] as f64;
+                let raw = r.history[at] as f64;
+                let x = raw * w;
+                let d = (raw - r.history[prev] as f64) * w;
+                let ang = 2.0 * core::f64::consts::PI * (bin * n) as f64 / FFT as f64;
+                let (s, c) = (libm::sin(ang), libm::cos(ang));
+                re += x * c;
+                im -= x * s;
+                dre += d * c;
+                dim -= d * s;
+            }
+            let mag = libm::sqrt(re * re + im * im);
+            let exp_amp = 2.0 * mag;
+            assert!((amps[bin] - exp_amp).abs() < 1.0e-5, "bin {bin}: {} vs {exp_amp}", amps[bin]);
+            if exp_amp > 1.0e-3 {
+                let q = libm::sqrt(dre * dre + dim * dim) / (mag + 1.0e-40);
+                let exp_freq = ANALYSIS_RATE / core::f64::consts::PI * libm::asin((0.5 * q).clamp(-1.0, 1.0));
+                assert!((freqs[bin] - exp_freq).abs() < 0.05, "bin {bin}: {} vs {exp_freq}", freqs[bin]);
+            }
+        }
     }
 
     #[test]
