@@ -1,0 +1,21 @@
+name: hwfact-lint
+
+# Flags hardware facts written as literals in added lines (warnings first).
+# Rule: https://github.com/aurora-silicon/agent-guidelines/blob/main/pre-pr-checklist.md
+# Accept a line with '# hwfact-ok: <reason>', or a path in .hwfact-allow.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: hwfact-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  hwfact-lint:
+    uses: aurora-silicon/.github/.github/workflows/hwfact-lint.yml@main
