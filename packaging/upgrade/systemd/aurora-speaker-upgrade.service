@@ -6,6 +6,9 @@ Documentation=https://github.com/aurora-silicon/speakerguardd/blob/v2/packaging/
 # bundle does nothing. Any failure switches nothing and starts no older
 # speaker daemon: where v2 does not run, the kernel's own limit holds them.
 After=local-fs.target sound.target systemd-udev-settle.service network-online.target
+# Let the Stage 2 trial commit before a slow restore image fetch. The
+# optional commit service is ordered only when the boot already starts it.
+After=multi-user.target aurora-stage2-commit.service
 Wants=network-online.target
 ConditionPathExists=/proc/device-tree/compatible
 

@@ -104,6 +104,10 @@ speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
 outcome, not a failure. `run` by hand always tries again.
 
+The boot service runs after `multi-user.target` and any scheduled Aurora
+Stage 2 commit. A slow restore image fetch can then finish independently
+of the Stage 2 rollback deadline.
+
 The boot unit also moves a speaker only once protected playback on it is on
 record. speakerguardd v2's gate data (`packaging/session/gate.json`,
 installed as `/usr/share/speakerguardd/gate.json`) lists in `playback_rows`,
