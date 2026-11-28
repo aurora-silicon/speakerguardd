@@ -1163,6 +1163,100 @@ pub struct Nest<'a> {
     pub dev_drop_tone_types: u64,
 }
 
+/// The region between a `split` box and the `join` that gathers its
+/// outputs back, as a stand-alone graph (input wired to the split, the
+/// join wired to the output) for [`nested`]. Every path out of the split
+/// must reach that one join without leaving the region.
+fn split_region(g: &Graph, split: &str) -> Result<(Graph, String, Vec<String>)> {
+    let mut members: Vec<String> = Vec::new();
+    let mut join: Option<String> = None;
+    let mut todo: Vec<String> = vec![split.to_string()];
+    while let Some(n) = todo.pop() {
+        for w in g.wires.iter().filter(|w| w.src.node == n) {
+            let d = &w.dst.node;
+            let bx = g.find_box(d).ok_or_else(|| bad(format!("split region of {split}: {d} is not a box")))?;
+            if subtype(bx) == "join" {
+                match &join {
+                    Some(j) if j != d => {
+                        return Err(bad(format!("split region of {split}: two joins ({j}, {d})")));
+                    }
+                    _ => join = Some(d.clone()),
+                }
+                continue;
+            }
+            if subtype(bx) == "split" || members.len() > 64 {
+                return Err(bad(format!("split region of {split}: nested split or too large at {d}")));
+            }
+            if !members.contains(d) {
+                members.push(d.clone());
+                todo.push(d.clone());
+            }
+        }
+    }
+    let join = join.ok_or_else(|| bad(format!("split region of {split}: no join")))?;
+    // every input of every member and of the join comes from inside the region
+    let inside = |n: &str| n == split || members.iter().any(|m| m == n);
+    for w in g.wires.iter().filter(|w| w.dst.node == join || members.contains(&w.dst.node)) {
+        if !inside(&w.src.node) {
+            return Err(bad(format!("split region of {split}: {} feeds {} from outside", w.src.node, w.dst.node)));
+        }
+    }
+    let (i, o) = ("__region_in".to_string(), "__region_out".to_string());
+    let keep = |n: &str| n == split || n == join || members.iter().any(|m| m == n);
+    let mut sub = g.clone();
+    sub.inputs = vec![i.clone()];
+    sub.outputs = vec![o.clone()];
+    sub.boxes.retain(|b| keep(&b.name));
+    let into_split = g
+        .wires
+        .iter()
+        .find(|w| w.dst.node == split)
+        .cloned()
+        .ok_or_else(|| bad(format!("split region of {split}: nothing feeds the split")))?;
+    let out_of_join = g
+        .wires
+        .iter()
+        .find(|w| w.src.node == join && w.src.port == 0)
+        .cloned()
+        .ok_or_else(|| bad(format!("split region of {split}: the join feeds nothing")))?;
+    let mut wires: Vec<dspg::Wire> =
+        g.wires.iter().filter(|w| keep(&w.src.node) && keep(&w.dst.node)).cloned().collect();
+    let mut a = into_split;
+    a.src = dspg::Endpoint { node: i, port: 0 };
+    let mut z = out_of_join;
+    z.dst = dspg::Endpoint { node: o, port: 0 };
+    wires.insert(0, a);
+    wires.push(z);
+    sub.wires = wires;
+    // Graph parameters reach the region's boxes unchanged: keep the
+    // declarations and every link into a region box (the caller passes the
+    // resolved values). A link that crosses the region boundary (a
+    // parameter box outside driving a box inside, or the reverse) or a
+    // property link into the region cannot be preserved: refuse.
+    for l in &g.box_param_links {
+        if keep(&l.from.node) != keep(&l.to.node) {
+            return Err(bad(format!(
+                "split region of {split}: parameter link {} -> {} crosses the region",
+                l.from.node, l.to.node
+            )));
+        }
+    }
+    if let Some(l) = g.box_property_links.iter().find(|l| keep(&l.from.node) || keep(&l.to.node)) {
+        return Err(bad(format!(
+            "split region of {split}: property link {} -> {} not carried",
+            l.from.node, l.to.node
+        )));
+    }
+    if let Some(l) = g.property_links.iter().find(|l| keep(&l.target.node)) {
+        return Err(bad(format!("split region of {split}: property {} -> {} not carried", l.name, l.target.node)));
+    }
+    sub.param_links.retain(|l| keep(&l.target.node));
+    sub.box_param_links.retain(|l| keep(&l.from.node) && keep(&l.to.node));
+    sub.box_property_links.clear();
+    sub.property_links.clear();
+    Ok((sub, join, members))
+}
+
 /// A nested graph (`aufx/dspg` box) flattened into one voicing chain: its
 /// filter boxes, `split`/`join` routing, `asum` sums and dB gains, at the
 /// static values of its parameter logic. `width` is the parent's wire.
@@ -1640,6 +1734,61 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
         if (fan.len() as u32) != bx.inputs {
             r.refusals.push(format!("{nx}: {} of its {} inputs come from {node}", fan.len(), bx.inputs));
             break;
+        }
+        // A split that fans the channels into per-channel boxes and a join
+        // that gathers them back: carry the region as one sub-graph stage
+        // (the nested-graph compiler already flattens split/join routing,
+        // gains and filter boxes).
+        if subtype(bx) == "split" && domain != Domain::Freq {
+            match split_region(&g, &nx) {
+                Ok((sub_g, join, members)) => {
+                    let mut dropped = Vec::new();
+                    let nest = Nest {
+                        graph: &sub_g,
+                        strip: &strip,
+                        props: props.as_ref(),
+                        parent_params: &graph_params,
+                        width: in_w,
+                        fs: fs as f64,
+                        dev_drop_tone_types: opts.dev_drop_tone_types,
+                    };
+                    let stages = if domain == Domain::PostTime { &mut post } else { &mut pre };
+                    match nested(&nest, &mut r.notes, &mut dropped) {
+                        Ok(spec) => {
+                            let n = spec.nodes.len();
+                            stages.push(Stage::Graph(spec));
+                            let dom = "time";
+                            r.stage(
+                                &nx,
+                                "split",
+                                dom,
+                                Status::Exact,
+                                format!("split/join region ({}) flattened to {n} nodes", members.join(", ")),
+                            );
+                            if !dropped.is_empty() {
+                                r.refusals.push(format!(
+                                    "{nx}: development option switched off {} (analysis only, never a blob)",
+                                    dropped.join(", ")
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            r.stage(&nx, "split", "time", Status::Refused, err.to_string());
+                            r.refusals.push(err.to_string());
+                            break;
+                        }
+                    }
+                    visited.extend(members);
+                    visited.push(join.clone());
+                    node = join;
+                    continue;
+                }
+                Err(err) => {
+                    r.stage(&nx, "split", "time", Status::Refused, err.to_string());
+                    r.refusals.push(err.to_string());
+                    break;
+                }
+            }
         }
         let e = strip.effect(&nx);
         let ov = overrides.get(&nx).cloned().unwrap_or_default();
