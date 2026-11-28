@@ -1,4 +1,4 @@
-policy_module(speakerguardd, 0.1.0)
+policy_module(speakerguardd, 0.2.0)
 
 # TODO(lane D, #211): complete and test in enforcing mode on every machine; the
 # gate is zero AVCs (ausearch -m AVC,USER_AVC -ts boot) after the full
@@ -70,3 +70,16 @@ files_type(speakerguardd_var_lib_t)
 files_search_var_lib(speakerguardd_t)
 list_dirs_pattern(speakerguardd_t, speakerguardd_var_lib_t, speakerguardd_var_lib_t)
 read_files_pattern(speakerguardd_t, speakerguardd_var_lib_t, speakerguardd_var_lib_t)
+
+# The upgrade tool's root-only store has private state beside the bundle.
+# Traverse that directory, but read only the exact bundle subtree. The
+# required provisioning oneshot restores these labels before every start,
+# including existing stores and bundles replaced by the upgrade tool.
+type speakerguardd_upgrade_store_t;
+files_type(speakerguardd_upgrade_store_t)
+allow speakerguardd_t speakerguardd_upgrade_store_t:dir search;
+
+type speakerguardd_upgrade_bundle_t;
+files_type(speakerguardd_upgrade_bundle_t)
+list_dirs_pattern(speakerguardd_t, speakerguardd_upgrade_bundle_t, speakerguardd_upgrade_bundle_t)
+read_files_pattern(speakerguardd_t, speakerguardd_upgrade_bundle_t, speakerguardd_upgrade_bundle_t)

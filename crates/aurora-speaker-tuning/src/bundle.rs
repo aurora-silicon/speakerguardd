@@ -69,7 +69,15 @@ impl Bundle {
 
     /// Loads and verifies a bundle from an unpacked directory.
     pub fn from_dir(dir: &Path) -> Result<Bundle> {
-        let mname = if dir.join(manifest::NAME).exists() { manifest::NAME } else { manifest::COLLECTOR_NAME };
+        // Only an absent installer manifest permits the legacy collector
+        // path. In particular, a denied stat must keep its path and error
+        // instead of looking like a missing metadata.json.
+        let manifest_path = dir.join(manifest::NAME);
+        let mname = match std::fs::metadata(&manifest_path) {
+            Ok(_) => manifest::NAME,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => manifest::COLLECTOR_NAME,
+            Err(e) => return Err(io(&manifest_path, e)),
+        };
         let mbytes = std::fs::read(dir.join(mname)).map_err(|e| io(&dir.join(mname), e))?;
         let manifest =
             if mname == manifest::NAME { Manifest::parse(&mbytes)? } else { Manifest::parse_collector(&mbytes)? };

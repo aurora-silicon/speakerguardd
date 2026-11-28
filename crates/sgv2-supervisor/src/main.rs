@@ -1,10 +1,11 @@
 //! speakerguardd v2: the supervisor loop.
 //!
 //! ```text
-//! speakerguardd [--card <N|ID>] --pcm <D> --uid <UID> --params <blob> [--selfcheck <record>]
+//! speakerguardd [--card <N|ID>] --pcm <D> --uid <UID> [--bundle <path>] [--voicing-pre] [--selfcheck <record>]
 //! ```
 //!
-//! - Identifies the Mac from the device tree and refuses a parameter blob
+//! - Compiles the Mac's verified tuning bundle at startup using its device-tree
+//!   board, unit identity and speaker ID. Refuses a parameter blob
 //!   compiled for another board, for another channel count, or with no
 //!   operating point or CRC (exit 78, not restarted).
 //! - Refuses to run without a passing first-boot self-check
@@ -44,7 +45,12 @@
 //! - Exits on losing ownership or any kernel error: closing the control file
 //!   withdraws protection at once.
 //!
-//! TODO(lane A, #209): compile the blob from the bundle instead of `--params`.
+//! Bundle discovery uses the tuning library's vendor-firmware/ESP search.
+//! `--bundle` selects an explicit directory or archive. `--voicing-pre` carries
+//! provisioning's full-voicing choice; otherwise the pre-stage is identity.
+
+#[cfg(target_os = "linux")]
+mod startup;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -65,10 +71,11 @@ mod linux {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
+    use crate::startup::{self, Environment};
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
     use sgv2_supervisor::lease::{Observation, Regrant};
-    use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, Machine};
+    use sgv2_supervisor::machine::Machine;
     use sgv2_supervisor::observe::{
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
         speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
@@ -686,10 +693,6 @@ mod linux {
         }
     }
 
-    fn arg(args: &[String], name: &str) -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
-    }
-
     /// The card index for `--card` (an index or an ALSA card id), once the
     /// card is there.
     fn card_index(card: &str) -> Option<u32> {
@@ -874,119 +877,72 @@ mod linux {
         Ok(())
     }
 
+    struct Startup<'a> {
+        selfcheck: &'a str,
+        run_dir: &'a Path,
+        user_dir: &'a Path,
+    }
+
+    impl Environment for Startup<'_> {
+        fn identity(&mut self) -> Result<(aurora_speaker_tuning::machine::Machine, Option<u32>), String> {
+            use aurora_speaker_tuning::machine::{self, Machine};
+            let dt = Path::new(machine::DEVICE_TREE);
+            let machine = Machine::from_device_tree(dt).map_err(|e| e.to_string())?;
+            let speaker_id = machine::speaker_id(dt).map_err(|e| e.to_string())?;
+            Ok((machine, speaker_id))
+        }
+
+        fn bundle(
+            &mut self,
+            path: Option<&Path>,
+        ) -> aurora_speaker_tuning::Result<aurora_speaker_tuning::bundle::Bundle> {
+            use aurora_speaker_tuning::bundle::Bundle;
+            match path {
+                Some(path) => Bundle::open(path),
+                None => Bundle::discover(),
+            }
+        }
+
+        fn selfcheck(&mut self) -> Result<selfcheck::Bind, String> {
+            read_selfcheck(self.selfcheck)
+        }
+
+        fn kernel_release(&mut self) -> Result<String, String> {
+            kernel_release().ok_or_else(|| "uname failed".into())
+        }
+
+        fn publish(&mut self, blob: &[u8]) -> Result<(), String> {
+            startup::publish_atomic(self.run_dir, self.user_dir, blob)
+                .map_err(|e| format!("publishing parameters: {e}"))
+        }
+    }
+
     pub fn run() -> i32 {
-        let args: Vec<String> = std::env::args().collect();
-        let (Some(pcm), Some(uid), Some(params)) = (arg(&args, "--pcm"), arg(&args, "--uid"), arg(&args, "--params"))
-        else {
-            eprintln!("usage: speakerguardd [--card N|ID] --pcm D --uid UID --params BLOB");
-            return EX_CONFIG;
-        };
-        let (Ok(pcm), Ok(uid)) = (pcm.parse::<u32>(), uid.parse::<u32>()) else {
-            eprintln!("bad --pcm or --uid");
-            return EX_CONFIG;
-        };
-        let compatible = std::fs::read("/proc/device-tree/compatible").unwrap_or_default();
-        let Some(board) = board_from_compatible(&compatible) else {
-            eprintln!("no Apple board in /proc/device-tree/compatible");
-            return EX_CONFIG;
-        };
-        let bind = match read_selfcheck(&arg(&args, "--selfcheck").unwrap_or_else(|| SELFCHECK.to_owned())) {
-            Ok(b) => b,
+        let options = match startup::Options::parse(std::env::args().skip(1)) {
+            Ok(o) => o,
             Err(why) => {
-                eprintln!("no self-check record: {why}; not granting (the kernel floor stays)");
+                eprintln!("{why}\n{}", startup::USAGE);
                 return EX_CONFIG;
             }
         };
-        let machine = match selfcheck::machine_for(&board, &bind) {
-            Ok(m) => m,
-            Err(why) => {
-                eprintln!("{why}; not granting (the kernel floor stays)");
-                return EX_CONFIG;
-            }
-        };
-        let card = arg(&args, "--card").unwrap_or_else(|| machine.card_id.to_owned());
-
-        let blob = match std::fs::read(&params) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("{params}: {e}");
-                return EX_CONFIG;
-            }
-        };
-        let header = match sgv2_core::blob::Header::parse(&blob) {
-            Ok((h, _)) => h,
-            Err(e) => {
-                eprintln!("{params}: not a valid parameter blob ({e:?})");
-                return EX_CONFIG;
-            }
-        };
-        let refuse = |why: String| {
-            eprintln!("{params}: {why}; refusing it (the kernel floor stays)");
-            EX_CONFIG
-        };
-        if header.machine() != Some(board.as_str()) {
-            return refuse(format!("compiled for {:?}, this Mac is {board}", header.machine()));
-        }
-        if header.channels as usize != machine.amps {
-            return refuse(format!("{} channels, {board} has {} amps", header.channels, machine.amps));
-        }
-        if header.full_scale_mv == 0 {
-            return refuse("states no operating point".into());
-        }
-        if header.payload_crc == 0 {
-            return refuse("payload CRC 0".into());
-        }
-        if !(8_000..=192_000).contains(&header.sample_rate) {
-            return refuse(format!("sample rate {}", header.sample_rate));
-        }
-        // The Mac's own filtering ahead of the unit: the plugin runs it and
-        // refuses a blob whose pre-stage is bad, so the supervisor does too.
-        if let Err(e) = sgv2_core::blob::voicing(&blob) {
-            return refuse(format!("voicing rejected ({e:?})"));
-        }
-        let crossover = match sgv2_core::blob::prestage(&blob, header.sample_rate as f64) {
-            Ok(p) => p.from_tuning(),
-            Err(e) => return refuse(format!("pre-stage rejected ({e:?})")),
-        };
-        let full_scales = match blob_full_scales(&blob) {
-            Ok(v) => v,
-            Err(why) => return refuse(why),
-        };
-        let engine_crc = match sgv2_core::blob::engine_crc(&blob) {
-            Ok(crc) if crc != 0 => crc,
-            _ => return refuse("invalid deployment identity".into()),
-        };
-        let params_sha256 = aurora_speaker_tuning::manifest::sha256_hex(&blob);
-        let Some(kernel_rel) = kernel_release() else {
-            eprintln!("uname failed");
-            return EX_UNAVAILABLE;
-        };
-        if let Err(why) = selfcheck::covers(&bind, &board, &kernel_rel, &params_sha256) {
-            eprintln!("{why}; not granting (the kernel floor stays)");
-            return EX_CONFIG;
-        }
-        eprintln!(
-            "self-check: {} wiring {:016x} ({}), kernel {}, params {}",
-            board,
-            bind.wiring,
-            bind.method,
-            bind.kernel,
-            &params_sha256[..12]
-        );
-
+        let (pcm, uid) = (options.pcm, options.uid);
         let run_dir = Path::new("/run/speakerguardd");
         let user_dir = run_dir.join(uid.to_string());
-        let publish = || -> std::io::Result<()> {
-            std::fs::create_dir_all(&user_dir)?;
-            let tmp = run_dir.join(".params.bin.new");
-            std::fs::write(&tmp, &blob)?;
-            std::fs::rename(&tmp, run_dir.join("params.bin"))?;
-            Ok(())
-        };
-        if let Err(e) = publish() {
-            eprintln!("publishing parameters: {e}");
-            return EX_UNAVAILABLE;
-        }
+        let mut env =
+            Startup { selfcheck: options.selfcheck.as_deref().unwrap_or(SELFCHECK), run_dir, user_dir: &user_dir };
+        let startup::Prepared { board, bind, machine, header, crossover, full_scales, engine_crc } =
+            match startup::start(&mut env, options.bundle.as_deref(), options.voicing_pre) {
+                Ok(p) => p,
+                Err(error) => {
+                    let (why, code) = match error {
+                        startup::Error::Config(why) => (why, EX_CONFIG),
+                        startup::Error::Unavailable(why) => (why, EX_UNAVAILABLE),
+                    };
+                    eprintln!("{why}; not granting (the kernel floor stays)");
+                    return code;
+                }
+            };
+        let card = options.card.unwrap_or_else(|| machine.card_id.to_owned());
         let page_path = user_dir.join("engine");
         let page = match engine_page(&page_path, uid) {
             Ok(p) => p,

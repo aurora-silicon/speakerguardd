@@ -45,7 +45,7 @@ Unusable sense makes the affected channel run open loop, as on macOS. Invalid pa
 ## Supervisor and kernel
 
 `speakerguardd` does no signal processing. It:
-- loads and verifies the bundle, and publishes a compiled parameter blob that the plugin loads;
+- loads and verifies the bundle, compiles it at every start through the tuning library, and publishes the blob only after the exact self-check/kernel binding passes (see [startup](NEW-PLATFORM.md#supervisor-startup));
 - holds the kernel's speaker interlock, with the amplifier at the operating point the tuning assumes.
 
 It renews the interlock only while a client stream plays into the protect stage (the session helper reports it) and these all hold:
