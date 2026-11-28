@@ -4,6 +4,7 @@ speakerguardd may grant.
 
     speakerguardd-selfcheck run      --params BLOB [--force] [--defer] [--switch-interface] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck pending
+    speakerguardd-selfcheck audio-fingerprint
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
@@ -1604,7 +1605,7 @@ def cmd_generate(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
-    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify"])
+    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify", "audio-fingerprint"])
     ap.add_argument("--params")
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
@@ -1626,6 +1627,12 @@ def main():
                          "aurora-speaker-upgrade --check passes its private root's)")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
     args = ap.parse_args()
+    if args.cmd == "audio-fingerprint":
+        try:
+            print(audio_of(wiring.read_dt()))
+        except (OSError, ValueError, wiring.Refused):
+            return 1
+        return 0
     if args.cmd in ("run", "check", "verify") and not args.params:
         ap.error("--params is required")
     if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):

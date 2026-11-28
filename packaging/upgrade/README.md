@@ -99,7 +99,8 @@ daemon starts), 2 not now (retry), 3 internal error (nothing switched).
 
 At boot (`aurora-speaker-upgrade.service`, `run --at-boot`), a refusal is
 recorded in `/var/lib/aurora-speaker-upgrade/refused.json` and not tried
-again until the kernel, speakerguardd v2's provisioning or self-check, the
+again until the kernel, the live speaker wiring or sound modules,
+speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
 outcome, not a failure. `run` by hand always tries again.
 
