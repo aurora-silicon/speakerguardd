@@ -26,7 +26,7 @@ GATE_PY=${GATE_PY:-python3}
 # 1. fetch
 if [ "${SKIP_FETCH:-0}" != 1 ]; then
 ssh "${FOPT[@]}" "$FETCHER" "rm -rf /var/tmp/attest-build && mkdir -p /var/tmp/attest-build"
-tar -C "$R" -cf - tools/diffrig/aidgate/ipsw_units.py packaging/upgrade/aurora_speaker_upgrade | ssh "${FOPT[@]}" "$FETCHER" "tar -C /var/tmp/attest-build -xf -"
+tar -C "$R" -cf - tools/diffrig/aidgate/ipsw_units.py packaging/upgrade/aurora_speaker_upgrade packaging/upgrade/share | ssh "${FOPT[@]}" "$FETCHER" "tar -C /var/tmp/attest-build -xf -"
 ssh "${FOPT[@]}" "$FETCHER" "cd /var/tmp/attest-build && python3 -I tools/diffrig/aidgate/ipsw_units.py $BUILD $BOARD out --ipsw '$URL'" > "$D/units.json"
 ssh "${FOPT[@]}" "$FETCHER" "tar -C /var/tmp/attest-build/out -cf - ." | tar -C "$D" -xf -; ssh "${FOPT[@]}" "$FETCHER" "rm -rf /var/tmp/attest-build"
 fi

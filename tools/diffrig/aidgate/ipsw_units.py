@@ -20,8 +20,12 @@ does not load: those builds need a host on that macOS.
 import argparse, hashlib, json, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "packaging", "upgrade"))
-from aurora_speaker_upgrade import apfs_ro, ipsw  # noqa: E402
+UPGRADE = os.path.join(HERE, "..", "..", "..", "packaging", "upgrade")
+sys.path.insert(0, UPGRADE)
+from aurora_speaker_upgrade import ipsw  # noqa: E402
+from aurora_speaker_upgrade.asahi_firmware import apfs_ro  # noqa: E402
+# This tree's pin, not an installed (possibly older) /usr/share copy
+PIN = os.path.join(UPGRADE, "share", "restore-images.json")
 
 UNIT = "/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP"
 
@@ -31,7 +35,13 @@ def main():
     ap.add_argument("build"); ap.add_argument("board"); ap.add_argument("out")
     ap.add_argument("--ipsw"); ap.add_argument("--no-tunings", action="store_true")
     a = ap.parse_args()
-    vol, _, got = ipsw.open_system(ipsw.find_url(a.build, a.ipsw), a.board, a.build)
+    release, entries = ipsw._pin_entries([PIN])
+    pinned = {b: u for b, u, _ in entries}
+    url = a.ipsw or pinned.get(a.build)
+    if not url:
+        sys.exit(f"macOS {a.build} is not in {PIN} (pinned: {', '.join(pinned)}); pass --ipsw URL")
+    vol = ipsw.open_system(a.board, images=(release, entries), url=url)[0]
+    got = a.build
     os.makedirs(a.out, mode=0o700, exist_ok=True)
     ino, _ = vol.resolve(UNIT)
     b = vol.read_file(ino)
