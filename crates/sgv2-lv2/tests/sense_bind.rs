@@ -200,10 +200,10 @@ fn run_follows_the_supervisor_word_through_the_c_abi() {
     std::env::set_var("SGV2_ENGINE_PAGE", &page_path);
     let index = VARIANTS.iter().position(|v| v.1 == 6 && v.2 == 12 && v.3 == Role::Protect).unwrap();
     let d = lv2_descriptor(index as u32);
-    const N: usize = 512;
-    let sense = resistive_sense(N);
-    let mut input = [[0.25f32; N]; 6];
-    let mut output = [[9.0f32; N]; 6];
+    const FIRST: usize = 2730;
+    let sense = resistive_sense(FIRST);
+    let mut input = [[0.25f32; FIRST]; 6];
+    let mut output = [[9.0f32; FIRST]; 6];
     let mut controls = [0.0f32; 3];
     let h = page.header();
     unsafe {
@@ -222,11 +222,16 @@ fn run_follows_the_supervisor_word_through_the_c_abi() {
         ((*d).activate.unwrap())(inst);
         let crc = h.params_crc.load(Ordering::Relaxed);
         assert_ne!(crc, 0);
+        // Count the first callback's actual frames, not the scratch capacity.
+        ((*d).run)(inst, FIRST as u32);
+        assert_eq!(h.frames.load(Ordering::Acquire), FIRST as u64);
+        assert_eq!(h.sense_bound.load(Ordering::Acquire), SENSE_UNBOUND);
         let run = || {
-            ((*d).run)(inst, N as u32);
+            ((*d).run)(inst, 512);
             h.sense_bound.load(Ordering::Acquire)
         };
         assert_eq!(run(), SENSE_UNBOUND, "no word, no binding");
+        assert_eq!(h.frames.load(Ordering::Acquire), (FIRST + 512) as u64);
         page.set_sense_bind(Some(crc ^ 1));
         assert_eq!(run(), SENSE_UNBOUND, "a word for another blob");
         page.set_sense_bind(Some(crc));
