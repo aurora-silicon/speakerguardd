@@ -433,6 +433,34 @@ def interface_mode():
     return "none", None
 
 
+# How long a boot run waits for the speaker card. The unit is ordered after
+# sound.target, but the card's driver can bind a second after that (J413: the
+# card registered 1 s after the run on a fresh boot), and a run that finds no
+# card waits for the next boot.
+CARD_WAIT_S = 120
+
+
+
+def wait_interface_mode(wait, dt=None, sleep=time.sleep, clock=time.monotonic):
+    """interface_mode(), waiting up to `wait` seconds for the speaker card
+    while the device tree describes one. A tree with no speaker card is a
+    retry at once with the reason: this kernel's device tree lacks the
+    speaker nodes, so nothing can register until a kernel/DTB update that
+    has them."""
+    deadline = clock() + wait
+    while True:
+        mode, card = interface_mode()
+        if mode != "none":
+            return mode, card
+        if unit.dt_speaker_card(dt) is False:
+            raise Retry("the device tree describes no speaker card (no enabled apple,macaudio node with a "
+                        "Speaker link): this kernel's device tree lacks the speaker amp nodes; the speakers "
+                        "stay at the kernel's own limit until a kernel and boot update that carries them")
+        if clock() >= deadline:
+            raise Retry(f"no speaker card yet (waited {wait:.0f} s)")
+        sleep(0.5)
+
+
 def interface_get(card):
     """The kernel's current speaker protection interface (IF_V2, IF_LEGACY)
     on a dual kernel, or None when it cannot be read."""
@@ -793,9 +821,7 @@ def _cmd_run(a):
     identity = collect.Identity(a.adt)
     if not identity.matches_dt():
         raise Refused("the Linux device tree and the ADT name different units")
-    mode, card = interface_mode()
-    if mode == "none":
-        raise Retry("no speaker card yet")
+    mode, card = wait_interface_mode(CARD_WAIT_S if getattr(a, "at_boot", False) else 0)
     state = store.state()
     have = store.read_bundle()
     m = json.loads(have[audio_tuning.MANIFEST]) if have else {}
