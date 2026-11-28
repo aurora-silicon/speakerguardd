@@ -31,6 +31,7 @@ nothing changes.
 """
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -43,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 
 from . import collect, ipsw, unit
 from .asahi_firmware import aea_ro, apfs_ro
@@ -97,6 +99,11 @@ class Refused(Exception):
 
 class Retry(Exception):
     """Cannot run now; nothing changed."""
+
+
+class Unreachable(Retry):
+    """The pinned restore image could not be read now (no network yet, DNS,
+    a timeout, a server error): a boot run waits a while for it."""
 
 
 def say(msg):
@@ -185,15 +192,19 @@ def from_ipsw(identity, a, spid, known, scratch):
         kw = {"preferred_build": preferred} if preferred else {}
         vol, rng, build, url = ipsw.open_system(identity.board, url=a.ipsw, **kw)
     except ipsw.IpswUnavailable as e:
-        raise Retry(f"the pinned restore image cannot be read now: {e}") from None
+        raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
     except ipsw.IpswError as e:
         raise collect.CollectError(str(e)) from None
     say(f"macOS {build} restore image ({url.rsplit('/', 1)[-1]}), by ranges")
     st = tempfile.mkdtemp(prefix="stage-", dir=scratch)
     try:
         collect.stage(vol, identity.acoustic, st)
-    except (aea_ro.AeaUnavailable, OSError) as e:
-        raise Retry(f"the pinned restore image cannot be read now: {e}") from None
+    except aea_ro.AeaUnavailable as e:
+        raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
+    except OSError as e:
+        if local_failure(e):
+            raise Retry(f"staging the restore image's files failed on this Mac: {e}") from None
+        raise Unreachable(f"the pinned restore image cannot be read now: {e}") from None
     except (aea_ro.AeaError, apfs_ro.ApfsError) as e:
         raise collect.CollectError(f"macOS {build} restore image: {e}") from None
     b, sysbuild = collect.collect(st, identity, spid, known)
@@ -219,6 +230,38 @@ def with_fill(identity, b, component, dirs):
                   f"takes on this Mac's macOS {m.get('macos_build')} from the same files; "
                   + ("; ".join(reasons) if reasons else "this unit's installer bundle has none")
                   + ". The speakers stay as they are")
+
+
+# A write or open failing on this Mac (the staging directory on /run is full,
+# read-only or not ours) is no network outage: retrying it for minutes only
+# repeats it.
+LOCAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES, errno.EPERM,
+                          errno.EMFILE, errno.ENFILE, errno.ENOMEM})
+
+
+def local_failure(e):
+    """Whether an OSError from staging is this Mac's own (not the network)."""
+    return not isinstance(e, urllib.error.URLError) and e.errno in LOCAL_ERRNOS
+
+
+def acquire_waiting(identity, a, wait, sleep=time.sleep, clock=time.monotonic):
+    """acquire(), starting a new attempt every 5 s while the pinned restore
+    image cannot be reached, as long as the attempt starts within `wait`
+    seconds (the last attempt itself is bounded by the reader's HTTP
+    timeouts, not by `wait`). Anything else (a refusal, a
+    retry for another reason) is passed on at once."""
+    deadline = clock() + wait
+    while True:
+        try:
+            return acquire(identity, a)
+        except Unreachable:
+            if clock() + 5 > deadline:
+                raise
+            sleep(5)
+            if clock() > deadline:
+                # A late wake (a suspend, a loaded boot) starts no attempt
+                # after the budget.
+                raise
 
 
 def acquire(identity, a):
@@ -435,6 +478,64 @@ def interface_mode():
         if _has(card, IF_UNLOCK):
             return "legacy-only", card
     return "none", None
+
+
+# How long a boot run waits for the speaker card. The unit is ordered after
+# sound.target, but the card's driver can bind a second after that (J413: the
+# card registered 1 s after the run on a fresh boot), and a run that finds no
+# card waits for the next boot.
+CARD_WAIT_S = 120
+# How long a boot run keeps starting new attempts at the pinned restore
+# image (a retry-start budget: an attempt started inside it runs to the end
+# under the reader's own HTTP timeouts). On a fresh J413 boot
+# network-online.target was reached before DNS answered, and the run gave up
+# until the next boot.
+NET_WAIT_S = 180
+
+
+
+def card_identity(card):
+    """The card's ALSA id (/proc/asound/cardN/id, e.g. AppleJ413), or None
+    when card N is gone. With the number it tells a reprobed or renumbered
+    card from the one a run started on."""
+    try:
+        with open(f"/proc/asound/card{card}/id") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def same_speaker_card(mode, card, ident):
+    """Retry unless the kernel still serves `mode` on the same card number
+    with the same ALSA id. Called after the restore image fetch, which can
+    take minutes at boot, before anything changes provisioning or the
+    protection switch."""
+    now_mode, now_card = interface_mode()
+    now_ident = card_identity(now_card) if now_card is not None else None
+    if not ident or not now_ident or (now_mode, now_card) != (mode, card) or now_ident != ident:
+        raise Retry(f"the speaker card changed during the fetch (was {mode} on card {card} {ident}, now "
+                    f"{now_mode} on card {now_card} {now_ident}): "
+                    "nothing changed, try again")
+
+
+def wait_interface_mode(wait, dt=None, sleep=time.sleep, clock=time.monotonic):
+    """interface_mode(), waiting up to `wait` seconds for the speaker card
+    while the device tree describes one. A tree with no speaker card is a
+    retry at once with the reason: this kernel's device tree lacks the
+    speaker nodes, so nothing can register until a kernel/DTB update that
+    has them."""
+    deadline = clock() + wait
+    while True:
+        mode, card = interface_mode()
+        if mode != "none":
+            return mode, card
+        if unit.dt_speaker_card(dt) is False:
+            raise Retry("the device tree describes no speaker card (no enabled apple,macaudio node with a "
+                        "Speaker link): this kernel's device tree lacks the speaker amp nodes; the speakers "
+                        "stay at the kernel's own limit until a kernel and boot update that carries them")
+        if clock() >= deadline:
+            raise Retry(f"no speaker card yet (waited {wait:.0f} s)")
+        sleep(0.5)
 
 
 def interface_get(card):
@@ -740,9 +841,7 @@ def _cmd_run(a):
     identity = collect.Identity(a.adt)
     if not identity.matches_dt():
         raise Refused("the Linux device tree and the ADT name different units")
-    mode, card = interface_mode()
-    if mode == "none":
-        raise Retry("no speaker card yet")
+    mode, card = wait_interface_mode(CARD_WAIT_S if getattr(a, "at_boot", False) else 0)
     state = store.state()
     have = store.read_bundle()
     m = json.loads(have[audio_tuning.MANIFEST]) if have else {}
@@ -767,7 +866,11 @@ def _cmd_run(a):
             "for this speaker yet, so the boot unit leaves the speakers as they are "
             "('aurora-speaker-upgrade run' switches by hand)")
         return EXIT_OK
-    b, prov = acquire(identity, a)
+    ident = card_identity(card)
+    if not ident:
+        raise Retry(f"cannot read the speaker card's ALSA id (card {card}): nothing changed, try again")
+    b, prov = acquire_waiting(identity, a, NET_WAIT_S if getattr(a, "at_boot", False) else 0)
+    same_speaker_card(mode, card, ident)
     store.ensure()
     if not have or digest(have) != digest(b):
         store.put_bundle(b)

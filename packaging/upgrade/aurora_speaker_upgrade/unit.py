@@ -23,6 +23,10 @@ it. The allow-list, and why each item is per unit:
   this unit and is used only when it was read from the exact files and
   AudioDSP component of the restore image (collect.attach_fill checks both),
   so it never carries another build's tuning.
+- Whether the live device tree has a speaker card (dt_speaker_card: an
+  enabled apple,macaudio node with a Speaker link). Nothing from it goes
+  into the bundle; a boot run uses it to decide whether to wait for the
+  card or to say that this kernel's device tree lacks the speaker nodes.
 
 Nothing else is read from the Mac.
 """
@@ -35,6 +39,7 @@ from .asahi_firmware import audio_tuning, lsm2_fill
 
 CHOSEN_SPID = "/proc/device-tree/chosen/asahi,speaker-id"
 DT_SERIAL = "/proc/device-tree/serial-number"
+DT = "/proc/device-tree"
 INSTALLER_BUNDLES = ("/lib/firmware/vendor/apple/audio-tuning",
                      "/run/aurora-firmware/vendorfw/apple/audio-tuning")
 # The HAL's invalid strap value. aura (aura#121) publishes it in
@@ -169,3 +174,44 @@ def installer_fill(identity, aid, dirs=INSTALLER_BUNDLES):
         if 0 < len(data) <= lsm2_fill.MAX_BYTES:
             out.append((d, data))
     return out
+
+
+def dt_speaker_card(dt=None):
+    """Whether the live device tree describes a speaker card: True for an
+    enabled apple,macaudio node at the root with a "Speaker"/"Speakers"
+    link (the jack-only card has none), False when the tree is readable
+    and has none, None when it cannot be read. Same rule as
+    speakerguardd-gate's dt_speaker_node()."""
+    dt = dt or DT
+    try:
+        names = os.listdir(dt)
+    except OSError:
+        return None
+    for d in names:
+        node = os.path.join(dt, d)
+        try:
+            with open(os.path.join(node, "compatible"), "rb") as f:
+                if b"apple,macaudio" not in f.read().split(b"\0"):
+                    continue
+        except OSError:
+            continue
+        try:
+            with open(os.path.join(node, "status"), "rb") as f:
+                if f.read().rstrip(b"\0") not in (b"okay", b"ok"):
+                    continue
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        try:
+            links = os.listdir(node)
+        except OSError:
+            return None
+        for c in links:
+            try:
+                with open(os.path.join(node, c, "link-name"), "rb") as f:
+                    if f.read().rstrip(b"\0") in (b"Speaker", b"Speakers"):
+                        return True
+            except OSError:
+                continue
+    return False

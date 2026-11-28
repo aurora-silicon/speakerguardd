@@ -363,6 +363,7 @@ class DualKernelRun(unittest.TestCase):
             with contextlib.ExitStack() as es:
                 es.enter_context(mock.patch.object(up.collect, "Identity", Ident))
                 es.enter_context(mock.patch.object(up, "interface_mode", return_value=("dual", "1")))
+                es.enter_context(mock.patch.object(up, "card_identity", return_value="AppleJ316"))
                 es.enter_context(mock.patch.object(up, "acquire", return_value=({}, {"source": "ipsw", "aid": "AID9"})))
                 es.enter_context(mock.patch.object(up, "digest", return_value="dg"))
                 es.enter_context(mock.patch.object(up.Store, "put_bundle", lambda self, b: None))
@@ -641,6 +642,7 @@ class CheckKeepsTheInterface(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0, stdout="", stderr="")
             with mock.patch.object(up.collect, "Identity", return_value=ident), \
                     mock.patch.object(up, "interface_mode", return_value=("dual", "AppleJ616")), \
+                    mock.patch.object(up, "card_identity", return_value="AppleJ616"), \
                     mock.patch.object(up, "acquire", return_value=({}, {"route": 0, "source": "test"})), \
                     mock.patch.object(up, "digest", return_value="d"), \
                     mock.patch.object(up.collect, "write_bundle", lambda b, p: os.makedirs(p, exist_ok=True)), \
@@ -677,6 +679,7 @@ class RunRechecksTheLiveState(unittest.TestCase):
         with mock.patch.object(up, "Store", return_value=store), \
                 mock.patch.object(up.collect, "Identity", return_value=types.SimpleNamespace(unit="U1", matches_dt=lambda: True)), \
                 mock.patch.object(up, "interface_mode", return_value=("dual", "AppleJ316")), \
+                mock.patch.object(up, "card_identity", return_value="AppleJ316"), \
                 mock.patch.object(up, "read_text", return_value="v2\n"), \
                 mock.patch.object(up, "v2_owns_speakers", return_value=owns), \
                 mock.patch.object(up, "acquire", side_effect=lambda *x: acquired.append(1) or (_ for _ in ()).throw(up.Retry("stop here"))):
@@ -762,6 +765,7 @@ class BootMigrationNeedsPlaybackRows(unittest.TestCase):
         with mock.patch.object(up, "Store", return_value=store), \
                 mock.patch.object(up.collect, "Identity", return_value=ident), \
                 mock.patch.object(up, "interface_mode", return_value=("v2-only", "AppleJ713")), \
+                mock.patch.object(up, "card_identity", return_value="AppleJ713"), \
                 mock.patch.object(up, "playback_proof", return_value=[{"evidence": "x"}] if proven else []), \
                 mock.patch.object(up, "acquire", side_effect=lambda *x: acquired.append(1) or (_ for _ in ()).throw(up.Retry("stop here"))):
             a = types.SimpleNamespace(store="/x", adt=None, at_boot=at_boot)

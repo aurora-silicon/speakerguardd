@@ -103,6 +103,24 @@ again until the kernel, speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
 outcome, not a failure. `run` by hand always tries again.
 
+A boot run waits up to 120 s for the speaker card, because the card's
+driver can bind after `sound.target` (on a J413 the card registered a
+second after the run). It waits only while the live device tree describes
+a speaker card. If the tree has none (no enabled `apple,macaudio` node
+with a Speaker link), the run stops at once with "not now" and says that
+this kernel's device tree lacks the speaker amp nodes. The speakers stay
+at the kernel's own limit, and the next boot on a kernel and boot update
+that carries the nodes tries again. A boot run also keeps starting new
+attempts at the pinned restore image every 5 s for 180 s (a retry-start
+budget; an attempt started in it runs under the reader's own HTTP
+timeouts): on a J413 `network-online.target` was reached before DNS
+answered. Only "cannot be read now" is tried again; any answer from the
+image is final. After the fetch the run checks that the kernel still
+serves the same speaker card (number, ALSA id, interface) before it
+changes provisioning or the protection switch; a reprobed or renumbered
+card is "not now", with nothing changed. A run by hand
+does not wait for either.
+
 The boot unit also moves a speaker only once protected playback on it is on
 record. speakerguardd v2's gate data (`packaging/session/gate.json`,
 installed as `/usr/share/speakerguardd/gate.json`) lists in `playback_rows`,
