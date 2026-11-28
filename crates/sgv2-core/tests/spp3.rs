@@ -1438,8 +1438,9 @@ fn plausibility_guard_still_trips_a_swap_after_a_gap() {
 /// unproven board the gain is the same, block for block, as a unit whose
 /// sense bus carries nothing, the limit never above the base. On a
 /// relaxing board (which may relax by the reference law while its T_CL
-/// lags the model) the post-gap limiter trace is pinned: the trend restart
-/// leaves the limiter bit for bit as it was.
+/// lags the model) the post-gap limiter trace is pinned and no looser than
+/// before the change: the re-qualification hold only keeps the limit at
+/// the base longer.
 #[test]
 fn over_temperature_after_a_gap_limits_as_the_open_loop() {
     let p = slow_cl_params();
@@ -1500,6 +1501,46 @@ fn over_temperature_after_a_gap_limits_as_the_open_loop() {
     assert!(max_tol > 120.0, "the model went past its limit: {max_tol}");
     assert!(min_gain < 0.5, "the limiter engaged after the gap: {min_gain}");
     assert!(units[0].controller_state(0)[9] == 1.0, "the closed loop was live at the end");
-    // measured with and without the trend restart: identical
-    assert_eq!((trace.0.to_bits(), trace.1.to_bits()), (0x4087_0a9c_75d0_0000, 0x405f_64c5_0f87_fa40), "{trace:?}");
+    // the pre-restart limiter (no trend restart, no re-qualification hold)
+    // traced gains summing to 0x4087_0a9c_75d0_0000 with a highest limit of
+    // 0x405f_64c5_0f87_fa40: after the gap the hold keeps the limit at the
+    // base until a full ring is judged, so the trace may only be stricter
+    let before = (f64::from_bits(0x4087_0a9c_75d0_0000), f64::from_bits(0x405f_64c5_0f87_fa40));
+    assert!(trace.0 <= before.0 && trace.1 <= before.1, "looser than before the change: {trace:?} vs {before:?}");
+    assert_eq!((trace.0.to_bits(), trace.1.to_bits()), (0x4086_f3ee_d4a0_0000, 0x405e_1de3_9946_b08b), "{trace:?}");
+}
+
+/// Repeated gaps on a relaxing board (App review of the trend restart): a
+/// sense that is not reading the coil (it reads a falling coil while the
+/// model climbs, the [V,I]-swap shape) comes back in bursts shorter than a
+/// trend ring, each after a gap long enough to restart the trend. No ring
+/// is ever full, so the guard never judges it; the correction must not
+/// relax on it meanwhile. The limit stays at the base through every burst.
+#[test]
+fn repeated_gaps_never_relax_on_an_unjudged_sense() {
+    let tc = 25.0;
+    let p = cl_params(4.0, tc as f32);
+    let mut rp = spp3::ClReplay::new(&p, 0, true).unwrap();
+    let upw = rp.updates_per_window().round() as usize;
+    gap_episode(&mut rp, upw);
+    let gap = (25.0 * 48_000.0 / 256.0) as usize;
+    let mut max_adj = 0.0f64;
+    for burst in 0..12 {
+        // five windows (shorter than the ring): the model climbs 2.3 K per
+        // window from 55 C, the sense reads 0.6 K-equivalent colder each
+        for k in 0..5 {
+            let o = replay_window(&mut rp, upw, coil_r(tc, 40.0 - 0.6 * k as f64), 55.0 + 2.3 * k as f64);
+            assert!(!o.2, "burst {burst} window {k}: a short burst is not judged");
+            max_adj = max_adj.max(o.0);
+        }
+        // a gap long enough to restart the trend
+        for k in 0..gap {
+            if k % upw == 0 {
+                assert!(!rp.window(0.0, 0.0), "a silent window is rejected");
+            }
+            let o = rp.update(60.0, 0.0);
+            max_adj = max_adj.max(o.0);
+        }
+    }
+    assert_eq!(max_adj, 0.0, "the correction relaxed on a sense the guard never judged");
 }

@@ -814,6 +814,11 @@ struct Cl {
     /// [`ClReplay`] chooses. False until the unit says otherwise.
     relax: bool,
     implausible: bool,
+    /// The trend restarted after a gap and has not yet judged a full ring
+    /// against a rising model: no relaxation (the limit stays at the base)
+    /// until it has, so bursts shorter than a ring between gaps never relax
+    /// on a sense the guard has not judged.
+    requalify: bool,
 }
 
 /// The Goertzel period `N = next_power_of_two(round(TempSenseWindowTime *
@@ -921,6 +926,7 @@ impl Cl {
             cold_floor: (c.cal_temp_range_min as f64).min(ambient) - COLD_MARGIN_K,
             relax: false,
             implausible: false,
+            requalify: false,
         })
     }
 
@@ -944,6 +950,7 @@ impl Cl {
         self.r_trend = f32::NAN;
         self.cold_n = 0;
         self.implausible = false;
+        self.requalify = false;
     }
 
     /// `AudioUnitReset`: the estimator restarts (the window grid from this
@@ -955,11 +962,13 @@ impl Cl {
     /// 177.630 C at the first accepted window, which is the pre-reset
     /// smoother 177.612 C stepped once toward 200 C).
     fn host_reset(&mut self) {
-        let (keep, verdict) = (self.limit_s, self.implausible);
+        let (keep, verdict, requalify) = (self.limit_s, self.implausible, self.requalify);
         self.reset(keep);
         self.limit_s = keep;
-        // the guard's verdict holds until the kernel is rebuilt
+        // the guard's verdict holds until the kernel is rebuilt, and so
+        // does a pending re-qualification
         self.implausible = verdict;
+        self.requalify = requalify;
     }
 
     /// `T_CL` of the current smoothed resistance: `fmaf(invTempCo, (Rw -
@@ -1025,10 +1034,12 @@ impl Cl {
         // cooled meanwhile while the model climbs again (J615 ladder at
         // volume 1.0, S100 -> F100: both right woofers tripped 3.6 s into
         // the sweep, their windows rising throughout). Windows that keep
-        // coming are judged as before.
+        // coming are judged as before. Until the restarted trend has judged
+        // a full ring, the correction does not relax (`requalify`).
         if self.age >= TREND_N * self.window {
             self.trend_n = 0;
             self.r_trend = f32::NAN;
+            self.requalify = true;
         }
         self.r_trend = if self.r_trend.is_finite() { self.r_trend + self.k_r * (r - self.r_trend) } else { r };
         // T_CL = fmaf(invTempCo, (Rw - Rshunt)/(R_cal - Rshunt) - 1, T_cal) in
@@ -1100,6 +1111,9 @@ impl Cl {
                 let honest = (self.cal_r - self.rshunt as f64) / (self.inv_temp_co as f64 * self.rdc_scale);
                 if slope < -TREND_SLOPE_FRAC * honest {
                     self.implausible = true;
+                } else {
+                    // a full ring judged honest: the trend is qualified again
+                    self.requalify = false;
                 }
             }
         }
@@ -1110,9 +1124,10 @@ impl Cl {
     }
 
     /// The correction may relax the limit: never while capped, never after
-    /// the plausibility guard has tripped.
+    /// the plausibility guard has tripped, never while a post-gap trend is
+    /// re-qualifying.
     fn relax_allowed(&self) -> bool {
-        self.relax && !self.implausible
+        self.relax && !self.implausible && !self.requalify
     }
 
     /// Per thermal update: the smoothed corrected limit for `base`.
@@ -1124,8 +1139,9 @@ impl Cl {
             self.fresh = false;
             self.guard(t_ol, driven);
         }
-        // a tripped guard drops any relaxation at once (TlimAdj -> 0)
-        if self.implausible {
+        // a tripped guard drops any relaxation at once (TlimAdj -> 0), and
+        // so does a trend that restarted after a gap until it re-qualifies
+        if self.implausible || self.requalify {
             self.limit_s = base;
             return base;
         }
