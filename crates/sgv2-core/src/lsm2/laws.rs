@@ -184,14 +184,242 @@ pub fn velocity_limit(e: f32, k: &[f32; 4], v: &[f32; 3], vmax: f32) -> f32 {
     a + (e - lo) * slope
 }
 
+/// Peak absolute modeled velocity over `first..` for band gains `g` under
+/// slow gain `s` and fixed residual `resid`.
+pub fn modeled_velocity_peak(vb: &[alloc::vec::Vec<f32>; 5], resid: &[f32], first: usize, s: f32, g: &[f32; 5]) -> f32 {
+    let n = vb[0].len();
+    let mut worst = 0.0f32;
+    for i in first..n {
+        let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
+        for k in 0..5 {
+            y += (g[k] * s) * vb[k][i];
+        }
+        worst = worst.max(y.abs());
+    }
+    worst
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaterfillStep {
+    Changed,
+    Stalled,
+    AllPinned,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn waterfill_step(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    idx: usize,
+    worst: f32,
+    limit: f32,
+    room_floor: Option<f32>,
+    s: f32,
+    active: (usize, usize),
+    floor: f32,
+    g: &mut [f32; 5],
+) -> WaterfillStep {
+    let is_active = |k: usize| k >= active.0 && k < active.1;
+    let floor_on = floor > 0.0;
+    let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
+    let pinned: [bool; 5] = core::array::from_fn(|k| floor_on && g[k] <= floor);
+    let mut fixed = if resid.is_empty() { 0.0f32 } else { resid[idx] };
+    for k in (0..5).filter(|&k| !is_active(k) || pinned[k]) {
+        fixed += (g[k] * s) * vb[k][idx];
+    }
+    let room = match room_floor {
+        Some(rf) => (limit - sign * fixed).max(rf),
+        None => limit - sign * fixed,
+    };
+    let mut share = [0.0f32; 5];
+    let mut sorted = [0.0f32; 5];
+    let mut m = 0;
+    for k in (0..5).filter(|&k| is_active(k) && !pinned[k]) {
+        share[k] = (sign * s) * (g[k] * vb[k][idx]);
+        sorted[m] = share[k];
+        m += 1;
+    }
+    if m == 0 {
+        return WaterfillStep::AllPinned;
+    }
+    let sorted = &mut sorted[..m];
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let mut remain = room;
+    let mut level = sorted[m - 1];
+    for (j, &v) in sorted.iter().enumerate() {
+        let count = (m - j) as f32;
+        if v * count >= remain {
+            level = remain / count;
+            break;
+        }
+        remain -= v;
+    }
+    let mut changed = false;
+    for k in (0..5).filter(|&k| is_active(k) && !pinned[k]) {
+        if share[k] > level && (!floor_on || share[k] > 0.0) {
+            let r = (level / share[k]).clamp(0.0, 1.0);
+            let next = if floor_on { (g[k] * r).max(floor.min(g[k])) } else { g[k] * r };
+            if next != g[k] {
+                g[k] = next;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        WaterfillStep::Changed
+    } else {
+        WaterfillStep::Stalled
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn velocity_band_gains_inner(
+    vb: &[alloc::vec::Vec<f32>; 5],
+    resid: &[f32],
+    first: usize,
+    room_floor: Option<f32>,
+    s: f32,
+    active: (usize, usize),
+    seed: [f32; 5],
+    floor: f32,
+    limit_at: impl Fn(usize) -> f32,
+) -> [f32; 5] {
+    let mut g = seed;
+    let n = vb[0].len();
+    if first >= n {
+        return g;
+    }
+    let is_active = |k: usize| k >= active.0 && k < active.1;
+    let floor_on = floor > 0.0;
+    let rf = room_floor.unwrap_or(0.0);
+    let sample_has_room = |i: usize, sign: f32, limit: f32, g: &[f32; 5], pinned: &[bool; 5]| -> bool {
+        if !floor_on {
+            return true;
+        }
+        let mut fixed = if resid.is_empty() { 0.0f32 } else { resid[i] };
+        for k in (0..5).filter(|&k| !is_active(k) || pinned[k]) {
+            fixed += (g[k] * s) * vb[k][i];
+        }
+        limit - sign * fixed > 0.0
+    };
+    loop {
+        let pinned: [bool; 5] = core::array::from_fn(|k| floor_on && g[k] <= floor);
+        if (0..5).all(|k| !is_active(k) || pinned[k]) {
+            break;
+        }
+        let (mut idx, mut worst) = (first, 0.0f32);
+        let (mut red_idx, mut red_worst) = (first, 0.0f32);
+        let mut has_reducible = false;
+        for i in first..n {
+            let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
+            for k in 0..5 {
+                y += (g[k] * s) * vb[k][i];
+            }
+            if y.is_nan() {
+                return g;
+            }
+            let ay = y.abs();
+            if ay > worst.abs() {
+                worst = y;
+                idx = i;
+            }
+            let l_i = limit_at(i);
+            let thresh = l_i + rf;
+            if ay > thresh {
+                let sign = if y >= 0.0 { 1.0f32 } else { -1.0 };
+                let reducible = sample_has_room(i, sign, l_i, &g, &pinned)
+                    && (0..5)
+                        .any(|k| is_active(k) && !pinned[k] && (!floor_on || (sign * s) * (g[k] * vb[k][i]) > 0.0));
+                if reducible && (!has_reducible || ay > red_worst.abs()) {
+                    has_reducible = true;
+                    red_worst = y;
+                    red_idx = i;
+                }
+            }
+        }
+        if worst.is_nan() {
+            break;
+        }
+        let limit = limit_at(idx);
+        let worst_ok = worst.abs() <= limit + rf;
+        if worst_ok && (!floor_on || !has_reducible) {
+            break;
+        }
+        let step = if worst_ok {
+            WaterfillStep::Stalled
+        } else {
+            waterfill_step(vb, resid, idx, worst, limit, room_floor, s, active, floor, &mut g)
+        };
+        match step {
+            WaterfillStep::Changed => continue,
+            WaterfillStep::AllPinned => break,
+            WaterfillStep::Stalled => {
+                if !has_reducible {
+                    break;
+                }
+                if (worst_ok || red_idx != idx)
+                    && waterfill_step(
+                        vb,
+                        resid,
+                        red_idx,
+                        red_worst,
+                        limit_at(red_idx),
+                        room_floor,
+                        s,
+                        active,
+                        floor,
+                        &mut g,
+                    ) == WaterfillStep::Changed
+                {
+                    continue;
+                }
+                // If 1-ULP binary32 rounding stalled `red_idx`, scan for the
+                // worst violating sample with positive room that updates `g`.
+                let mut best_trial: Option<(f32, [f32; 5])> = None;
+                for i in first..n {
+                    let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
+                    for k in 0..5 {
+                        y += (g[k] * s) * vb[k][i];
+                    }
+                    let ay = y.abs();
+                    let l_i = limit_at(i);
+                    if ay > l_i + rf && best_trial.as_ref().is_none_or(|(bw, _)| ay > *bw) {
+                        let sign = if y >= 0.0 { 1.0f32 } else { -1.0 };
+                        if !sample_has_room(i, sign, l_i, &g, &pinned) {
+                            continue;
+                        }
+                        let mut trial = g;
+                        if waterfill_step(vb, resid, i, y, l_i, room_floor, s, active, floor, &mut trial)
+                            == WaterfillStep::Changed
+                        {
+                            best_trial = Some((ay, trial));
+                        }
+                    }
+                }
+                if let Some((_, next_g)) = best_trial {
+                    g = next_g;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    g
+}
+
 /// The velocity allocation (residuals 5): on the signed sum of the five
 /// band velocities `vb[k][n]` over `first..`, under the applied slow gain
 /// `s`, find the worst sample, orient every band's contribution to its sign
 /// and water-fill the active bands (`active`) into the room the ignored
-/// bands leave; repeat until the waveform is within `vlim`. Returns each
-/// band's gain relative to `s` (ignored bands 1), before the floor. The
-/// ordinary solve starts from unity; the post-retarget solve (residuals
-/// 5.2) from a lane-selective `seed`.
+/// bands leave; repeat until the waveform is within `vlim`. When `floor > 0`,
+/// a band at or below `floor` is treated as a fixed term and active cuts stop
+/// at `floor` (never raising a seed already below it). When a worst violating
+/// sample stalls (for example because every contributing active band is
+/// already pinned at `floor`), continue solving remaining reducible violating
+/// samples. Returns each band's gain relative to `s` (ignored bands unchanged
+/// from `seed`). The ordinary solve starts from unity; the post-retarget
+/// solve (residuals 5.2) from a lane-selective `seed`.
+#[allow(clippy::too_many_arguments)]
 pub fn velocity_band_gains(
     vb: &[alloc::vec::Vec<f32>; 5],
     resid: &[f32],
@@ -200,73 +428,9 @@ pub fn velocity_band_gains(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
+    floor: f32,
 ) -> [f32; 5] {
-    let mut g = seed;
-    let n = vb[0].len();
-    if first >= n {
-        return g;
-    }
-    let is_active = |k: usize| k >= active.0 && k < active.1;
-    loop {
-        let (mut idx, mut worst) = (first, 0.0f32);
-        for i in first..n {
-            let mut y = if resid.is_empty() { 0.0f32 } else { resid[i] };
-            for k in 0..5 {
-                y += (g[k] * s) * vb[k][i];
-            }
-            if y.abs() > worst.abs() {
-                worst = y;
-                idx = i;
-            }
-        }
-        if worst.abs() <= vlim || worst.is_nan() {
-            break;
-        }
-        let sign = if worst >= 0.0 { 1.0f32 } else { -1.0 };
-        let mut fixed = if resid.is_empty() { 0.0f32 } else { resid[idx] };
-        for k in (0..5).filter(|&k| !is_active(k)) {
-            fixed += (g[k] * s) * vb[k][idx];
-        }
-        let room = vlim - sign * fixed;
-        let mut share = [0.0f32; 5];
-        let mut sorted = [0.0f32; 5];
-        let mut m = 0;
-        for k in (0..5).filter(|&k| is_active(k)) {
-            share[k] = (sign * s) * (g[k] * vb[k][idx]);
-            sorted[m] = share[k];
-            m += 1;
-        }
-        if m == 0 {
-            break;
-        }
-        let sorted = &mut sorted[..m];
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-        let mut remain = room;
-        let mut level = sorted[m - 1];
-        for (j, &v) in sorted.iter().enumerate() {
-            let count = (m - j) as f32;
-            if v * count >= remain {
-                level = remain / count;
-                break;
-            }
-            remain -= v;
-        }
-        let mut changed = false;
-        for k in (0..5).filter(|&k| is_active(k)) {
-            if share[k] > level {
-                let r = (level / share[k]).clamp(0.0, 1.0);
-                let next = g[k] * r;
-                if next != g[k] {
-                    g[k] = next;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    g
+    velocity_band_gains_inner(vb, resid, first, None, s, active, seed, floor, |_| vlim)
 }
 
 /// Signed velocity allocation against the retained full-band bound. The
@@ -291,7 +455,7 @@ pub fn velocity_band_gains_window(
     seed: [f32; 5],
 ) -> [f32; 5] {
     let n = vb[0].len();
-    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| {
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, 0.0, |i| {
         if i < split {
             old_limit
         } else if new_limit >= old_limit {
@@ -316,9 +480,10 @@ pub fn velocity_band_gains_limit_window(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
+    floor: f32,
 ) -> [f32; 5] {
     debug_assert_eq!(limits.len(), vb[0].len());
-    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, |i| limits[i])
+    velocity_band_gains_with_limits(vb, resid, first, room_floor, s, active, seed, floor, |i| limits[i])
 }
 
 /// Choose the producer for a newly admitted retained-window segment.
@@ -339,72 +504,10 @@ fn velocity_band_gains_with_limits(
     s: f32,
     active: (usize, usize),
     seed: [f32; 5],
+    floor: f32,
     limit_at: impl Fn(usize) -> f32,
 ) -> [f32; 5] {
-    let mut g = seed;
-    let n = vb[0].len();
-    if first >= n {
-        return g;
-    }
-    let is_active = |k: usize| k >= active.0 && k < active.1;
-    loop {
-        let (mut idx, mut worst) = (first, 0.0f32);
-        for i in first..n {
-            let mut y = if resid.is_empty() { 0.0 } else { resid[i] };
-            for k in 0..5 {
-                y += (g[k] * s) * vb[k][i];
-            }
-            if y.abs() > worst.abs() {
-                worst = y;
-                idx = i;
-            }
-        }
-        let limit = limit_at(idx);
-        if worst.abs() <= limit + room_floor || worst.is_nan() {
-            break;
-        }
-        let sign = if worst >= 0.0 { 1.0 } else { -1.0 };
-        let mut fixed = if resid.is_empty() { 0.0 } else { resid[idx] };
-        for k in (0..5).filter(|&k| !is_active(k)) {
-            fixed += (g[k] * s) * vb[k][idx];
-        }
-        let room = (limit - sign * fixed).max(room_floor);
-        let mut share = [0.0f32; 5];
-        let mut sorted = [0.0f32; 5];
-        let mut m = 0;
-        for k in (0..5).filter(|&k| is_active(k)) {
-            share[k] = (sign * s) * (g[k] * vb[k][idx]);
-            sorted[m] = share[k];
-            m += 1;
-        }
-        if m == 0 {
-            break;
-        }
-        let sorted = &mut sorted[..m];
-        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-        let mut remain = room;
-        let mut level = sorted[m - 1];
-        for (j, &v) in sorted.iter().enumerate() {
-            let count = (m - j) as f32;
-            if v * count >= remain {
-                level = remain / count;
-                break;
-            }
-            remain -= v;
-        }
-        let mut changed = false;
-        for k in (0..5).filter(|&k| is_active(k)) {
-            if share[k] > level {
-                let next = g[k] * (level / share[k]).clamp(0.0, 1.0);
-                changed |= next != g[k];
-                g[k] = next;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    g
+    velocity_band_gains_inner(vb, resid, first, Some(room_floor), s, active, seed, floor, limit_at)
 }
 
 /// A fast band gain (residuals 5.1, decision-local): at every decision the
@@ -846,6 +949,96 @@ mod tests {
         assert!((velocity_limit(50.0, &k, &v, 2.0) - 3.0).abs() < 1e-6);
     }
 
+    /// A crossover tone: band 2 carries it, band 1 contributes 3 % with the
+    /// opposite sign, and the full-band carry of the earlier, floor-bound
+    /// output is itself over the limit, so the floor binds.
+    /// A band that reaches MaxVelocityAttenuation is a fixed term of the
+    /// water-fill: the opposite-sign neighbour, which lowers the peak, is
+    /// not cut. Flooring after an unbounded solve drove every band to zero
+    /// first and so put the neighbour on the floor too.
+    #[test]
+    fn the_velocity_floor_bounds_the_water_fill_and_spares_an_opposite_neighbour() {
+        let n = 96;
+        let tone = |a: f32, ph: f32| {
+            (0..n).map(|i| a * (core::f32::consts::TAU * i as f32 / 24.0 + ph).sin()).collect::<alloc::vec::Vec<f32>>()
+        };
+        let vb = [vec![0.0; n], tone(0.032, core::f32::consts::PI), tone(1.03, 0.0), tone(0.007, 0.1), vec![0.0; n]];
+        let carry = tone(0.4, 2.0);
+        let floor = 0.501_187_2;
+        let got = velocity_band_gains(&vb, &carry, 0, 0.05, 1.0, (0, 5), [1.0; 5], floor);
+        assert_eq!(got[2], floor);
+        assert_eq!(got[3], floor);
+        assert_eq!(got[1], 1.0, "{got:?}");
+        // the same floor rule holds on the retained-window solver too
+        let limits = vec![0.05f32; n];
+        let got_win = velocity_band_gains_limit_window(&vb, &carry, 0, &limits, 0.0, 1.0, (0, 5), [1.0; 5], floor);
+        assert_eq!(got_win[2], floor);
+        assert_eq!(got_win[1], 1.0, "{got_win:?}");
+        // the former rule: solve unbounded, then floor
+        let old = velocity_band_gains(&vb, &carry, 0, 0.05, 1.0, (0, 5), [1.0; 5], 0.0);
+        assert!(old[1] < floor && old[2] < floor, "old {old:?} new {got:?}");
+        // a floor that does not bind changes nothing
+        let free = velocity_band_gains(&vb, &[], 0, 0.9, 1.0, (0, 5), [1.0; 5], 0.0);
+        assert_eq!(velocity_band_gains(&vb, &[], 0, 0.9, 1.0, (0, 5), [1.0; 5], 0.1), free);
+    }
+
+    #[test]
+    fn zero_crossing_neighbour_is_not_cut_when_pinned_room_is_negative() {
+        let vb = [vec![4.0, 2.4], vec![0.0, -0.3], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let got = velocity_band_gains(&vb, &[], 0, 1.0, 1.0, (0, 5), [1.0; 5], 0.5);
+        assert_eq!(got[0], 0.5);
+        assert_eq!(got[1], 1.0, "{got:?}");
+        assert!(got[0] * 2.4 + got[1] * -0.3 <= 1.0);
+        let got_win = velocity_band_gains_limit_window(&vb, &[], 0, &[1.0, 1.0], 0.0, 1.0, (0, 5), [1.0; 5], 0.5);
+        assert_eq!(got_win[0], 0.5);
+        assert_eq!(got_win[1], 1.0, "{got_win:?}");
+        assert!(got_win[0] * 2.4 + got_win[1] * -0.3 <= 1.0);
+    }
+
+    #[test]
+    fn floor_pinned_worst_sample_does_not_skip_reducible_violations() {
+        // Sample 0 reaches 1.2 m/s while pinned at floor 0.5 (band 1 is zero
+        // there); sample 1 is 1.0 m/s on band 1 and must still be cut to 0.5
+        // against vlim = 0.5.
+        let vb = [vec![2.4, 0.0], vec![0.0, 1.0], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let got = velocity_band_gains(&vb, &[], 0, 0.5, 1.0, (0, 5), [1.0; 5], 0.5);
+        assert_eq!(got[0], 0.5);
+        assert_eq!(got[1], 0.5, "{got:?}");
+        let got_seeded = velocity_band_gains(&vb, &[], 0, 0.5, 1.0, (0, 5), [0.5, 1.0, 1.0, 1.0, 1.0], 0.5);
+        assert_eq!(got_seeded[1], 0.5, "{got_seeded:?}");
+
+        let got_win = velocity_band_gains_limit_window(&vb, &[], 0, &[0.5, 0.5], 0.0, 1.0, (0, 5), [1.0; 5], 0.5);
+        assert_eq!(got_win[0], 0.5);
+        assert_eq!(got_win[1], 0.5, "{got_win:?}");
+        let got_win_seeded = velocity_band_gains_limit_window(
+            &vb,
+            &[],
+            0,
+            &[0.5, 0.5],
+            0.0,
+            1.0,
+            (0, 5),
+            [0.5, 1.0, 1.0, 1.0, 1.0],
+            0.5,
+        );
+        assert_eq!(got_win_seeded[1], 0.5, "{got_win_seeded:?}");
+    }
+
+    #[test]
+    fn unequal_limits_still_solve_reducible_violation_when_largest_sample_passes() {
+        // Sample 0 has the largest magnitude (1.2 <= 1.3), while sample 1
+        // (1.0 > 0.5) remains reducible. Under an active floor, the solver
+        // must still try the reducible violating candidate before stopping.
+        let vb_two = [vec![1.2, 0.0], vec![0.0, 1.0], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let got_two = velocity_band_gains_limit_window(&vb_two, &[], 0, &[1.3, 0.5], 0.0, 1.0, (0, 5), [1.0; 5], 0.25);
+        assert_eq!(got_two[0], 1.0, "{got_two:?}");
+        assert_eq!(got_two[1], 0.5, "{got_two:?}");
+
+        let vb_one = [vec![1.2, 1.0], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2], vec![0.0; 2]];
+        let got_one = velocity_band_gains_limit_window(&vb_one, &[], 0, &[1.3, 0.5], 0.0, 1.0, (0, 5), [1.0; 5], 0.25);
+        assert_eq!(got_one[0], 0.5, "{got_one:?}");
+    }
+
     #[test]
     fn retained_velocity_bounds_switch_at_the_handoff() {
         let vb = [vec![2.0, 2.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
@@ -856,7 +1049,7 @@ mod tests {
     #[test]
     fn retained_velocity_uses_the_limit_at_the_selected_window_sample() {
         let vb = [vec![1.0, 2.0, 1.5], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3], vec![0.0; 3]];
-        let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5]);
+        let got = velocity_band_gains_limit_window(&vb, &[], 0, &[0.2, 1.0, 0.3], 0.0, 1.0, (0, 5), [1.0; 5], 0.0);
         assert_eq!(got, [0.5, 1.0, 1.0, 1.0, 1.0]);
     }
 

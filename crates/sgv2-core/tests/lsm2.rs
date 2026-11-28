@@ -710,3 +710,525 @@ fn ordinary_blob_decoding_keeps_stream_geometry_and_runtime_budgets() {
         }
     }
 }
+
+struct TestMotionModel {
+    b: [f64; 3],
+    a: [f64; 2],
+    x: [f64; 2],
+    y: [f64; 2],
+}
+
+impl TestMotionModel {
+    fn from_mech(r: f64, bl: f64, m: f64, rm: f64, k: f64, n: [f64; 3], rate: f64) -> Self {
+        let d = [r * k, r * rm + bl * bl, r * m];
+        let kk = 2.0 * rate;
+        let k2 = kk * kk;
+        let a0 = d[2] * k2 + d[1] * kk + d[0];
+        Self {
+            b: [
+                (n[2] * k2 + n[1] * kk + n[0]) / a0,
+                2.0 * (n[0] - n[2] * k2) / a0,
+                (n[2] * k2 - n[1] * kk + n[0]) / a0,
+            ],
+            a: [2.0 * (d[0] - d[2] * k2) / a0, (d[2] * k2 - d[1] * kk + d[0]) / a0],
+            x: [0.0; 2],
+            y: [0.0; 2],
+        }
+    }
+
+    fn vel(c: &ChannelParams, rate: f64) -> Self {
+        Self::from_mech(
+            c.vel_rdc as f64,
+            c.vel_bl as f64,
+            c.vel_mms_kg as f64,
+            c.vel_rms as f64,
+            c.vel_kms as f64,
+            [0.0, c.vel_bl as f64, 0.0],
+            rate,
+        )
+    }
+
+    fn disp(c: &ChannelParams, rate: f64) -> Self {
+        Self::from_mech(
+            c.disp_rdc as f64,
+            c.disp_bl as f64,
+            c.disp_mms_kg as f64,
+            c.disp_rms as f64,
+            c.disp_kms as f64,
+            [c.disp_bl as f64, 0.0, 0.0],
+            rate,
+        )
+    }
+
+    fn step(&mut self, x: f64) -> f64 {
+        let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1]
+            - self.a[0] * self.y[0]
+            - self.a[1] * self.y[1];
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+}
+
+type TestVelModel = TestMotionModel;
+
+impl TestVelModel {
+    fn new(c: &ChannelParams, rate: f64) -> Self {
+        Self::vel(c, rate)
+    }
+}
+
+#[test]
+fn max_velocity_attenuation_bounds_the_retarget_solve_too() {
+    // Regression check across upward retarget bursts (1000 / 650 / 300 Hz)
+    // checking both the gain floor at 256-frame decision boundaries and the
+    // modeled velocity of the protected output:
+    // - When MaxVelocityAttenuation can meet `vlim` (18 dB), the protected
+    //   output's modeled velocity stays within `vlim` (< 1 % onset samples).
+    // - When MaxVelocityAttenuation cannot meet `vlim` (3 and 6 dB), the
+    //   floor holds on both primary and retarget solves (0.99 law leaves the
+    //   downward follower 1 % below its request) and outranks `vlim`.
+    for (name, freq) in [("1k", 1000.0), ("650", 650.0), ("300", 300.0)] {
+        let mut x = vec![0.0f32; 24_000];
+        for amp in [0.3f32, 1.0, 0.2, 1.0] {
+            x.extend(sine(freq, amp, 0.6));
+            x.extend(vec![0.0; 4800]);
+        }
+        for db in [3.0f32, 6.0, 18.0] {
+            let mut p = only([false, false, true, false, true]);
+            for c in &mut p.ch[..2] {
+                c.max_velocity_attenuation_db = db;
+            }
+            let floor = 10f32.powf(-db / 20.0);
+            let vfs = p.ch[0].volts_full_scale as f64;
+            let mut vin = TestVelModel::new(&p.ch[0], RATE as f64);
+            let mut vout = TestVelModel::new(&p.ch[0], RATE as f64);
+            let mut u = Unit::new(p);
+            let (mut low, mut vlim, mut in_peak, mut out_peak) = (f32::MAX, 0.0f32, 0.0f64, 0.0f64);
+            let mut over = 0usize;
+            for block in x.chunks(256) {
+                let out = run(&mut u, &[block.to_vec(), block.to_vec()], block.len());
+                let t = tel(&u).channels[0];
+                if t.velocity_limit_m_s.is_finite() {
+                    vlim = vlim.max(t.velocity_limit_m_s);
+                }
+                low = t.band_gain.iter().fold(low, |l, &g| l.min(g * t.gain));
+                for (&xi, &yi) in block.iter().zip(&out[0]) {
+                    in_peak = in_peak.max(vin.step(vfs * xi as f64).abs());
+                    let v = vout.step(vfs * yi as f64).abs();
+                    out_peak = out_peak.max(v);
+                    if v > t.velocity_limit_m_s as f64 {
+                        over += 1;
+                    }
+                }
+            }
+            let over_frac = over as f64 / x.len() as f64;
+            assert!(
+                low >= 0.99 * floor * (1.0 - 1e-5),
+                "{name} {db} dB: band x slow gain {low} below the floor {floor}"
+            );
+            if in_peak * floor as f64 <= vlim as f64 {
+                assert!(
+                    over_frac < 0.01 && out_peak <= vlim as f64,
+                    "{name} {db} dB: modeled velocity exceeded vlim on {:.2} % of samples (peak {out_peak:.4} vs {vlim:.4})",
+                    100.0 * over_frac
+                );
+            } else {
+                assert!(
+                    low <= floor * 1.01,
+                    "{name} {db} dB: expected velocity cut to reach the floor {floor}, got {low}"
+                );
+                assert!(
+                    out_peak > vlim as f64 * 1.1 && out_peak <= in_peak * floor as f64 * 1.05,
+                    "{name} {db} dB: expected floor to outrank vlim while staying bounded ({out_peak:.4} vs vlim {vlim:.4}, cap {:.4})",
+                    in_peak * floor as f64
+                );
+                assert!(over_frac < 0.30, "{name} {db} dB: exceedance {:.2} % above upper bound", 100.0 * over_frac);
+            }
+        }
+    }
+}
+
+#[test]
+fn velocity_retry_treats_ignored_bands_as_fixed_and_preserves_sample_peak_limit() {
+    // S2: With low/high bands ignored (`vel_active = (1, 4)`), a 60 Hz +
+    // 650 Hz sum exceeds `vlim` even though the 60 Hz component alone is
+    // below `vlim`. Solving over all bands and discarding band 0's cut leaves
+    // the output velocity above `vlim`; the retry over eligible bands treats
+    // ignored contributions as fixed and cuts band 2 to hold `vlim`.
+    let mut x = vec![0.0f32; 24_000];
+    let low = sine(60.0, 0.7, 0.6);
+    let mid = sine(650.0, 0.25, 0.6);
+    x.extend(low.iter().zip(&mid).map(|(&a, &b)| a + b));
+    x.extend(vec![0.0; 4800]);
+
+    let mut p = only([false, false, true, false, true]);
+    for c in &mut p.ch[..2] {
+        c.max_velocity_attenuation_db = 24.0;
+    }
+    let mut u = Unit::new(p);
+    let vfs = p.ch[0].volts_full_scale as f64;
+    let vlim = p.ch[0].velocity_limit[0] as f64;
+    let out = run(&mut u, &[x.clone(), x.clone()], 256);
+    // Past the initial 2 ms attack ramp after latency, steady modeled velocity stays <= vlim.
+    let settle = LATENCY + 256 * 2;
+    let mut vout_full = TestVelModel::new(&p.ch[0], RATE as f64);
+    let mut steady_peak = 0.0f64;
+    for (idx, &y) in out[0].iter().enumerate() {
+        let v = vout_full.step(vfs * y as f64).abs();
+        if idx >= settle {
+            steady_peak = steady_peak.max(v);
+        }
+    }
+    assert!(steady_peak <= vlim * 1.01, "ignored-band retry left steady velocity {steady_peak:.4} above {vlim:.4}");
+
+    // S3: Enable sample-peak limiting (`amplitude_limit = 0.86`) on a
+    // third-harmonic cancelling waveform `0.90 sin(w t) + 0.30 sin(3 w t)`
+    // (`200 Hz` in ignored band 0, `600 Hz` in active band 1) where peak
+    // amplitude is 0.8485 <= 0.86 when both bands pass at unity. Because
+    // band 0's modeled velocity exceeds band 1's, `chain(..., all)` only cuts
+    // ignored band 0 and leaves active band 1 at unity; the velocity retry
+    // over `vel_active` then cuts band 1, removing cancellation and pushing
+    // the waveform peak above `0.86` unless the final fast-axis check
+    // re-enforces `amplitude_limit`.
+    let mut x_cancel = vec![0.0f32; 24_000];
+    let f0 = 200.0f64;
+    let harm: Vec<f32> = (0..(0.6 * RATE as f64) as usize)
+        .map(|k| {
+            let w = 2.0 * std::f64::consts::PI * f0 * k as f64 / RATE as f64;
+            (0.90 * w.sin() + 0.30 * (3.0 * w).sin()) as f32
+        })
+        .collect();
+    x_cancel.extend(harm);
+    x_cancel.extend(vec![0.0; 4800]);
+
+    let mut p_peak = only([true, false, true, false, true]);
+    for c in &mut p_peak.ch[..2] {
+        c.band_center_hz = [200.0, 600.0, 1200.0, 2400.0, 5000.0];
+        c.velocity_limit = [1.25, 1.25, 1.25];
+        c.max_velocity_attenuation_db = 24.0;
+        c.amplitude_limit = 0.86;
+    }
+    let mut u_peak = Unit::new(p_peak);
+    let out_peak_run = run(&mut u_peak, &[x_cancel.clone(), x_cancel], 256);
+    let mut vout_peak = TestVelModel::new(&p_peak.ch[0], RATE as f64);
+    let (mut max_amp, mut max_vel) = (0.0f32, 0.0f64);
+    for (idx, &y) in out_peak_run[0].iter().enumerate() {
+        let v = vout_peak.step(vfs * y as f64).abs();
+        if idx >= settle {
+            max_amp = max_amp.max(y.abs());
+            max_vel = max_vel.max(v);
+        }
+    }
+    assert!(
+        max_amp <= p_peak.ch[0].amplitude_limit,
+        "cancelling-band retry raised steady sample peak to {max_amp:.4} above {}",
+        p_peak.ch[0].amplitude_limit
+    );
+    assert!(
+        max_vel <= p_peak.ch[0].velocity_limit[0] as f64 * 1.01,
+        "fast-axis check left steady velocity {max_vel:.4} above {}",
+        p_peak.ch[0].velocity_limit[0]
+    );
+}
+
+#[test]
+fn floor_pinned_burst_does_not_block_separate_reducible_velocity_violation() {
+    // S4a: A loud 650 Hz pulse pins band 2 at MaxVelocityAttenuation (6 dB) and
+    // leaves a 1.2 m/s > 0.5 m/s velocity peak in the 416-sample retained
+    // window, while a simultaneous/adjacent 1600 Hz tone in band 3 is still
+    // reducible to <= vlim. The pinned sample must not stop the solver from
+    // cutting band 3.
+    let mut x = vec![0.0f32; 24_000];
+    let hi = sine(1600.0, 0.85, 0.4);
+    let burst = sine(650.0, 1.0, 0.4);
+    // Alternate 256-sample 650 Hz pulses (every 512 samples) over a steady
+    // 1600 Hz tone so every controller frame's 416-sample retained window sees
+    // the pinned 650 Hz peak alongside the reducible 1600 Hz-only segment.
+    for i in 0..hi.len() {
+        let pulse = if (i % 512) < 128 { burst[i] } else { 0.0 };
+        x.push(hi[i] + pulse);
+    }
+    x.extend(vec![0.0; 4800]);
+
+    let mut p = only([false, false, true, false, true]);
+    for c in &mut p.ch[..2] {
+        c.max_velocity_attenuation_db = 6.0;
+        c.velocity_limit = [0.5, 0.5, 0.5];
+    }
+    let mut u = Unit::new(p);
+    let vfs = p.ch[0].volts_full_scale as f64;
+    let vlim = p.ch[0].velocity_limit[0] as f64;
+    let mut vout = TestVelModel::new(&p.ch[0], RATE as f64);
+    let mut band3_min = 1.0f32;
+    let mut steady_hi_only_peak = 0.0f64;
+    let settle_block = 24_000 / 256 + 4;
+    for (bi, block) in x.chunks(256).enumerate() {
+        let out = run(&mut u, &[block.to_vec(), block.to_vec()], block.len());
+        let t = tel(&u).channels[0];
+        if bi >= settle_block && bi * 256 < 24_000 + hi.len() {
+            band3_min = band3_min.min(t.band_gain[3]);
+        }
+        for (j, &y) in out[0].iter().enumerate() {
+            let v = vout.step(vfs * y as f64).abs();
+            let idx = bi * 256 + j;
+            if idx >= 24_000 + LATENCY + 512 && idx < 24_000 + LATENCY + hi.len() {
+                let src_idx = idx - (24_000 + LATENCY);
+                // Measure well inside the 1600 Hz-only half of each 512-sample period.
+                if (src_idx % 512) >= 280 {
+                    steady_hi_only_peak = steady_hi_only_peak.max(v);
+                }
+            }
+        }
+    }
+    assert!(band3_min < 0.85, "expected band 3 to be cut despite pinned band 2, got {band3_min}");
+    assert!(
+        steady_hi_only_peak <= vlim * 1.05,
+        "pinned 650 Hz burst left 1600 Hz segment at {steady_hi_only_peak:.4} above {vlim:.4}"
+    );
+}
+
+#[test]
+fn velocity_retry_re_enforces_displacement_limit() {
+    // S4b: Two cancelling components (200 Hz in ignored band 0 and 600 Hz in
+    // active band 1) stay within displacement_limit when both pass at unity,
+    // while velocity exceeds vlim. Velocity retry cuts band 1, removing
+    // displacement cancellation and pushing modeled displacement above
+    // displacement_limit unless the fast-axis check re-enforces it.
+    let mut x = vec![0.0f32; 24_000];
+    let f0 = 200.0f64;
+    let harm: Vec<f32> = (0..(0.6 * RATE as f64) as usize)
+        .map(|k| {
+            let w = 2.0 * std::f64::consts::PI * f0 * k as f64 / RATE as f64;
+            (0.65 * w.sin() + 0.55 * (3.0 * w).sin()) as f32
+        })
+        .collect();
+    x.extend(harm);
+    x.extend(vec![0.0; 4800]);
+
+    let mut p = only([false, true, true, false, true]);
+    for c in &mut p.ch[..2] {
+        c.band_center_hz = [200.0, 600.0, 1200.0, 2400.0, 5000.0];
+        c.displacement_limit = 0.00050;
+        c.velocity_limit = [0.85, 0.85, 0.85];
+        c.max_velocity_attenuation_db = 24.0;
+    }
+    let mut u = Unit::new(p);
+    let out = run(&mut u, &[x.clone(), x], 256);
+    let vfs = p.ch[0].volts_full_scale as f64;
+    let settle = 24_000 + LATENCY + 256 * 2;
+    let mut dout = TestMotionModel::disp(&p.ch[0], RATE as f64);
+    let mut vout = TestVelModel::new(&p.ch[0], RATE as f64);
+    let (mut max_disp, mut max_vel) = (0.0f64, 0.0f64);
+    for (idx, &y) in out[0].iter().enumerate() {
+        let d = dout.step(vfs * y as f64).abs();
+        let v = vout.step(vfs * y as f64).abs();
+        if idx >= settle {
+            max_disp = max_disp.max(d);
+            max_vel = max_vel.max(v);
+        }
+    }
+    assert!(
+        max_disp <= p.ch[0].displacement_limit as f64 * 1.02,
+        "displacement re-enforcement left steady displacement {max_disp:.6} above {}",
+        p.ch[0].displacement_limit
+    );
+    assert!(
+        max_vel <= p.ch[0].velocity_limit[0] as f64 * 1.02,
+        "velocity check left steady velocity {max_vel:.4} above {}",
+        p.ch[0].velocity_limit[0]
+    );
+}
+
+#[test]
+fn fast_axis_fallback_enforces_limits_when_retry_budget_exhausted() {
+    // S4c: Exercise both (1) multi-axis streaming protection on `Unit` with a
+    // feasible velocity floor (`>= 0.99 * floor`) and (2) `enforce_fast_axes`
+    // fallback entry when 16 passes exhaust on coupled cancelling axes,
+    // including the `2a - 1.9b` / `-1.996a + 1.9b` floor-preserving case and
+    // a truly floor-infeasible case that permits below-floor cuts only after
+    // `[floor, req]` is shown infeasible.
+    let mut x = vec![0.0f32; 24_000];
+    let f0 = 200.0f64;
+    let sig: Vec<f32> = (0..(0.6 * RATE as f64) as usize)
+        .map(|k| {
+            let w = 2.0 * std::f64::consts::PI * f0 * k as f64 / RATE as f64;
+            (0.95 * w.sin() + 0.35 * (3.0 * w + 0.4).sin()) as f32
+        })
+        .collect();
+    x.extend(sig);
+    x.extend(vec![0.0; 4800]);
+
+    let mut p = only([true, true, true, false, true]);
+    let db = 6.0f32;
+    let floor = 10f32.powf(-db / 20.0);
+    for c in &mut p.ch[..2] {
+        c.band_center_hz = [200.0, 600.0, 1200.0, 2400.0, 5000.0];
+        c.amplitude_limit = 0.85;
+        c.displacement_limit = 0.00055;
+        c.velocity_limit = [1.05, 1.05, 1.05];
+        c.max_velocity_attenuation_db = db;
+    }
+    let mut u = Unit::new(p);
+    let vfs = p.ch[0].volts_full_scale as f64;
+    let settle = 24_000 + LATENCY + 256 * 2;
+    let mut dout = TestMotionModel::disp(&p.ch[0], RATE as f64);
+    let mut vout = TestVelModel::new(&p.ch[0], RATE as f64);
+    let (mut max_amp, mut max_disp, mut max_vel) = (0.0f32, 0.0f64, 0.0f64);
+    let mut min_active_gain = f32::MAX;
+    for (bi, block) in x.chunks(256).enumerate() {
+        let out = run(&mut u, &[block.to_vec(), block.to_vec()], block.len());
+        let t = tel(&u).channels[0];
+        for &g in &t.band_gain[1..4] {
+            min_active_gain = min_active_gain.min(g * t.gain);
+        }
+        for (j, &y) in out[0].iter().enumerate() {
+            let idx = bi * 256 + j;
+            let d = dout.step(vfs * y as f64).abs();
+            let v = vout.step(vfs * y as f64).abs();
+            if idx >= settle {
+                max_amp = max_amp.max(y.abs());
+                max_disp = max_disp.max(d);
+                max_vel = max_vel.max(v);
+            }
+        }
+    }
+    assert!(
+        min_active_gain >= 0.99 * floor * (1.0 - 1e-5),
+        "active band gain {min_active_gain} dropped below feasible velocity floor {floor}"
+    );
+    assert!(max_amp <= p.ch[0].amplitude_limit, "steady sample peak {max_amp:.4} exceeded {}", p.ch[0].amplitude_limit);
+    assert!(
+        max_disp <= p.ch[0].displacement_limit as f64 * 1.02,
+        "steady displacement {max_disp:.6} exceeded {}",
+        p.ch[0].displacement_limit
+    );
+    assert!(
+        max_vel <= p.ch[0].velocity_limit[0] as f64 * 1.02,
+        "steady velocity {max_vel:.4} exceeded {} (min active gain {min_active_gain}, floor {floor})",
+        p.ch[0].velocity_limit[0]
+    );
+
+    // 1) Coupled displacement (2a - 1.9b) and sample peak (-1.996a + 1.9b) on
+    // active velocity bands 1 and 2 with floor 0.5 and limits 0.0012:
+    // (0.5, 0.52579) is feasible, so fallback must preserve >= 0.5.
+    let mut probe = Unit::new(only([true, true, true, false, true]));
+    let (got_coupled, used_coupled) = probe.fast_axis_probe(
+        0,
+        [0.0, 2.0, -1.9, 0.0, 0.0],
+        [0.0; BANDS],
+        [0.0, -1.996, 1.9, 0.0, 0.0],
+        0.0012,
+        0.5,
+        0.0012,
+        0.5,
+    );
+    assert!(used_coupled, "expected fallback entry on coupled disp/peak fixture");
+    assert_eq!(probe.fast_axis_fallback_count(0), 1);
+    assert!((2.0 * got_coupled[1] - 1.9 * got_coupled[2]).abs() <= 0.0012, "{got_coupled:?}");
+    assert!((-1.996 * got_coupled[1] + 1.9 * got_coupled[2]).abs() <= 0.0012, "{got_coupled:?}");
+    assert!(
+        got_coupled[1] >= 0.5 && got_coupled[2] >= 0.5,
+        "expected floor-preserving active gains >= 0.5, got {got_coupled:?}"
+    );
+
+    // 1b) Thin-sliver feasible region on the same coupled fixture with
+    // floor = 0.5999999: (0.5999999, 0.6309473) preserves the floor and stays
+    // within the 0.0012 limits.
+    let sliver_floor = 0.5999999;
+    let (got_sliver, used_sliver) = probe.fast_axis_probe(
+        0,
+        [0.0, 2.0, -1.9, 0.0, 0.0],
+        [0.0; BANDS],
+        [0.0, -1.996, 1.9, 0.0, 0.0],
+        0.0012,
+        0.5,
+        0.0012,
+        sliver_floor,
+    );
+    assert!(used_sliver, "expected fallback entry on thin-sliver coupled disp/peak fixture");
+    assert_eq!(probe.fast_axis_fallback_count(0), 2);
+    assert!((2.0 * got_sliver[1] - 1.9 * got_sliver[2]).abs() <= 0.0012, "{got_sliver:?}");
+    assert!((-1.996 * got_sliver[1] + 1.9 * got_sliver[2]).abs() <= 0.0012, "{got_sliver:?}");
+    assert!(
+        got_sliver[1] >= sliver_floor as f32 && got_sliver[2] >= sliver_floor as f32,
+        "expected floor-preserving active gains >= {sliver_floor}, got {got_sliver:?}"
+    );
+
+    // 1c) Exact-f64 infeasible / f32-feasible rounding boundary on the same
+    // coupled fixture: floor = 0.6 with limits (0.0012013912, 0.0011985302).
+    let (got_round, used_round) = probe.fast_axis_probe(
+        0,
+        [0.0, 2.0, -1.9, 0.0, 0.0],
+        [0.0; BANDS],
+        [0.0, -1.996, 1.9, 0.0, 0.0],
+        0.0012013912,
+        0.5,
+        0.0011985302,
+        0.6,
+    );
+    assert!(used_round, "expected fallback entry on f32-rounding coupled disp/peak fixture");
+    assert_eq!(probe.fast_axis_fallback_count(0), 3);
+    assert!((2.0 * got_round[1] - 1.9 * got_round[2]).abs() <= 0.0012013912, "{got_round:?}");
+    assert!((-1.996 * got_round[1] + 1.9 * got_round[2]).abs() <= 0.0011985302, "{got_round:?}");
+    assert!(
+        got_round[1] >= 0.6 && got_round[2] >= 0.6,
+        "expected floor-preserving active gains >= 0.6, got {got_round:?}"
+    );
+
+    // 1d) Lowering only the peak limit to 0.00119849 at floor = 0.6 makes the
+    // relaxed LP feasible in f64 (BoxSearch::Undecided) while [0.6, 1.0]^2 is
+    // f32-infeasible; fallback must cut below floor rather than returning an
+    // unverified floor_req that violates displacement and sample peak.
+    let (got_undecided, used_undecided) = probe.fast_axis_probe(
+        0,
+        [0.0, 2.0, -1.9, 0.0, 0.0],
+        [0.0; BANDS],
+        [0.0, -1.996, 1.9, 0.0, 0.0],
+        0.0012013912,
+        0.5,
+        0.00119849,
+        0.6,
+    );
+    assert!(used_undecided, "expected fallback entry when BoxSearch::Undecided");
+    assert_eq!(probe.fast_axis_fallback_count(0), 4);
+    assert!((2.0 * got_undecided[1] - 1.9 * got_undecided[2]).abs() <= 0.0012013912, "{got_undecided:?}");
+    assert!((-1.996 * got_undecided[1] + 1.9 * got_undecided[2]).abs() <= 0.00119849, "{got_undecided:?}");
+    assert!(got_undecided[1] > 0.0 && got_undecided[2] > 0.0 && got_undecided[1] < 0.6, "{got_undecided:?}");
+
+    // 2) Coupled displacement (2a - 1.996b) and velocity (-1.996a + 2b) with
+    // floor 0.25 on active band 1 and limits 0.002.
+    let (got_vel, used_vel) = probe.fast_axis_probe(
+        0,
+        [2.0, -1.996, 0.0, 0.0, 0.0],
+        [-1.996, 2.0, 0.0, 0.0, 0.0],
+        [0.0; BANDS],
+        0.002,
+        0.002,
+        1.0,
+        0.25,
+    );
+    assert!(used_vel, "expected fallback entry on coupled disp/vel fixture");
+    assert_eq!(probe.fast_axis_fallback_count(0), 5);
+    assert!((2.0 * got_vel[0] - 1.996 * got_vel[1]).abs() <= 0.002, "{got_vel:?}");
+    assert!((-1.996 * got_vel[0] + 2.0 * got_vel[1]).abs() <= 0.002, "{got_vel:?}");
+    assert!(got_vel[1] >= 0.25, "expected active gain >= 0.25, got {got_vel:?}");
+
+    // 3) Truly floor-infeasible coupled fixture (floor 0.7 > 0.6 max feasible `a`
+    // for 2a - 1.9b <= 0.0012 and -1.996a + 1.9b <= 0.0012): below-floor cut
+    // is permitted and still satisfies both limits.
+    let (got_below, used_below) = probe.fast_axis_probe(
+        0,
+        [0.0, 2.0, -1.9, 0.0, 0.0],
+        [0.0; BANDS],
+        [0.0, -1.996, 1.9, 0.0, 0.0],
+        0.0012,
+        0.7,
+        0.0012,
+        0.7,
+    );
+    assert!(used_below, "expected fallback entry on below-floor coupled fixture");
+    assert!((2.0 * got_below[1] - 1.9 * got_below[2]).abs() <= 0.0012, "{got_below:?}");
+    assert!((-1.996 * got_below[1] + 1.9 * got_below[2]).abs() <= 0.0012, "{got_below:?}");
+    assert!(got_below[1] < 0.7 && got_below[1] > 0.0, "{got_below:?}");
+}
