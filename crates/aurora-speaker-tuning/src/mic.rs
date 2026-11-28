@@ -38,7 +38,7 @@
 //! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, measured against black-box whole-graph renders of the unit (broadband, wind-like, steered, onset: 43-60 dB; low-level and tone-in-noise residuals), TODO(SPEC) | approximate |
 //! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
 //! | bypassed in the strip | nothing | bypassed |
-//! | `aufx/sens` after the analysis (frequency domain, before the beam) | the same suppressor carried before the transform: black-box equal there, one block later than the unit, so only together with the trackpad block | approximate |
+//! | `aufx/sens` after the analysis (frequency domain, before the beam) | the same suppressor carried before the transform: black-box equal there, one block later than the unit; with the trackpad block below the two blocks cancel, without it the blob carries one block (10 ms) more latency than the unit, stated in the report | approximate |
 //! | trackpad block (`aufx/nnet` bypassed, `delay` set from its latency, `adif`, `dbgn`, `asum`) | one block of delay (black-box exact), which the frequency-placed suppressor's block carries; the unit not bypassed, or the block alone, refuses | exact |
 //! | anything else | refused, partial or not | refused |
 //!
@@ -2132,10 +2132,15 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
         node = nx;
     }
     if freq_sens_block {
-        r.refusals.push(
-            "a frequency-placed suppressor runs one block later than the unit and no trackpad block carries that block"
+        // measured: the same output as the unit, one block later; the
+        // blob's latency says so, so a host aligns it
+        r.notes.push(
+            "the frequency-placed suppressor runs one block later than the unit (no trackpad block absorbs it): \
+             lag-aligned approximate parity with the unit, one block (10 ms at 48 kHz) more latency than macOS, \
+             carried in the blob's latency"
                 .into(),
         );
+        r.todo("frequency-placed suppressor: one block more latency than the unit (a frequency-domain suppressor stage would remove it)");
     }
     // every box off the path must be a dead end, parameter logic, or bypassed
     for bx in &g.boxes {
