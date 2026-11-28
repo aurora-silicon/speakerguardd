@@ -51,6 +51,12 @@ pub const PROTECTION_CONTROL: &str = "Speaker Protection";
 pub const CROSSOVER_CONTROL: &str = "Speaker Protection Crossover";
 /// The per-amp fault control's name suffix.
 pub const FAULT_CONTROL_SUFFIX: &str = "Amp Fault Status";
+
+/// The kernel's count of system sleeps begun since the card bound, bumped
+/// before the freezer (macaudio "Speaker Protection Sleeps"). Read before a
+/// renewal and again at a lapse, an unchanged count proves the lapse was a
+/// stall, not a sleep. Kernels without it answer [`Kernel::sleeps`] `None`.
+pub const SLEEPS_CONTROL: &str = "Speaker Protection Sleeps";
 /// The per-amp analog gain control's name suffix.
 pub const GAIN_CONTROL_SUFFIX: &str = "Amp Gain Volume";
 /// The mux that picks the front-end driving the speakers.
@@ -155,6 +161,11 @@ pub trait Kernel {
     /// The front-end "Speaker Playback Mux" selects ("Primary", "Secondary"),
     /// or `None` if the card has no such mux.
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError>;
+    /// The kernel's sleep count ([`SLEEPS_CONTROL`]), or `None` on a kernel
+    /// without it.
+    fn sleeps(&mut self) -> Result<Option<u32>, KernelError> {
+        Ok(None)
+    }
 }
 
 /// A level's raw value and centi-dB, for the double.
@@ -182,6 +193,8 @@ pub struct Recorder {
     /// maximum is the released level, the kernel's floor.
     pub ceiling: Option<Option<i32>>,
     pub route: Option<String>,
+    /// The kernel's sleep count; `None`: a kernel without the control.
+    pub sleeps: Option<u32>,
 }
 
 impl Recorder {
@@ -249,6 +262,9 @@ impl Kernel for Recorder {
     }
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
         Ok(self.route.clone())
+    }
+    fn sleeps(&mut self) -> Result<Option<u32>, KernelError> {
+        Ok(self.sleeps)
     }
 }
 
@@ -648,6 +664,12 @@ mod alsa {
         }
         fn granted(&mut self) -> Result<bool, KernelError> {
             Ok(self.read(elem_id(PROTECTION_CONTROL))?.value[0] == 1)
+        }
+        fn sleeps(&mut self) -> Result<Option<u32>, KernelError> {
+            let Some(id) = self.ids()?.into_iter().find(|id| id_name(id) == SLEEPS_CONTROL) else {
+                return Ok(None);
+            };
+            Ok(Some(self.read(id)?.value[0].clamp(0, i64::from(u32::MAX)) as u32))
         }
         fn faults(&mut self) -> Result<Vec<AmpFault>, KernelError> {
             let mut out = Vec::new();

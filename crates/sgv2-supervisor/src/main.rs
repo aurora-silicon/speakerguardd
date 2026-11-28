@@ -1160,14 +1160,16 @@ mod linux {
                 lapse.sleep();
             }
             (suspended, slept) = (s, n);
+            // the kernel's sleep count before this tick's renewal: a lapse
+            // is a stall only if it has not moved since (see
+            // `lease::LapseWitness`); unreadable counts as unknown
+            let kernel_sleeps = kernel.sleeps().unwrap_or(None);
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
             // a held-off re-grant: this tick counts as one without demand
             // (every check still runs, so the grant comes on the first tick
             // after the hold)
             let demand_seen = obs.demand;
-            // a lapse taken for a late tick holds the re-grant until the
-            // suspend counters confirm it (`lease::LAPSE_CONFIRM_NS`)
-            let holding = regrant.holding(now_ns()) | lapse.confirming(now_ns());
+            let holding = regrant.holding(now_ns());
             if holding != held_off {
                 held_off = holding;
                 if !holding {
@@ -1214,7 +1216,7 @@ mod linux {
             }
             // what a lapse is measured from (the lapse itself is answered below)
             match &event {
-                Ok(Event::Granted | Event::Renewed) => lapse.renewed(now_ns()),
+                Ok(Event::Granted | Event::Renewed) => lapse.renewed(now_ns(), kernel_sleeps),
                 Ok(Event::Lapsed) => {}
                 _ if !sup.granted() => lapse.released(),
                 _ => {}
@@ -1259,18 +1261,17 @@ mod linux {
                         lapse.sleep();
                     }
                     (suspended, slept) = (s, n);
-                    match lapse.answer(now_ns(), &mut observer) {
+                    match lapse.answer(now_ns(), kernel.sleeps().unwrap_or(None), &mut observer) {
                         // after a sleep the next grant waits for the engine
                         // to beat steadily after the thaw
                         LapseCause::Sleep => eprintln!("lease lapsed; re-qualifying"),
-                        // a late tick, provisionally: once the suspend
-                        // counters have read unchanged for the confirm
-                        // window, the lease's own rule (two clean ticks)
-                        // re-grants
+                        // a late tick, proven by the kernel's sleep count:
+                        // the engine's beats and this tick's checks are
+                        // honest, and the lease's own rule (two clean
+                        // ticks) re-grants
                         LapseCause::Stall { since_renew_ns } => eprintln!(
-                            "lease lapsed: renewed {} ms after the last renewal, with no system sleep; re-granting after a {} ms check of the suspend counters",
-                            since_renew_ns / 1_000_000,
-                            sgv2_supervisor::lease::LAPSE_CONFIRM_NS / 1_000_000
+                            "lease lapsed: renewed {} ms after the last renewal, and the kernel counted no system sleep; re-qualifying",
+                            since_renew_ns / 1_000_000
                         ),
                     }
                 }

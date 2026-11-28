@@ -13,7 +13,7 @@
 //! overflowed the plugin's 500 ms wake. Timings here are synthetic.
 
 use crate::kernel::{AmpFault, AmpLevel, Kernel, KernelError, Recorder};
-use crate::lease::{LapseCause, LapseWitness, Observation, LAPSE_CONFIRM_NS};
+use crate::lease::{LapseCause, LapseWitness};
 use crate::machine::{Amp, Machine};
 use crate::observe::{
     EngineState, EngineView, Observer, PcmState, PcmView, SessionReport, SessionView, RESUME_SETTLE_NS,
@@ -58,6 +58,9 @@ impl Kernel for Card {
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
         self.k.speaker_route()
     }
+    fn sleeps(&mut self) -> Result<Option<u32>, KernelError> {
+        self.k.sleeps()
+    }
 }
 
 struct E(EngineState);
@@ -93,7 +96,8 @@ impl Loop {
         Loop {
             o: Observer::new(CRC, 48_000, TICK),
             s: Supervisor::new(Expect::new(&SN6, vec![11_890; 6], "Secondary")),
-            k: Card { k: Recorder::healthy(6), lapse_next: false },
+            // a kernel with the sleep count ("Speaker Protection Sleeps")
+            k: Card { k: Recorder { sleeps: Some(0), ..Recorder::healthy(6) }, lapse_next: false },
             w: LapseWitness::default(),
             now: 0,
         }
@@ -129,18 +133,28 @@ impl Loop {
             demand: true,
         };
         let obs = self.o.observe(&mut || now, &mut E(e), &mut P(PcmState::Running { owner: PID }), &mut S(r));
-        // as `main`: a lapse taken for a late tick holds the re-grant until
-        // the suspend counters confirm it
-        let obs = if self.w.confirming(now) { Observation { demand: false, ..obs } } else { obs };
+        // as `main`: the kernel's sleep count before the renewal
+        let before = self.k.sleeps().unwrap();
         let event = self.s.tick(obs, &mut self.k).expect("no fatal kernel error");
         let mut cause = None;
         match event {
-            Event::Lapsed => cause = Some(self.w.answer(now, &mut self.o)),
-            Event::Granted | Event::Renewed => self.w.renewed(now),
+            Event::Lapsed => {
+                let at = self.k.sleeps().unwrap();
+                cause = Some(self.w.answer(now, at, &mut self.o))
+            }
+            Event::Granted | Event::Renewed => self.w.renewed(now, before),
             _ if !self.s.granted() => self.w.released(),
             _ => {}
         }
         (event, cause)
+    }
+
+    /// A system sleep begins as the kernel sees it: the sleep count moves at
+    /// PM_SUSPEND_PREPARE, before the freezer, whenever the suspend
+    /// counters userspace reads catch up.
+    fn kernel_sleep(&mut self) {
+        let n = self.k.k.sleeps.expect("a kernel with the sleep count");
+        self.k.k.sleeps = Some(n + 1);
     }
 
     /// Ticks every 10 ms until a grant; how long it took.
@@ -180,56 +194,53 @@ fn a_late_tick_lapse_regrants_on_the_next_clean_tick_without_the_sleep_settle() 
     assert_eq!(cause, Some(LapseCause::Stall { since_renew_ns: 39 * MS }));
     assert!(!l.s.granted());
     assert!(!l.o.waiting_after_sleep(), "a late tick was taken for a sleep");
-    // provisional: the re-grant waits for the suspend counters to read
-    // unchanged for the confirm window, then the lease's two clean ticks;
-    // still far short of the post-sleep settle and the 500 ms wake
-    let t = l.until_granted();
-    assert!(t >= LAPSE_CONFIRM_NS, "re-granted at {t} ns, before the counters were confirmed");
-    assert!(t <= LAPSE_CONFIRM_NS + 3 * TICK, "re-grant took {t} ns");
-    assert!(t < RESUME_SETTLE_NS);
+    // the lapsed tick was clean, so the next clean tick grants
+    assert_eq!(l.until_granted(), TICK);
 }
 
-/// Review (#289): an aborted or sub-millisecond suspend leaves no
-/// BOOTTIME gap and the kernel bumps `suspend_stats` only after the thaw and
-/// the PM_POST_SUSPEND notifiers, so the counters can show the sleep ticks
-/// after the lapse it caused. It still settles.
+/// Review (#289, REVIEW6 at 22b3e770): an aborted or sub-millisecond
+/// suspend leaves no BOOTTIME gap, and the kernel bumps `suspend_stats`
+/// only after the thaw and the PM_POST_SUSPEND chain, with no bound on how
+/// late. The kernel's own count moved before the freezer, so the lapse is a
+/// sleep however late (or never) the suspend counters show it.
 #[test]
-fn a_sleep_the_counters_show_two_ticks_late_still_settles() {
-    // the review's case used a 150 ms gap, a stall under the old 250 ms
-    // bound and a sleep by age under 100 ms; a measured late-tick gap keeps
-    // it a stall
-    let mut l = Loop::steady();
-    l.now += 39 * MS;
-    l.k.lapse_next = true;
-    assert_eq!(l.tick(false).0, Event::Lapsed);
-    l.now += TICK;
-    let second = l.tick(false).0;
-    l.now += TICK;
-    let _ = l.tick(true); // suspend_stats finally moved
-    assert_ne!(second, Event::Granted, "granted before the counters showed the sleep");
-    assert!(l.o.waiting_after_sleep(), "the late counters were not taken for a sleep");
-    assert!(l.until_granted() >= RESUME_SETTLE_NS - 2 * TICK, "granted before the post-sleep settle");
-}
-
-/// The counters may lag by up to the whole confirm window: a sleep seen on
-/// the last tick inside it still settles; one tick later the stall is
-/// confirmed and a later sleep is a new event of its own.
-#[test]
-fn a_sleep_seen_anywhere_in_the_confirm_window_settles() {
-    let ticks = (LAPSE_CONFIRM_NS / TICK) as usize;
-    for k in 1..ticks {
+fn a_sleep_the_suspend_counters_show_late_or_never_still_settles() {
+    for late in [None, Some(2u64), Some(8), Some(40)] {
         let mut l = Loop::steady();
+        // the sleep began (and ended) inside this 39 ms gap
+        l.kernel_sleep();
         l.now += 39 * MS;
         l.k.lapse_next = true;
-        assert_eq!(l.tick(false).0, Event::Lapsed);
-        for i in 1..=k {
+        assert_eq!(l.tick(false), (Event::Lapsed, Some(LapseCause::Sleep)), "late {late:?}");
+        assert!(l.o.waiting_after_sleep(), "late {late:?}");
+        let t0 = l.now;
+        let mut granted = None;
+        for k in 1..=400u64 {
             l.now += TICK;
-            let ev = l.tick(i == k).0;
-            assert_ne!(ev, Event::Granted, "k {k} tick {i}: granted inside the confirm window");
+            if l.tick(Some(k) == late).0 == Event::Granted {
+                granted = Some(l.now - t0);
+                break;
+            }
         }
-        assert!(l.o.waiting_after_sleep(), "k {k}");
-        assert!(l.until_granted() >= RESUME_SETTLE_NS - (k as u64) * TICK, "k {k}: granted before the settle");
+        let t = granted.expect("granted again");
+        assert!(t >= RESUME_SETTLE_NS - TICK, "late {late:?}: granted {t} ns after the lapse, before the settle");
     }
+}
+
+/// A kernel without the sleep count cannot prove a stall: every lapse
+/// keeps the post-sleep settle, as on main.
+#[test]
+fn without_the_kernel_sleep_count_every_lapse_settles() {
+    let mut l = Loop::steady();
+    l.k.k.sleeps = None;
+    // one renewal at the old kernel's count (none)
+    l.now += TICK;
+    assert_eq!(l.tick(false).0, Event::Renewed);
+    l.now += 39 * MS;
+    l.k.lapse_next = true;
+    assert_eq!(l.tick(false), (Event::Lapsed, Some(LapseCause::Sleep)));
+    assert!(l.o.waiting_after_sleep());
+    assert!(l.until_granted() >= RESUME_SETTLE_NS - TICK);
 }
 
 #[test]
@@ -329,13 +340,16 @@ fn review_a_sleep_inside_the_lapsed_tick_still_waits_for_the_settle() {
     // adversarial (AIRS-GAPS review): the system suspends after this tick's
     // sleep check and before its renewal write. CLOCK_MONOTONIC stops
     // during the sleep, so the lapse looks like a 10 ms late tick (Stall);
-    // only the NEXT tick's check sees the suspend clock moved.
+    // only the NEXT tick's check sees the suspend clock moved. The
+    // kernel's count moved before the freezer, after the last renewal: the
+    // lapse is a sleep on this very tick.
     let mut l = Loop::steady();
     l.now += TICK;
+    l.kernel_sleep();
     l.k.lapse_next = true;
     let (event, cause) = l.tick(false);
     assert_eq!(event, Event::Lapsed);
-    assert_eq!(cause, Some(LapseCause::Stall { since_renew_ns: TICK }));
+    assert_eq!(cause, Some(LapseCause::Sleep));
     let t0 = l.now;
     l.now += TICK;
     let (event, _) = l.tick(true);
@@ -353,5 +367,5 @@ fn review_back_to_back_stalls_each_need_a_fresh_renewal() {
     l.now += 39 * MS;
     l.k.lapse_next = true;
     assert_eq!(l.tick(false).1, Some(LapseCause::Stall { since_renew_ns: 39 * MS }));
-    assert_eq!(l.w.lapsed(l.now + 39 * MS), LapseCause::Sleep);
+    assert_eq!(l.w.lapsed(l.now + 39 * MS, Some(0)), LapseCause::Sleep);
 }
