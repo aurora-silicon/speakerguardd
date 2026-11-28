@@ -50,15 +50,16 @@ pub struct Persisted {
     pub record: HandOff,
 }
 
-/// `/proc/sys/kernel/random/boot_id` ("xxxxxxxx-xxxx-...") as 16 bytes.
+/// `/proc/sys/kernel/random/boot_id` ("xxxxxxxx-xxxx-...") as 16 bytes:
+/// exactly 32 hex digits once the dashes are dropped, or `None`.
 pub fn parse_boot_id(text: &str) -> Option<[u8; 16]> {
-    let hex: String = text.trim().chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
+    let digits: Vec<u32> = text.trim().chars().filter(|c| *c != '-').map(|c| c.to_digit(16)).collect::<Option<_>>()?;
+    if digits.len() != 32 {
         return None;
     }
     let mut out = [0u8; 16];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    for (b, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        *b = (pair[0] << 4 | pair[1]) as u8;
     }
     Some(out)
 }
@@ -255,5 +256,16 @@ mod tests {
         assert_eq!(b[0], 0x0f);
         assert_eq!(b[15], 0xf0);
         assert_eq!(parse_boot_id("nope"), None);
+    }
+
+    #[test]
+    fn a_boot_id_is_32_hex_digits_and_nothing_else_parses() {
+        // 32 bytes once the dashes go, but not 32 hex digits: a multi-byte
+        // character used to split inside a pair and abort the supervisor
+        assert_eq!(parse_boot_id(&format!("0\u{e9}{}", "0".repeat(29))), None);
+        // a sign is no digit, though `from_str_radix` takes one
+        assert_eq!(parse_boot_id(&format!("+f{}", "0".repeat(30))), None);
+        let upper = parse_boot_id("0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0").unwrap();
+        assert_eq!(Some(upper), parse_boot_id("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"));
     }
 }

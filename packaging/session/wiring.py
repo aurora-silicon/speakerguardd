@@ -4,6 +4,8 @@
     wiring.py {derive|describe} [--dt ROOT | --dtb FILE.dtb | --hw HW.json]
                                 (--tuning-json DUMP.json | -- TUNING-CLI-ARGS...) [--key KEY]
     wiring.py hardware [--dt ROOT | --dtb FILE.dtb | --hw HW.json]
+    wiring.py caps [--dt ROOT | --dtb FILE.dtb | --hw HW.json] [--live]
+                   [--tuning-json DUMP.json | -- TUNING-CLI-ARGS...]
 
 The protect stage needs two maps (packaging/session/gen.py):
 
@@ -59,9 +61,11 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
+from collections import namedtuple
 
 SCHEMA = 1
 
@@ -128,14 +132,19 @@ TRANSPORTS = {
     # sound/soc/apple/aop_t8140.rs: S32_LE playback, no sense
     "apple,t8140-aop-audio": {"transport": "aop-t8140", "formats": ["S32_LE"], "sense_batch": True, "speaker_headroom": 0,
                               "speaker_irq": True},
-    # t8152_aop_audio.rs, T8142 configuration: ADMAC burst-residue DMA,
-    # S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    # t8152_aop_audio.rs, T8142/T6050/T8152 configurations: ADMAC burst-residue
+    # DMA, S24_LE playback and S16_LE sense, not the T6041 firmware ring above.
+    # As there, the sense is the audio node's "sense" DMA channel: a Mac
+    # whose AOP speaker stream carries none (e.g. the M5 Mac Studio's ADT
+    # audio-speaker has one TX slot and no RX slot) names none (transport_senses).
     "apple,t8142-aop-audio": {"transport": "aop-dma", "formats": ["S24_LE"], "sense_batch": False, "speaker_headroom": 0,
-                              "speaker_irq": False},
+                              "speaker_irq": False, "speaker_dma": "spkr", "sense_dma": "sense"},
 }
-# The T6050 (J714s) is the same driver's T6050 configuration: six amps on the
-# T8142 transport.
+# The T6050 (J714s) and T8152 (J804, J873g) bind the same t8152_aop_audio.rs
+# driver: PCM widths follow the link's amps and sense path, and the self-check
+# refuses a sensed wiring on a card with no sense PCM.
 TRANSPORTS["apple,t6050-aop-audio"] = TRANSPORTS["apple,t8142-aop-audio"]
+TRANSPORTS["apple,t8152-aop-audio"] = TRANSPORTS["apple,t8142-aop-audio"]
 # Newer device trees omit the generic MCA fallback. Both compatibles bind
 # mca.c; share the entry so back-ends using either name are the same driver.
 TRANSPORTS["apple,t8103-mca"] = TRANSPORTS["apple,mca"]
@@ -160,6 +169,10 @@ SENSE_HEADROOM = 512
 PLUGINS = {(1, 0): "1ch", (2, 0): "2ch", (2, 4): "2ch-vi", (4, 0): "4ch", (4, 8): "4ch-vi", (6, 12): "6ch-vi"}
 # The protection units that model from the amps' V/I sense.
 SENSE_UNITS = ("spp3",)
+# The protection units that run without it (atsp open loop, lsm2 from its
+# model alone): the only ones a transport that carries no sense admits. An
+# allowlist, so that a unit added later is refused there until it is named.
+NO_SENSE_UNITS = ("atsp", "lsm2")
 
 _PREFIX = re.compile(r"^(?:(Left|Right)\s+)?(Woofer|Tweeter|Speaker|Full[- ]Range)(?:\s+(\d+))?$")
 _ROLES = {"woofer": "woofer", "tweeter": "tweeter", "speaker": "full", "full-range": "full", "full range": "full"}
@@ -203,6 +216,46 @@ def _strs(raw):
 def _read(path):
     with open(path, "rb") as f:
         return f.read()
+
+
+def read_user_file(path, cap, follow=False):
+    """A file in a directory a user owns, read as root with the supervisor's
+    rules for the helper report (read_report): no final link followed
+    (unless `follow`), a regular file only, opened without blocking, at most
+    `cap` bytes. None for anything else (missing, a link, a FIFO, a device,
+    a directory, longer than `cap`): the caller treats it as not readable.
+    The type is checked on an O_PATH reference before anything is opened
+    for reading, so no device or FIFO is ever opened; the read reopens that
+    same inode, so a link swapped in between changes nothing."""
+    flags = os.O_PATH | os.O_CLOEXEC
+    if not follow:
+        flags |= os.O_NOFOLLOW
+    try:
+        ref = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(ref).st_mode):
+            return None
+        fd = os.open(f"/proc/self/fd/{ref}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    finally:
+        os.close(ref)
+    try:
+        data = b""
+        while len(data) <= cap:
+            chunk = os.read(fd, cap + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > cap:
+        return None
+    return data.decode(errors="replace")
 
 
 def _phandles(root):
@@ -278,6 +331,7 @@ def _links(snd, root, phandles, sysfs):
                 c["i2c"] = i2c
             codecs.append(c)
         cpu_compat, cpu_dmas = [], []
+        cpu_nodes = [os.path.relpath(node, root) for node in cpu]
         for node in cpu:
             f = os.path.join(node, "compatible")
             cpu_compat.append(_strs(_read(f)) if os.path.exists(f) else [])
@@ -285,9 +339,73 @@ def _links(snd, root, phandles, sysfs):
             cpu_dmas.append(_strs(_read(f)) if os.path.exists(f) else None)
         links.append(
             {"name": _str(_read(os.path.join(p, "link-name"))), "cpus": len(cpu), "cpu_compatible": cpu_compat,
-             "cpu_dma_names": cpu_dmas, "codecs": codecs}
+             "cpu_dma_names": cpu_dmas, "cpu_nodes": cpu_nodes, "codecs": codecs}
         )
     return links
+
+
+def audio_stack(sound, root="/proc/device-tree", modules="/sys/module"):
+    """A fingerprint (16 hex digits) of what carries the speaker and sense
+    words on this boot, beyond the kernel release: the speaker card's node
+    `sound` (relative to `root`, with everything under it), the nodes its
+    links' `sound-dai` lists point at (the serializer and amp nodes, their
+    own properties), and the build ID of every loaded sound module (and of
+    the AOP core). A
+    rebuilt module or a changed device tree under the same release (the
+    J615's MCA receiver moved one bit clock by a module and a DT property)
+    changes it. "-" when `sound` is not in the tree."""
+    root = os.path.realpath(root)
+    snd = os.path.join(root, sound)
+    if not sound or not os.path.isdir(snd):
+        return "-"
+    h = hashlib.sha256()
+
+    def props(node, recursive):
+        for d, dirs, files in os.walk(node):
+            dirs.sort()
+            for name in sorted(files):
+                f = os.path.join(d, name)
+                h.update(os.path.relpath(f, root).encode() + b"\0")
+                try:
+                    h.update(_read(f))
+                except OSError:
+                    h.update(b"\xff")
+                h.update(b"\0")
+            if not recursive:
+                dirs[:] = []
+
+    props(snd, True)
+    phandles = _phandles(root)
+    nodes = set()
+    for d in sorted(os.listdir(snd)):
+        for side in ("cpu", "codec"):
+            f = os.path.join(snd, d, side, "sound-dai")
+            if os.path.exists(f):
+                try:
+                    nodes.update(_dai_list(_read(f), phandles))
+                except Refused:
+                    h.update(f"unresolved {d}/{side}".encode())
+    for node in sorted(nodes):
+        props(node, False)
+    try:
+        names = sorted(os.listdir(modules))
+    except OSError:
+        names = []
+    for m in names:
+        # the sound modules, and the AOP core the AOP Macs' speaker and
+        # sense rings run through (not its sensor clients)
+        if not (m.startswith("snd") or m == "aop"):
+            continue
+        h.update(f"module {m}\0".encode())
+        # the loaded binary: its GNU build ID note (srcversion exists only
+        # for modules with a MODULE_VERSION or CONFIG_MODULE_SRCVERSION_ALL)
+        for f in ("notes/.note.gnu.build-id", "srcversion"):
+            try:
+                h.update(_read(os.path.join(modules, m, f)))
+            except OSError:
+                h.update(b"-")
+            h.update(b"\0")
+    return h.hexdigest()[:16]
 
 
 def has_speaker_link(node):
@@ -302,6 +420,22 @@ def has_speaker_link(node):
         except OSError:
             continue
     return False
+
+
+def card_registered(card_dir, proc="/proc/asound"):
+    """Whether ALSA has finished registering the card at `card_dir`
+    (/sys/class/sound/cardN). snd_card_register() adds the card device
+    first (the sysfs directory with its id and of_node link), then the
+    card's devices with the control device controlCN last, then publishes
+    the card for lookup by number and id, and adds the card's proc entries
+    (/proc/asound/cardN) at the very end. In between the card can be found
+    but not opened: amixer then fails as if the card had no such control,
+    and the proc PCM list is missing. Registered = controlCN in sysfs and,
+    where ALSA's proc interface exists (`proc`), /proc/asound/cardN/id."""
+    m = re.fullmatch(r"card(\d+)", os.path.basename(os.path.normpath(card_dir)))
+    if not m or not os.path.exists(os.path.join(card_dir, f"controlC{m.group(1)}")):
+        return False
+    return not os.path.isdir(proc) or os.path.exists(os.path.join(proc, f"card{m.group(1)}", "id"))
 
 
 def read_dt(root="/proc/device-tree", sysfs="/sys/bus/i2c/devices"):
@@ -439,45 +573,6 @@ def speaker_format(t):
     return fmt
 
 
-def describe(hw, w):
-    """Everything the protect stage's graph needs that is not the channel
-    map: derived from the device tree (and the wiring derived from it),
-    and the tuning's sample rate.
-    The self-check checks the card id and the format against ALSA."""
-    t = transport(hw)
-    # LSID is a side-chain inside the existing LSM2 governor. Plain LSM2
-    # bundles still have no sense ports; only an explicit companion requests
-    # the V/I variant. The self-check proves the sense map either way.
-    n = len(w["amps"])
-    takes_sense = w.get("unit_kind") in (None, *SENSE_UNITS) or w.get("sense_companion", False)
-    s = len(w["sense"]) if takes_sense else 0
-    plugin = PLUGINS.get((n, s))
-    if plugin is None:
-        raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
-    fmt = speaker_format(t)
-    speaker_pcm, sense_pcm = pcm_widths(t, n, len(w["sense"]))
-    return {
-        "key": machine_key(hw),
-        "board": hw["board"],
-        "card": card_id(hw),
-        "name": hw.get("model") or card_id(hw),
-        "transport": t["transport"],
-        "amps": n,
-        "sense": s,
-        # the PCMs' own widths: the amps' lanes come first (PCM widths above)
-        "speaker_pcm": speaker_pcm,
-        "sense_pcm": sense_pcm,
-        "rate": w["rate"],
-        "plugin": plugin,
-        "alsa_format": fmt,
-        "speaker_format": PW_FORMAT[fmt],
-        "speaker_headroom": t["speaker_headroom"],
-        "sense_headroom": SENSE_HEADROOM if s else 0,
-        "sense_batch": t["sense_batch"],
-        "speaker_irq": t["speaker_irq"],
-    }
-
-
 def pcm_widths(t, amps, sense):
     """The channel counts the speaker and sense PCMs open with, for `amps`
     amps and `sense` sense lanes on transport `t` (PCM widths above)."""
@@ -564,6 +659,11 @@ def hardware(hw):
         families.add(fam)
         side, role, ordinal = parse_prefix(c["prefix"])
         a = {"prefix": c["prefix"], "family": fam[0], "slot": slot, "side": side, "role": role, "ordinal": ordinal}
+        if mono:
+            # "Speaker" only labels the lone amp here: with no
+            # sound-name-prefix its ALSA controls carry no prefix at all
+            # ("VSENSE Switch", "Speaker Volume").
+            a["control_prefix"] = ""
         if c.get("i2c"):
             a["i2c"] = c["i2c"]
         if fam[1] and not sensed:
@@ -605,6 +705,248 @@ def hardware(hw):
         if chans != list(range(2 * len(amps))):
             raise Refused(f"the sense slots give channels {chans}, not 0..{2 * len(amps) - 1} once each")
     return amps
+
+
+# ------------------------------------------------------------- capabilities
+#
+# speakerguardd selects nothing by board, model or SoC. Every fact the
+# protect stage, the self-check and the supervisor depend on is a
+# *capability*, read from a source the machine itself provides, and each one
+# carries that source (`Cap.source`) so a report says where it came from:
+#
+# - ``dt:``    the device tree, as macaudio reads it: the speaker dai-link,
+#              its back-end (CPU DAI) and amp (codec) nodes, their
+#              compatibles, `dma-names`, `sound-name-prefix` and sense slots;
+# - ``alsa:``  the running card: the card bound to the device tree's sound
+#              node, and (supervisor side) its controls' own dB scales;
+# - ``tuning:`` the Mac's own tuning bundle, through the reader's graph trace:
+#              the protection unit, its channel roles, its sample rate, the
+#              speaker identity (AID) it names;
+# - ``driver:`` a constant of the kernel driver a compatible binds (sample
+#              formats, ring cadence). Keyed by the block's compatible,
+#              never by the board that carries it;
+# - ``derived:`` computed from the capabilities above (the PCM widths, the
+#              plugin variant), never from an identity.
+#
+# A capability no source establishes is a refusal (Refused): the
+# speakers stay muted exactly as before, with the reason. There is no
+# default that admits a Mac; the only defaults are ones that keep a Mac
+# safe (no sense proven: the unit must run without sense; no fixed ceiling
+# named: the supervisor latches on any other grant volume).
+#
+# The board itself is still read (``dt:/compatible``) but only as an
+# identity: the self-check record and the parameter blob are bound to the Mac
+# they were made on, so one Mac's proof never admits another. It is never
+# used to choose a value.
+#
+# See docs/CAPABILITIES.md for the inventory, the providers and the plan.
+
+# A capability: its value and where it came from.
+Cap = namedtuple("Cap", "value source")
+
+# Everything an amp family's driver offers userspace, by the family the
+# amp's compatible names (AMPS). The supervisor checks each of these
+# against the card's controls before a grant (crates/sgv2-supervisor
+# machine.rs Amp): these are the driver's, not the board's.
+FAMILY = {
+    "sn012776": {"gain_control": True, "fault_status": True},
+    "tas2770": {"gain_control": True, "fault_status": False},
+    "max98360a": {"gain_control": False, "fault_status": False},
+}
+
+
+def _src_cpu(hw):
+    link = _speaker_link(hw)
+    nodes = link.get("cpu_nodes")
+    where = ", ".join(nodes) if nodes else f"link {link['name']!r} cpu"
+    return f"dt:{where}/compatible"
+
+
+def cap_transport(hw):
+    """The speaker back-end's driver and what it offers (TRANSPORTS)."""
+    t = transport(hw)
+    return Cap(t, "driver:" + t["transport"] + " (" + _src_cpu(hw) + ")")
+
+
+def sense_path(hw):
+    """Whether this Mac returns its amps' V/I sense: the amp family must
+    offer it and the speaker transport carry it (transport_senses), and
+    from which value.
+
+    - An amp family without sense (AMPS): none, by the family's driver.
+    - The back-end names the driver's sense DMA channel: it does.
+    - It names its speaker channel and not the sense one: it does not.
+    - It names neither, or no dma-names at all: the amp family's sense
+      stands, and the self-check's silent sense test must then see it on
+      the card; a transport that sends none fails that test (muted).
+    """
+    link = _speaker_link(hw)
+    fams = {AMPS[x] for c in link["codecs"] for x in c.get("compatible", []) if x in AMPS}
+    if fams and not any(f[1] for f in fams):
+        return Cap(False, f"driver:{', '.join(sorted(f[0] for f in fams))} returns no V/I sense")
+    dmas = link.get("cpu_dma_names")
+    t = transport(hw)
+    carries = transport_senses(hw)
+    if not dmas or any(d is None for d in dmas) or not t.get("sense_dma"):
+        return Cap(carries, "dt:no sense dma-names on the back-end; proven by the self-check's silent sense test")
+    names = sorted({n for d in dmas for n in d})
+    if t["sense_dma"] in names:
+        return Cap(carries, f"dt:back-end dma-names {names} (names {t['sense_dma']!r})")
+    if not carries:
+        return Cap(carries, f"dt:back-end dma-names {names} (names {t.get('speaker_dma')!r}, no {t['sense_dma']!r})")
+    # dma-names that name neither channel describe nothing about sense
+    return Cap(carries, f"dt:back-end dma-names {names} name neither {t.get('speaker_dma')!r} nor {t['sense_dma']!r}; "
+                        "proven by the self-check's silent sense test")
+
+
+def cap_amps(hw):
+    """The amps in speaker PCM order (hardware), and the family's
+    driver capabilities."""
+    a = hardware(hw)
+    fam = a[0]["family"]
+    if fam not in FAMILY:
+        raise Refused(f"amp family {fam} has no driver capabilities this probe knows")
+    sensed = sum(1 for x in a if "v_ch" in x)
+    return {
+        "amps": Cap(len(a), "dt:speaker dai-link codec sound-dai"),
+        "family": Cap(fam, "dt:amp compatible"),
+        "roles": Cap([[x["side"], x["role"], x["ordinal"]] for x in a], "dt:amp sound-name-prefix"),
+        "gain_control": Cap(FAMILY[fam]["gain_control"], f"driver:{fam}"),
+        "fault_status": Cap(FAMILY[fam]["fault_status"], f"driver:{fam}"),
+        "sense_slots": Cap(2 * sensed, "dt:ti,vmon-slot-no / ti,imon-slot-no" if sensed else "dt:no sense slots"),
+        "_amps": a,
+    }
+
+
+def live_card(hw, dt="/proc/device-tree", sysfs="/sys/class/sound", proc="/proc/asound"):
+    """(index, id) of the ALSA card whose device is the device tree's sound
+    node: the running card's own id. None when no card is bound to it, or
+    when the bound card is still registering (card_registered): the caller
+    waits, or keeps its record."""
+    want = os.path.realpath(os.path.join(dt, hw["sound"]))
+    try:
+        names = sorted(os.listdir(sysfs))
+    except OSError:
+        return None
+    for d in names:
+        if not re.fullmatch(r"card\d+", d):
+            continue
+        of = os.path.join(sysfs, d, "device", "of_node")
+        if os.path.exists(of) and os.path.realpath(of) == want:
+            if not card_registered(os.path.join(sysfs, d), proc):
+                return None
+            idx = int(d[4:])
+            # The id from sysfs: the attribute exists as soon as the card
+            # device does. snd_card_register() adds the device (and its
+            # of_node link) before the card's proc entries, so a card that is
+            # still registering may have no /proc id yet (the proc copy is the
+            # fallback). Not there yet = not bound yet (None: the caller waits
+            # or keeps the record); any other error refuses.
+            for path in (os.path.join(sysfs, d, "id"), os.path.join(proc, f"card{idx}", "id")):
+                try:
+                    with open(path) as f:
+                        cid = f.read().strip()
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    raise Refused(f"the speaker card {d} is bound to {hw['sound']}, but its id cannot be read ({path}: "
+                                  f"{e.strerror or e})") from None
+                if cid:
+                    return idx, cid
+            return None
+    return None
+
+
+def cap_card(hw, live=None):
+    """The speaker card's ALSA id. On a running Mac (`live`, from
+    live_card()) it is the card's own; offline (fixtures, a .dtb) it is the
+    name macaudio gives it from the device tree's model, which the
+    self-check then confirms on the card."""
+    if live is not None:
+        return Cap(live[1], f"alsa:card{live[0]} (of_node {hw['sound']})")
+    return Cap(card_id(hw), f"dt:/{hw['sound']}/model (macaudio's naming; confirmed on the card by the self-check)")
+
+
+def probe(hw, live=None, w=None):
+    """Every capability of the speaker path, each with its source: the
+    hardware's, and with a wiring `w` (derive) the tuning's too. Refuses
+    (Refused) on anything no source establishes."""
+    t = cap_transport(hw)
+    a = cap_amps(hw)
+    s = sense_path(hw)
+    fmt = speaker_format(t.value)
+    caps = {
+        "board": Cap(hw["board"], "dt:/compatible (identity binding only)"),
+        "machine_key": Cap(machine_key(hw), f"dt:/{hw['sound']}/compatible"),
+        "model": Cap(hw.get("model"), f"dt:/{hw['sound']}/model"),
+        "card": cap_card(hw, live),
+        "transport": Cap(t.value["transport"], t.source),
+        "speaker_format": Cap(fmt, f"driver:{t.value['transport']} formats {t.value['formats']}"),
+        "speaker_irq": Cap(t.value["speaker_irq"], f"driver:{t.value['transport']}"),
+        "speaker_headroom": Cap(t.value["speaker_headroom"], f"driver:{t.value['transport']}"),
+        "sense_batch": Cap(t.value["sense_batch"], f"driver:{t.value['transport']}"),
+        "sense_path": s,
+    }
+    caps.update({k: v for k, v in a.items() if not k.startswith("_")})
+    if w is not None:
+        caps.update(
+            unit=Cap(w["unit_kind"], "tuning:the protection unit the graph trace names"),
+            aid=Cap(w["aid"], "tuning:the bundle's speaker identity"),
+            rate=Cap(w["rate"], "tuning:the graph's sample rate"),
+            unit_channels=Cap(w["unit_channels"], "derived:dt roles matched to the tuning's channel roles"),
+            sense_ports=Cap(w["sense_ports"], "derived:dt sense slots matched to the unit's channels"),
+        )
+    caps["_transport"] = t.value
+    caps["_amps"] = a["_amps"]
+    return caps
+
+
+def describe(hw, w, live=None):
+    """ the machine description the protect stage's graph
+    is generated from, built from the capabilities (probe) and the wiring
+    derived from the device tree and the tuning. Byte for byte what the
+    description was before the probe layer, except that on a running Mac
+    the card id is the card's own (`live`)."""
+    c = probe(hw, live, w)
+    t = c["_transport"]
+    n = len(w["amps"])
+    if n != c["amps"].value:
+        raise Refused(f"the wiring has {n} amps, the device tree {c['amps'].value}")
+    # LSID is a side-chain inside the existing LSM2 governor. Plain LSM2
+    # bundles still have no sense ports; only an explicit companion requests
+    # the V/I variant. The self-check proves the sense map either way.
+    takes_sense = w.get("unit_kind") in (None, *SENSE_UNITS) or w.get("sense_companion", False)
+    s = len(w["sense"]) if takes_sense else 0
+    plugin = PLUGINS.get((n, s))
+    if plugin is None:
+        raise Refused(f"no sgv2 plugin variant for {n} amps and {s} sense channels")
+    speaker_pcm, sense_pcm = pcm_widths(t, n, len(w["sense"]))
+    fmt = c["speaker_format"].value
+    return {
+        "key": c["machine_key"].value,
+        "board": c["board"].value,
+        "card": c["card"].value,
+        "name": c["model"].value or c["card"].value,
+        "transport": c["transport"].value,
+        "amps": n,
+        "sense": s,
+        # the PCMs' own widths: the amps' lanes come first (PCM widths in py)
+        "speaker_pcm": speaker_pcm,
+        "sense_pcm": sense_pcm,
+        "rate": c["rate"].value,
+        "plugin": plugin,
+        "alsa_format": fmt,
+        "speaker_format": PW_FORMAT[fmt],
+        "speaker_headroom": c["speaker_headroom"].value,
+        "sense_headroom": SENSE_HEADROOM if s else 0,
+        "sense_batch": c["sense_batch"].value,
+        "speaker_irq": c["speaker_irq"].value,
+    }
+
+
+def caps_report(caps):
+    """The capabilities as JSON-able {name: {"value", "source"}}."""
+    return {k: {"value": v.value, "source": v.source} for k, v in caps.items() if not k.startswith("_")}
 
 
 # ------------------------------------------------------------------ tuning
@@ -833,8 +1175,11 @@ def derive(hw, dump, key=None):
     amps = hardware(hw)
     rl = roles(dump)
     no_sense_path = any(a.get("no_sense_path") for a in amps)
-    if no_sense_path and rl["kind"] in SENSE_UNITS:
-        raise Refused(f"the tuning's {rl['kind']} protection reads V/I sense, and this Mac's speaker transport carries none")
+    if no_sense_path and rl["kind"] not in NO_SENSE_UNITS:
+        raise Refused(
+            f"the tuning's {rl['kind']} protection is not one that runs without V/I sense "
+            f"({', '.join(NO_SENSE_UNITS)}), and this Mac's speaker transport carries none"
+        )
     # Without sense, nothing checks which amp plays which unit channel: one
     # amp has no order to get wrong, several would rest on the device tree
     # alone. A sense-capable Mac whose device tree lost its sense channel
@@ -920,13 +1265,29 @@ def role_errors(w, units):
     return errs
 
 
+def dump_errors(r):
+    """The reader's error diagnostics ("code: message"), so a refusal says
+    why in the journal: from the JSON (a failed load prints the bare
+    diagnostics, a load with errors the tuning and its diagnostics), else
+    the last stderr line."""
+    try:
+        v = json.loads(r.stdout)
+        items = (v.get("diagnostics", v) if isinstance(v, dict) else {}).get("items", [])
+        errs = [f"{d.get('code')}: {d.get('message')}" for d in items if d.get("severity") == "error"]
+    except (ValueError, AttributeError):
+        errs = []
+    if not errs and r.stderr.strip():
+        errs = [r.stderr.strip().splitlines()[-1]]
+    return (": " + "; ".join(errs))[:600] if errs else ""
+
+
 def tuning_dump(cli_args, cli="aurora-speaker-tuning", strict=False):
     """Run the tuning reader's JSON dump; its exit code reports refusals,
     which offline derivation does not need. Qualification uses strict=True
     to require success and an empty refusal/error set."""
     r = subprocess.run([cli, "dump", "--json", *cli_args], capture_output=True, text=True, timeout=60)
     if strict and r.returncode != 0:
-        raise Refused(f"{cli} dump refused the tuning (exit {r.returncode})")
+        raise Refused(f"{cli} dump refused the tuning (exit {r.returncode}){dump_errors(r)}")
     try:
         result = json.loads(r.stdout)
         if strict:
@@ -936,11 +1297,265 @@ def tuning_dump(cli_args, cli="aurora-speaker-tuning", strict=False):
         raise Refused(f"{cli} dump --json gave no JSON (exit {r.returncode}): {r.stderr.strip()[-300:]}")
 
 
+# ---------------------------------------------------------------- microphones
+#
+# The built-in microphone array (the "hpai" stream of the AOP audio
+# service). What the kernel's drivers fix per audio block, keyed by the
+# block's device-tree compatible like TRANSPORTS:
+# - dma: the dma-names entry the driver takes the array's stream from; a Mac
+#   whose audio node lists none has no array (Mac mini, Mac Studio);
+# - card: the suffix of the card the driver registers the array on
+#   ("Apple<apple,chassis-name><suffix>");
+# - dev: the array's capture PCM on that card (its PCM id is "hpai");
+# - channels, rate: the PCM's only layout.
+MIC_PCM_ID = "hpai"
+MIC_TRANSPORTS = {
+    # sound/soc/apple/aop_audio.rs (the PDM microphones, T8103 to T6041)
+    "apple,aop-audio": {"dma": "dma", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+    "apple,t6030-aop-audio": {"dma": "dma", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+    "apple,t6041-aop-audio": {"dma": "dma", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+    # sound/soc/apple/aop_t8140.rs: PCM 0 of its card is the low-power microphone
+    "apple,t8140-aop-audio": {"dma": "hpai", "card": "AOP", "dev": 1, "channels": 2, "rate": 48000},
+    # sound/soc/apple/t8152_aop_audio.rs (T8142, T6050, T8152)
+    "apple,t8152-aop-audio": {"dma": "hpai", "card": "HPAI", "dev": 0, "channels": 3, "rate": 48000},
+}
+MIC_TRANSPORTS["apple,t8142-aop-audio"] = MIC_TRANSPORTS["apple,t8152-aop-audio"]
+MIC_TRANSPORTS["apple,t6050-aop-audio"] = MIC_TRANSPORTS["apple,t8152-aop-audio"]
+# The sgv2_mic plugin's variants (crates/sgv2-lv2/src/mic.rs VARIANTS).
+MIC_PLUGIN_MAX = 4
+
+
+def _okay(node, root):
+    """Whether a device-tree node and every node above it is enabled."""
+    node, root = os.path.realpath(node), os.path.realpath(root)
+    while True:
+        status = os.path.join(node, "status")
+        if os.path.exists(status) and _str(_read(status)) not in ("okay", "ok"):
+            return False
+        if node == root or os.path.dirname(node) == node:
+            return True
+        node = os.path.dirname(node)
+
+
+def read_mic_dt(root="/proc/device-tree"):
+    """The built-in microphone array of the running Mac, from its device
+    tree, or None when it has none: the enabled AOP audio node (a node named
+    "audio" whose compatible MIC_TRANSPORTS knows) that lists the array's
+    stream in dma-names. {node, compatible, dma_names, chassis}."""
+    root = os.path.realpath(root)
+    found = []
+    for d, dirs, files in os.walk(root):
+        dirs.sort()
+        if os.path.basename(d) != "audio" or "compatible" not in files:
+            continue
+        compatible = _strs(_read(os.path.join(d, "compatible")))
+        if not any(c in MIC_TRANSPORTS for c in compatible) or not _okay(d, root):
+            continue
+        names = _strs(_read(os.path.join(d, "dma-names"))) if "dma-names" in files else []
+        chassis = _str(_read(os.path.join(d, "apple,chassis-name"))) if "apple,chassis-name" in files else None
+        found.append({"node": os.path.relpath(d, root), "compatible": compatible, "dma_names": names, "chassis": chassis})
+    found = [m for m in found if mic_transport(m)["dma"] in m["dma_names"]]
+    if not found:
+        return None
+    if len(found) != 1:
+        raise Refused(f"{len(found)} AOP audio nodes with a microphone array in the device tree (want 1)")
+    return found[0]
+
+
+def read_mic_dtb(path):
+    """read_mic_dt() on a compiled device tree (.dtb)."""
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.join(d, "dt")
+        os.makedirs(root)
+        _fdt_to_dir(_read(path), root)
+        return read_mic_dt(root)
+
+
+def mic_transport(mic):
+    for c in mic["compatible"]:
+        if c in MIC_TRANSPORTS:
+            return MIC_TRANSPORTS[c]
+    raise Refused(f"no microphone transport is known for {mic['compatible']}")
+
+
+def describe_mic(mic):
+    """The array's description, from the device tree's node alone (the
+    driver's rules): {key, card, dev, channels, rate}. The key is the
+    chassis the card is named for, as the speaker graph's machine key."""
+    t = mic_transport(mic)
+    chassis = mic.get("chassis")
+    if not chassis or not re.fullmatch(r"[A-Za-z0-9]+", chassis):
+        raise Refused(f"the device tree's {mic['node']} node names no chassis (apple,chassis-name {chassis!r})")
+    if not 1 <= t["channels"] <= MIC_PLUGIN_MAX:
+        raise Refused(f"no microphone plugin takes {t['channels']} channels")
+    return {"key": chassis.lower(), "card": f"Apple{chassis}{t['card']}", "dev": t["dev"],
+            "channels": t["channels"], "rate": t["rate"]}
+
+
+def live_mic_pcm(desc, proc="/proc/asound"):
+    """The array's capture PCM device on the running card `desc` names: the
+    card's capture PCM whose id is MIC_PCM_ID (as the speaker PCM is found
+    by its id), else the driver's fixed one if the card has it. None
+    without the card or the PCM."""
+    card = os.path.join(proc, desc["card"])
+    try:
+        names = sorted(os.listdir(card))
+    except OSError:
+        return None
+    fixed = None
+    for d in names:
+        m = re.fullmatch(r"pcm(\d+)c", d)
+        if not m:
+            continue
+        try:
+            with open(os.path.join(card, d, "info")) as f:
+                info = dict(l.split(": ", 1) for l in f.read().splitlines() if ": " in l)
+        except OSError:
+            continue
+        if re.sub(r"\s*\(\*\)$", "", info.get("id", "").strip()) == MIC_PCM_ID:
+            return int(m.group(1))
+        if int(m.group(1)) == desc["dev"]:
+            fixed = desc["dev"]
+    return fixed
+
+
+# The microphone blob's header (crates/sgv2-core/src/mic/artifact.rs), as
+# far as provisioning binds it. MIC_BLOB_VERSION is the artifact's VERSION:
+# the plugin refuses any other (silence), so a blob of another version is
+# never kept (test_provision checks the two constants agree).
+MIC_BLOB_MAGIC = b"SGV2MIC\0"
+MIC_BLOB_VERSION = 2
+MIC_BLOB_HEADER = 76
+MIC_BLOB_MAX = 4 * 1024 * 1024
+MIC_FLAG_PARTIAL = 1
+
+
+def mic_blob_header(data):
+    """{version, partial, rate, mics, latency, machine, unit_bound} of a
+    microphone blob whose framing holds (magic, lengths, CRC-32). Refuses
+    anything else. The version is reported, not judged."""
+    import zlib
+
+    if len(data) < MIC_BLOB_HEADER + 4 or len(data) > MIC_BLOB_MAX or data[:8] != MIC_BLOB_MAGIC:
+        raise Refused("not a microphone blob (length or magic)")
+    u32 = lambda at: int.from_bytes(data[at : at + 4], "little")  # noqa: E731
+    if MIC_BLOB_HEADER + u32(72) + 4 != len(data):
+        raise Refused("the microphone blob's payload length does not match its size")
+    if zlib.crc32(data[:-4]) != u32(len(data) - 4):
+        raise Refused("the microphone blob's checksum does not match")
+    machine = data[28:36].split(b"\0", 1)[0]
+    try:
+        machine = machine.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refused("the microphone blob names no board") from None
+    return {"version": u32(8), "partial": bool(u32(12) & MIC_FLAG_PARTIAL), "rate": u32(16), "mics": u32(20),
+            "latency": u32(24), "machine": machine, "unit_bound": any(data[40:72])}
+
+
+def mic_blob_errors(h, board, desc):
+    """Why the plugin's variant for `desc` on `board` would refuse (or must
+    not run) a blob with header `h`: [] when it is this Mac's, complete, and
+    of the version this package's plugin takes."""
+    errs = []
+    if h["version"] != MIC_BLOB_VERSION:
+        errs.append(f"blob version {h['version']}, the plugin takes {MIC_BLOB_VERSION}")
+    if h["partial"]:
+        errs.append("a partial design (stages carried as identity)")
+    if h["machine"] != board:
+        errs.append(f"compiled for {h['machine'] or 'no board'}, this Mac is {board}")
+    if h["rate"] != desc["rate"]:
+        errs.append(f"compiled for {h['rate']} Hz, the microphone PCM runs at {desc['rate']} Hz")
+    if h["mics"] != desc["channels"]:
+        errs.append(f"compiled for {h['mics']} microphones, the microphone PCM has {desc['channels']}")
+    return errs
+
+
+MIC_PLUGIN_URI = "https://aurora-silicon.org/lv2/sgv2#mic-{}ch"
+# Where the packaged bundle's library is, under a system LV2 directory.
+MIC_PLUGIN_LIB = os.path.join("sgv2.lv2", "libsgv2_lv2.so")
+
+
+def mic_plugin_health(lib, blob, mics, rate, frames=512):
+    """Loads the packaged plugin's microphone variant for `mics` channels as
+    a host does, on blob `blob`, runs one block of silence and returns its
+    (health, latency) outputs (health 0: it runs the blob; 1: it refused it
+    and is silent).
+    The plugin reads the board from this Mac's device tree. Refuses when
+    the library or the variant cannot be loaded. Run in a process of its
+    own (speakerguardd-selfcheck mic): it loads native code."""
+    import ctypes
+
+    class Descriptor(ctypes.Structure):
+        _fields_ = [("uri", ctypes.c_char_p),
+                    ("instantiate", ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_double, ctypes.c_char_p, ctypes.c_void_p)),
+                    ("connect_port", ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)),
+                    ("activate", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                    ("run", ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)),
+                    ("deactivate", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                    ("cleanup", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
+                    ("extension_data", ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p))]
+
+    try:
+        so = ctypes.CDLL(lib)
+        entry = so.lv2_descriptor
+    except (OSError, AttributeError) as e:
+        raise Refused(f"the plugin library {lib} cannot be loaded ({e})") from None
+    entry.restype = ctypes.POINTER(Descriptor)
+    entry.argtypes = [ctypes.c_uint32]
+    uri = MIC_PLUGIN_URI.format(mics).encode()
+    desc = None
+    for i in range(256):
+        d = entry(i)
+        if not d:
+            break
+        if d.contents.uri == uri:
+            desc = d
+            break
+    if desc is None:
+        raise Refused(f"{lib} has no {uri.decode()} plugin")
+    old = os.environ.get("SGV2_MIC_PARAMS")
+    os.environ["SGV2_MIC_PARAMS"] = blob
+    try:
+        h = desc.contents.instantiate(desc, float(rate), os.path.dirname(lib).encode(), None)
+    finally:
+        if old is None:
+            del os.environ["SGV2_MIC_PARAMS"]
+        else:
+            os.environ["SGV2_MIC_PARAMS"] = old
+    if not h:
+        raise Refused(f"the {uri.decode()} plugin did not instantiate")
+    try:
+        # ports: the microphones, the output, latency, health
+        audio = [(ctypes.c_float * frames)() for _ in range(mics + 1)]
+        latency, health = ctypes.c_float(-1.0), ctypes.c_float(-1.0)
+        for i, buf in enumerate(audio):
+            desc.contents.connect_port(h, i, ctypes.cast(buf, ctypes.c_void_p))
+        desc.contents.connect_port(h, mics + 1, ctypes.cast(ctypes.byref(latency), ctypes.c_void_p))
+        desc.contents.connect_port(h, mics + 2, ctypes.cast(ctypes.byref(health), ctypes.c_void_p))
+        if desc.contents.activate:
+            desc.contents.activate(h)
+        desc.contents.run(h, frames)
+        return int(health.value), int(latency.value)
+    finally:
+        desc.contents.cleanup(h)
+
+
+def mic_plugin_lib(dirs):
+    """The packaged plugin library, in the first of the system LV2
+    directories `dirs` that has it."""
+    for d in dirs:
+        lib = os.path.join(d, MIC_PLUGIN_LIB)
+        if os.path.isfile(lib):
+            return lib
+    raise Refused("the packaged sgv2 LV2 plugin is in none of " + ", ".join(dirs))
+
+
 def main(argv):
     import argparse
 
     ap = argparse.ArgumentParser(prog="wiring.py")
-    ap.add_argument("cmd", choices=["derive", "hardware", "describe"])
+    ap.add_argument("cmd", choices=["derive", "hardware", "describe", "caps"])
+    ap.add_argument("--live", action="store_true", help="caps: read the running card too (read-only)")
     ap.add_argument("--dt", default="/proc/device-tree")
     ap.add_argument("--dtb", help="a compiled device tree (.dtb) instead of the live one")
     ap.add_argument("--hw", help="a hardware description (JSON) instead of the live device tree")
@@ -953,6 +1568,15 @@ def main(argv):
         hw = json.load(open(a.hw)) if a.hw else read_dtb(a.dtb) if a.dtb else read_dt(a.dt)
         if a.cmd == "hardware":
             print(json.dumps({"hw": hw, "amps": hardware(hw)}, indent=1))
+            return 0
+        if a.cmd == "caps":
+            live = live_card(hw, a.dt) if a.live else None
+            if a.live and live is None:
+                raise Refused(f"no ALSA card is bound to the device tree's {hw['sound']} node")
+            w = None
+            if a.tuning_json or a.rest:
+                w = derive(hw, json.load(open(a.tuning_json)) if a.tuning_json else tuning_dump(a.rest, a.tuning_cli), a.key)
+            print(json.dumps(caps_report(probe(hw, live, w)), indent=1))
             return 0
         dump = json.load(open(a.tuning_json)) if a.tuning_json else tuning_dump(a.rest, a.tuning_cli)
         w = derive(hw, dump, a.key)

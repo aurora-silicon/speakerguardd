@@ -32,11 +32,14 @@ selects /System/Library/Audio/Tunings/AID35) and, on Macs with speaker
 calibration, carries the per-unit `speaker-thiele-small` record. Both are
 copied unchanged, read-only, into the per-machine vendor firmware under
 `apple/audio-tuning/`, with a manifest of sizes and SHA-256 hashes, and into
-the raw fallback archive under `audio-tuning/`. Nothing is shipped: the data
-comes from the user's own system volume and stays on the user's own ESP.
+the raw fallback archive under `audio-tuning/`. Nothing is shipped: the
+tuning is the per-model data of the pinned macOS restore image (ipsw.py
+stages it into a tree laid out like a system volume), never the installed
+macOS; only the per-unit values (speaker ID, SpTS record, unit) come from
+the Mac itself. The data stays on the user's own ESP.
 
-The bundle also carries the lsm2 masker's bucket lattice, read from this
-Mac's own AudioDSP component (see lsm2_lattice). A collection without it is
+The bundle also carries the lsm2 masker's bucket lattice, read from the
+staged image's AudioDSP component (see lsm2_lattice). A collection without it is
 no bundle.
 
 The manifest names the Mac the bundle was collected on: its board (the
@@ -51,11 +54,12 @@ profiles without it.
 """
 import hashlib, json, logging, os, plistlib, re, shutil, stat, subprocess, sys
 
-from . import lsm2_lattice, lsm2_fill
+from . import buzzkill_matrix, lsm2_fill, lsm2_lattice
 from .core import FWFile
 
 log = logging.getLogger("asahi_firmware.audio_tuning")
 
+# The tuning tree's place in a system volume layout (staged image trees).
 TUNINGS_ROOT = "/System/Library/Audio/Tunings"
 PACKAGE_PREFIX = "apple/audio-tuning/"
 FALLBACK_DIR = "audio-tuning"
@@ -64,8 +68,18 @@ SPTS = "speaker-thiele-small.bin"
 DATABASE = "DeviceDSPDatabase.plist"
 # The lsm2 masker's bucket lattice (lsm2_lattice), as its 800 bytes.
 LATTICE = "lsm2-mask-lattice.bin"
-# Where it is read: the AudioDSP component of the running macOS.
-AUDIODSP_PATH = "/" + lsm2_lattice.AUDIODSP
+# The BuzzKill detector's quadrature matrix (buzzkill_matrix), as its 80 bytes.
+BUZZKILL = "buzzkill-quadrature.bin"
+BUZZKILL_KEY = "buzzkill_quadrature"
+# Whether a new bundle carries that matrix. speakerguardd v2 reads a schema-2
+# manifest strictly: a key it does not know refuses the whole bundle, and the
+# speakers stay at the kernel's floor. No speakerguardd release reads
+# `buzzkill_quadrature` yet (speakerguardd#138 adds the reader); every one up
+# to 1.0.0alpha.1-42 refuses a bundle that has it. So, until a release reads
+# it, the matrix is collected only on request (rigs, the parity gate), as the
+# native installer does. A bundle that already carries it is still verified
+# and read; `without_buzzkill` gives the same bundle without it.
+COLLECT_BUZZKILL = False
 
 
 # macOS 27 keeps each Mac's entry in its own folder instead of the shared
@@ -358,11 +372,19 @@ def fill_record(data, aid, build, unit):
     return rec
 
 
+def buzzkill_record(data):
+    rec = record(BUZZKILL, data)
+    rec.update({"version": buzzkill_matrix.VERSION, "format": buzzkill_matrix.FORMAT,
+                "sections": buzzkill_matrix.SECTIONS})
+    return rec
+
+
 def manifest(aid, acoustic, files, spts, build, selection=None, speaker=None,
-             shared=None, loudness=None, source=DATABASE, lattice=None, board=None, unit=None, fill=None):
+             shared=None, loudness=None, source=DATABASE, lattice=None, board=None, unit=None,
+             fill=None, buzzkill=None):
     selection = selection or {}
     shared = shared or {}
-    return {
+    doc = {
         # The Mac the bundle was collected on: its board and the unit ID of
         # its serial number (never the serial). null when unknown.
         "board": board,
@@ -407,10 +429,35 @@ def manifest(aid, acoustic, files, spts, build, selection=None, speaker=None,
                     for name in sorted(selection)],
         "based_on": BASED_ON,
     }
+    # The BuzzKill detector's quadrature matrix from this Mac's AudioDSP:
+    # four output-major binary32 second-order sections (version 1). Only
+    # present when it was read; without it the voicing compiler refuses
+    # Buzz boxes.
+    if buzzkill is not None:
+        doc[BUZZKILL_KEY] = buzzkill_record(buzzkill)
+    return doc
+
+
+def encode_manifest(doc):
+    return json.dumps(doc, indent=2, sort_keys=True).encode("utf-8")
+
+
+def without_buzzkill(bundle):
+    """The bundle as the collector writes it without the BuzzKill matrix:
+    no matrix file and no `buzzkill_quadrature` record; every other file and
+    manifest entry unchanged. A bundle without the matrix is returned as is."""
+    doc = json.loads(bundle[MANIFEST])
+    if BUZZKILL not in bundle and BUZZKILL_KEY not in doc:
+        return bundle
+    doc.pop(BUZZKILL_KEY, None)
+    out = {rel: data for rel, data in bundle.items() if rel != BUZZKILL}
+    out[MANIFEST] = encode_manifest(doc)
+    return out
 
 
 def tree(acoustic, files, spts, build, selection=None, source_count=None, speaker=None,
-         shared=None, loudness=None, source=DATABASE, lattice=None, board=None, unit=None, fill=None):
+         shared=None, loudness=None, source=DATABASE, lattice=None, board=None, unit=None,
+         fill=None, buzzkill=None):
     """Relative path -> bytes for one bundle: AID<n>/..., the selection
     data, the shared files the speaker graph references, the loudness
     manager, the record, the manifest. Only a complete set makes a bundle."""
@@ -444,6 +491,8 @@ def tree(acoustic, files, spts, build, selection=None, source_count=None, speake
         raise ValueError("implausible speaker ID")
     if not lsm2_lattice.valid(lattice):
         raise ValueError("incomplete speaker tuning: no valid lsm2 masker lattice")
+    if buzzkill is not None and not buzzkill_matrix.valid(buzzkill):
+        raise ValueError("invalid BuzzKill quadrature matrix")
     if board is not None and not (isinstance(board, str) and BOARD.match(board)):
         raise ValueError("implausible board")
     if unit is not None and not (isinstance(unit, str) and UNIT_ID.match(unit)):
@@ -466,9 +515,11 @@ def tree(acoustic, files, spts, build, selection=None, source_count=None, speake
         fill_record(fill, aid, build, unit)
         lsm2_fill.validate_configuration(fill, out, aid)
         out[lsm2_fill.NAME] = fill
-    out[MANIFEST] = json.dumps(manifest(aid, acoustic, files, spts, build, selection, speaker,
-                                        shared, loudness, source, bytes(lattice), board, unit, fill),
-                               indent=2, sort_keys=True).encode("utf-8")
+    if buzzkill is not None:
+        out[BUZZKILL] = bytes(buzzkill)
+    out[MANIFEST] = encode_manifest(manifest(aid, acoustic, files, spts, build, selection, speaker,
+                                             shared, loudness, source, bytes(lattice), board, unit,
+                                             fill, None if buzzkill is None else bytes(buzzkill)))
     return out
 
 
@@ -492,90 +543,24 @@ def os_build(run=subprocess.run):
     return value if value.isalnum() and len(value) <= 16 else "unknown"
 
 
-class OfflineMac(object):
-    """This Mac's identity from its ADT and its tuning from its own macOS
-    system volume mounted read-only, for a collection from Linux.
-
-    The ADT is the one iBoot passed on this boot (aura exposes it as the
-    "adt" MTD partition), so it carries the same `acoustic-id`,
-    `speaker-thiele-small`, `target-type` and `serial-number` that
-    `ioreg -p IODeviceTree` shows on macOS. The build is the volume's
-    SystemVersion.plist ProductBuildVersion (`kern.osversion` on macOS).
-    The speaker ID (the IORegistry `speakerID`) has no ADT source: it is
-    taken from the Linux device tree's `/chosen/asahi,speaker-id` when the
-    boot chain exports it, else unknown, as on macOS when it is missing."""
-
-    def __init__(self, adt_bytes, macos_root, speaker_id=None):
-        from . import adt
-        self.root = adt.parse(adt_bytes)
-        self.macos_root = macos_root
-        self.tunings_root = os.path.join(macos_root, TUNINGS_ROOT.lstrip("/"))
-        self.audiodsp = os.path.join(macos_root, lsm2_lattice.AUDIODSP)
-        self._speaker = speaker_id
-
-    def probe(self):
-        found = []
-        for node in self.root.walk():
-            if node.name == "audio" and "acoustic-id" in node.properties:
-                found.append((node.get("acoustic-id"), node.get("speaker-thiele-small")))
-        if len(found) != 1:
-            if found:
-                log.warning("Several audio nodes carry acoustic-id; speaker tuning not collected")
-            return None
-        return found[0]
-
-    def identity(self):
-        try:
-            return board_name(self.root.get("target-type")), unit_id(self.root.get("serial-number"))
-        except Exception as e:
-            log.info(f"Mac identity unknown: {e}")
-            return None, None
-
-    def speaker_id(self):
-        value = self._speaker
-        if type(value) is not int or not 0 <= value <= MAX_SPEAKER_ID:
-            return None
-        return value
-
-    def model(self):
-        raw = self.root.get("model")
-        return raw.rstrip(b"\0").decode("ascii", "replace") if raw else None
-
-    def target(self):
-        """hw.target as macOS reports it (J616sAP): the root `target-type`
-        and `AP`, the same name the installer's info file records."""
-        raw = self.root.get("target-type")
-        if not raw:
-            return None
-        name = raw.rstrip(b"\0").decode("ascii", "replace")
-        return name if name.endswith("AP") else name + "AP"
-
-    def os_build(self):
-        path = os.path.join(self.macos_root, "System/Library/CoreServices/SystemVersion.plist")
-        try:
-            value = plistlib.loads(read_bounded(path, MAX_CONFIG_BYTES)).get("ProductBuildVersion")
-        except Exception as e:
-            log.info(f"macOS build unknown: {e}")
-            return "unknown"
-        return value if isinstance(value, str) and value.isalnum() and len(value) <= 16 else "unknown"
-
-
 class AudioTuningFWCollection(object):
-    """Live collection on macOS (path None), or re-collection from an
-    extracted fallback archive (path = the directory holding audio-tuning/)."""
+    """Collection from a staged restore-image tree (tunings_root and
+    audiodsp, see ipsw.py), or re-collection from an extracted fallback
+    archive (path = the directory holding audio-tuning/). There is no
+    default source: the installed macOS is never read for per-model data."""
 
-    def __init__(self, path=None, tunings_root=TUNINGS_ROOT, run=subprocess.run, audiodsp=None,
-                 offline=None, force_lsm2_fill=False):
-        """offline: an OfflineMac, to collect from a mounted macOS system
-        volume and the Mac's ADT (Linux) instead of the running macOS."""
+    def __init__(self, path=None, tunings_root=None, run=subprocess.run, audiodsp=None,
+                 force_lsm2_fill=False, buzzkill=None):
+        """buzzkill: also collect the BuzzKill quadrature matrix (default
+        COLLECT_BUZZKILL); a re-collection (path) keeps what the bundle has."""
         self.fwfiles = []
         self.bundle = {}
+        self.collect_buzzkill = COLLECT_BUZZKILL if buzzkill is None else bool(buzzkill)
         try:
-            if offline is not None:
-                self.load(offline.tunings_root, None, offline.audiodsp, offline)
-            elif path is None:
-                self.load(tunings_root, run, AUDIODSP_PATH if audiodsp is None else audiodsp,
-                          force_lsm2_fill=force_lsm2_fill)
+            if path is None:
+                if tunings_root is None or audiodsp is None:
+                    raise ValueError("no staged restore-image tree to collect from")
+                self.load(tunings_root, run, audiodsp, force_lsm2_fill=force_lsm2_fill)
             else:
                 self.update(os.path.join(path, FALLBACK_DIR))
         except lsm2_lattice.LatticeError as e:
@@ -595,8 +580,8 @@ class AudioTuningFWCollection(object):
         self.fwfiles = [(PACKAGE_PREFIX + rel, FWFile(PACKAGE_PREFIX + rel, data))
                         for rel, data in sorted(bundle.items())]
 
-    def load(self, tunings_root, run, audiodsp=AUDIODSP_PATH, offline=None, force_lsm2_fill=False):
-        props = probe(run) if offline is None else offline.probe()
+    def load(self, tunings_root, run, audiodsp, force_lsm2_fill=False):
+        props = probe(run)
         if props is None:
             log.info("No device-tree acoustic-id; no speaker tuning to collect")
             return
@@ -637,23 +622,17 @@ class AudioTuningFWCollection(object):
             data = read_bounded(lm_path, MAX_CONFIG_BYTES)
             if loudness_lists(data, acoustic):
                 loudness = data
-        if offline is None:
-            speaker = probe_speaker_id(run)
-            board, unit = probe_identity(run)
-            build = os_build(run)
-        else:
-            speaker = offline.speaker_id()
-            board, unit = offline.identity()
-            build = offline.os_build()
+        speaker = probe_speaker_id(run)
+        board, unit = probe_identity(run)
+        build = os_build(run)
         if unit is None and props[1] is not None:
             log.warning("This Mac's serial-number is unreadable: the speaker tuning is collected "
                         "without its unit, and Linux will not use its speaker calibration")
         # Exactly one valid lattice, or no bundle: never a guessed table.
         lattice = lsm2_lattice.read(audiodsp)
-        # A running owner macOS is required: never import defaults from a
-        # mounted volume or another Mac. Failure retains the old muted path.
+        # Hosted only on macOS (lsm2_fill); failure retains the muted path.
         fill = None
-        if offline is None and sys.platform == "darwin":
+        if sys.platform == "darwin":
             try:
                 capture_files = {f"AID{acoustic}/{p}": d for p, d in files.items()}
                 capture_files.update(shared)
@@ -661,12 +640,22 @@ class AudioTuningFWCollection(object):
             except Exception as e:
                 log.warning(f"lsm2 fill not collected: {e}; short presets remain muted; "
                             "collect again on this Mac's running macOS")
+        # The BuzzKill matrix the same way, when asked (COLLECT_BUZZKILL);
+        # without one the bundle still serves every Mac whose graph has no
+        # Buzz box.
+        buzzkill = None
+        if getattr(self, "collect_buzzkill", COLLECT_BUZZKILL):
+            try:
+                buzzkill = buzzkill_matrix.read(audiodsp)
+            except ValueError as e:
+                log.warning(f"Speaker tuning collected without the BuzzKill quadrature matrix: {e}")
         self._publish(tree(acoustic, files, props[1], build, selection, count, speaker,
-                           shared, loudness, source, lattice, board, unit, fill))
+                           shared, loudness, source, lattice, board, unit, fill, buzzkill))
         log.info(f"  Collected speaker tuning AID{acoustic} ({len(files)} files"
                  + (f", {len(shared)} shared" if shared else "")
                  + (", loudness manager" if loudness is not None else "")
-                 + ", lsm2 masker lattice)")
+                 + ", lsm2 masker lattice"
+                 + (", BuzzKill matrix)" if buzzkill is not None else ")"))
 
     def update(self, path):
         """Re-verify an extracted fallback bundle against its manifest.
@@ -766,6 +755,15 @@ class AudioTuningFWCollection(object):
                     or not unit or fill.get("unit_id") != unit):
                 raise ValueError("malformed lsm2 fill record")
             records = records + [fill]
+        buzzkill = meta.get(BUZZKILL_KEY)
+        if buzzkill is not None:
+            if not isinstance(buzzkill, dict) or buzzkill.get("path") != BUZZKILL \
+                    or buzzkill.get("version") != buzzkill_matrix.VERSION \
+                    or buzzkill.get("format") != buzzkill_matrix.FORMAT \
+                    or buzzkill.get("sections") != buzzkill_matrix.SECTIONS \
+                    or buzzkill.get("bytes") != buzzkill_matrix.SIZE:
+                raise ValueError("malformed BuzzKill quadrature matrix record")
+            records = records + [buzzkill]
         if unit is None and spts is not None:
             log.warning("This speaker tuning bundle does not name the Mac it was collected on "
                         "(collected before the installer recorded it): Linux runs the speakers "
@@ -776,7 +774,9 @@ class AudioTuningFWCollection(object):
         for rec in records:
             rel = rec["path"]
             size = rec.get("bytes")
-            limit = lsm2_fill.MAX_BYTES if rel == lsm2_fill.NAME else MAX_SPTS_BYTES if rel == SPTS else lsm2_lattice.SIZE if rel == LATTICE else \
+            limit = lsm2_fill.MAX_BYTES if rel == lsm2_fill.NAME else \
+                MAX_SPTS_BYTES if rel == SPTS else lsm2_lattice.SIZE if rel == LATTICE else \
+                buzzkill_matrix.SIZE if rel == BUZZKILL else \
                 min(MAX_CONFIG_BYTES, MAX_BYTES - total) if rel == LOUDNESS else MAX_BYTES - total
             if type(size) is not int or not 0 <= size <= limit:
                 raise ValueError(f"tuning file over budget: {rel}")
@@ -786,11 +786,13 @@ class AudioTuningFWCollection(object):
             data = read_bounded(full, size)
             if len(data) != size or hashlib.sha256(data).hexdigest() != rec.get("sha256"):
                 raise ValueError(f"tuning file changed: {rel}")
-            if rel not in (SPTS, LATTICE):
+            if rel not in (SPTS, LATTICE, BUZZKILL):
                 total += size
             bundle[rel] = data
         if LATTICE in bundle and not lsm2_lattice.valid(bundle[LATTICE]):
             raise ValueError("the lsm2 masker lattice is not valid")
+        if BUZZKILL in bundle and not buzzkill_matrix.valid(bundle[BUZZKILL]):
+            raise ValueError("the BuzzKill quadrature matrix is not valid")
         if LOUDNESS in bundle and not loudness_lists(bundle[LOUDNESS], acoustic):
             raise ValueError("the loudness manager does not list this AID")
         if lsm2_fill.NAME in bundle:

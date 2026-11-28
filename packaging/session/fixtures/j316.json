@@ -118,9 +118,20 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@293c00000/audio",
+  "compatible": [
+   "apple,t6000-aop-audio",
+   "apple,aop-audio"
+  ],
+  "dma_names": [
+   "dma"
+  ],
+  "chassis": "J316"
+ },
  "tuning": {
   "tuning": {
-   "aid": "synthetic",
+   "aid": "AID9",
    "selection": {
     "sample_rate": 48000,
     "substitutions": {

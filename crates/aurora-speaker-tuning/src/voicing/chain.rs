@@ -144,7 +144,7 @@ fn compile_node(
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),
             },
-            "buzk" => match super::buzz::compile(stage, fs, diags) {
+            "buzk" => match super::buzz::compile(stage, t.buzzkill.as_ref(), fs, diags) {
                 Ok(Some(p)) => Kind::Buzz(Box::new(p)),
                 Ok(None) => Kind::Bypass,
                 Err(e) => uncarried(n, subtype, e, gaps),

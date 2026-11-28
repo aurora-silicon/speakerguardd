@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import pwd
 import shutil
 import sys
@@ -46,7 +47,7 @@ with open(log, "a") as f:
 if cmd == "identify":
     if ctl.get("no_bundle"):
         print(json.dumps({"error": "no speaker tuning bundle found"})); sys.exit(1)
-    print(json.dumps({"source": "/lib/firmware/vendor/apple/audio-tuning", "verified": True, "aid": "AID9",
+    print(json.dumps({"source": "/lib/firmware/vendor/apple/audio-tuning", "verified": True, "aid": ctl.get("aid", "AID9"),
                       "macos_build": ctl.get("build", "25G83"), "digest": ctl.get("digest", "d1"), "reader": "1.0.0",
                       "kind": ctl.get("kind", "Installer"), "board": ctl.get("board", "j316s"),
                       "unit_bound": ctl.get("unit_bound", True),
@@ -60,6 +61,24 @@ elif cmd == "compile":
     print("wrote blob", file=sys.stderr)
     for w in ctl.get("warnings", []):
         print(w, file=sys.stderr)
+elif cmd == "mic-compile":
+    # The microphone blob's framing (crates/sgv2-core/src/mic/artifact.rs)
+    # around a stand-in payload. Like the compiler, it refuses a design it
+    # cannot carry whole unless asked for a partial blob.
+    import zlib
+    partial = "--allow-partial" in sys.argv
+    if ctl.get("mic_refuses") or (ctl.get("mic_uncharacterised") and not partial):
+        print("refused: stage 3 (blend): uncharacterised", file=sys.stderr)
+        sys.exit(1)
+    u32 = lambda v: v.to_bytes(4, "little")
+    payload = ("mic " + ctl.get("digest", "d1")).encode()
+    head = (b"SGV2MIC\0" + u32(ctl.get("mic_version", 2)) + u32(1 if partial or ctl.get("mic_partial") else 0)
+            + u32(ctl.get("mic_rate", 48000)) + u32(ctl.get("mic_mics", 3)) + u32(1439)
+            + ctl.get("mic_board", ctl.get("board", "j316s")).encode().ljust(8, b"\0") + u32(9) + bytes(32) + u32(len(payload)))
+    blob = head + payload
+    out = sys.argv[sys.argv.index("-o") + 1]
+    open(out, "wb").write(blob + u32(zlib.crc32(blob)))
+    print("wrote %s (%d bytes): %d microphones" % (out, len(blob) + 4, ctl.get("mic_mics", 3)), file=sys.stderr)
 elif cmd == "dump":
     t = {"protection": {"kind": ctl.get("unit", "spp3")}, "refusals": ctl.get("refusals", [])}
     if ctl.get("lsid"):
@@ -120,7 +139,7 @@ class Base(unittest.TestCase):
         self.p = prov.Paths(self.root)
         self.saved = {}
         # The live machine's card, seat and users are stand-ins.
-        self.patch(prov, "find_card", lambda want, wait: (0, want))
+        self.patch(prov, "find_card", lambda hw, want, wait, **kw: (0, want))
         self.patch(prov, "speaker_pcm", lambda idx: 1)
         self.patch(prov, "seat0_user", lambda rng: None)
         self.patch(prov, "autologin_user", lambda etc: None)
@@ -150,6 +169,13 @@ class Base(unittest.TestCase):
         except OSError:
             return []
 
+    def call_lines(self):
+        try:
+            with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
     def args(self, cmd="run", **kw):
         a = dict(cmd=cmd, bundle=None, force=False, unit="speakerguardd.service", graph_unit="speakerguardd-graph.service",
                  switch_test_wait=0.3, root=self.root,
@@ -159,6 +185,29 @@ class Base(unittest.TestCase):
 
     def run_(self, **kw):
         return prov.cmd_run(self.args(**kw), self.p)
+
+    def targets(self, **kw):
+        """What a deferred switch test must bind, as speakerguardd-selfcheck's
+        deferral_text() writes it: the record version, every BOUND field and
+        the card id."""
+        rec = dict(board="j316", wiring="w1", audio="a1", card="AppleJ316", params_sha256=prov.sha256_file(self.p.params))
+        rec.update({k: v for k, v in kw.items() if k in ("board", "wiring", "audio", "card", "params_sha256")})
+        sc = load("sc", "speakerguardd-selfcheck")
+        text = sc.deferral_text(rec, kw.get("kernel", os.uname().release))
+        if "version" in kw:
+            text = re.sub(r"^version=.*$", f"version={kw['version']}", text, flags=re.M)
+        return text
+
+    def pending(self, text):
+        prov.write_atomic(self.p.deferred, text)
+
+    def bound(self, text, result="pass", **kw):
+        """selfcheck.bind as the self-check writes it for `text`'s values (kw
+        overrides one field, None drops it)."""
+        rec = dict(line.split("=", 1) for line in text.splitlines() if line)
+        rec.update(result=result, **kw)
+        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
+                          "".join(f"{k}={v}\n" for k, v in rec.items() if v is not None))
 
     def record(self):
         with open(self.p.report) as f:
@@ -184,6 +233,39 @@ class Provision(Base):
         self.assertTrue(self.record()["compiled"])
         self.assertEqual(prov.read_kv(self.p.bind)["voicing_pre"], "false")
 
+
+    def test_the_running_cards_own_id_names_the_card_for_both_writers(self):
+        # The card bound to the sound node has an id other than the one
+        # macaudio derives from the model: provisioning passes with the
+        # running card's id, and the self-check's lookup (and so its
+        # generated graph) names the same card.
+        import gen
+        import wiring
+        sc = load("sc", "speakerguardd-selfcheck")
+        sysfs, proc = os.path.join(self.t, "sys"), os.path.join(self.t, "proc")
+        for n, of, ident in ((1, os.path.join(self.t, "jack"), "AppleJack"), (2, os.path.join(self.dt, "sound"), "AppleJ316Live")):
+            os.makedirs(of, exist_ok=True)
+            os.makedirs(os.path.join(sysfs, f"card{n}", "device"))
+            os.symlink(of, os.path.join(sysfs, f"card{n}", "device", "of_node"))
+            open(os.path.join(sysfs, f"card{n}", f"controlC{n}"), "w").close()
+            os.makedirs(os.path.join(proc, f"card{n}"))
+            with open(os.path.join(proc, f"card{n}", "id"), "w") as f:
+                f.write(ident + "\n")
+        self.patch(prov, "find_card", self.saved.get((prov, "find_card"), prov.find_card))
+        real = wiring.live_card
+        self.patch(wiring, "live_card", lambda hw, dt="/proc/device-tree", *a, **kw: real(hw, dt, sysfs, proc))
+        self.assertEqual(self.run_(), 0)
+        conf = prov.read_kv(self.p.conf)
+        self.assertTrue(conf["SGV2_ARGS"].startswith("--card AppleJ316Live --pcm 1 "), conf["SGV2_ARGS"])
+        hw = wiring.read_dt(self.dt)
+        self.assertNotEqual(wiring.card_id(hw), "AppleJ316Live")
+        live = sc.find_card(hw, self.dt)
+        self.assertEqual(live, (2, "AppleJ316Live"))
+        fx = gen.fixture("j316")
+        w = wiring.derive(fx["hw"], fx["tuning"])
+        text = gen.pipewire_conf(w["key"], dict(wiring.describe(fx["hw"], w, live), board="j316s"),
+                                 (w["unit_channels"], w["sense_ports"], w["hash"]), "test", voicing_pre=False)
+        self.assertIn("hw:CARD=AppleJ316Live,", text)
 
     def test_compiles_binds_and_configures(self):
         self.assertEqual(self.run_(), 0)
@@ -301,11 +383,11 @@ class Provision(Base):
         self.assert_closed("no seat user: 2 regular users (alice, bob)")
 
     def test_fails_closed_without_a_card(self):
-        def nocard(want, wait):
-            raise prov.Failed("no speaker card (apple,macaudio) after 0 s")
+        def nocard(hw, want, wait, **kw):
+            raise prov.Failed("no ALSA card bound to the device tree's sound node after 0 s")
         self.patch(prov, "find_card", nocard)
         self.assertEqual(self.run_(), 1)
-        self.assert_closed("no speaker card")
+        self.assert_closed("no ALSA card bound")
 
     def test_a_hand_written_conf_is_kept_aside(self):
         os.makedirs(self.p.etc)
@@ -640,9 +722,9 @@ class Graph(Base):
         self.assertEqual(os.listdir(os.path.join(self.p.graph, "wireplumber")), [])
         # The switch test passed after login: its activate generates the
         # graph while the test is still marked pending (until ExecStopPost).
-        digest = prov.sha256_file(self.p.params)
-        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
-                          f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
+        t = self.targets()
+        self.pending(t)  # the run after login rewrote it with what it binds
+        self.bound(t)
         from unittest import mock
         done = types.SimpleNamespace(returncode=0, stderr="", stdout="")
         with mock.patch.object(prov.subprocess, "run", return_value=done) as run:
@@ -663,6 +745,40 @@ class Graph(Base):
         self.assertEqual(os.listdir(wpd), ["59-sgv2-raw.conf"])
         self.assertEqual(prov.cmd_is_seat(self.args("is-seat"), self.p), 1)
 
+    def test_activate_keeps_the_switch_test_pending_for_a_stale_record(self):
+        """speakerguardd-selfcheck.service's ExecStartPost activate, after a
+        `run --defer` that found no current pass: the pending file names what
+        the next pass must bind, and a record that differs in any of it (the
+        audio stack, the wiring derivation, the record version, the board, the
+        card id: a card that came up under another id makes the deferring run
+        name the new id while the old record still names the old one) or
+        lacks a field (a 0.48 record has no "audio") is not current. No
+        graph, and the file stays, so speakerguardd-switchtest runs the test.
+        A pending file from an older self-check (no version) is never
+        satisfied either."""
+        self.provisioned()
+        t = self.targets()
+        from unittest import mock
+        for name, kw in (("audio", dict(audio="a0")), ("no audio", dict(audio=None)), ("wiring", dict(wiring="w0")),
+                         ("version", dict(version="2")), ("board", dict(board="j999")), ("card", dict(card="AppleJ316old")),
+                         ("failed", dict(result="fail"))):
+            with self.subTest(stale=name):
+                self.pending(t)
+                self.bound(t, **kw)
+                with mock.patch.object(prov.subprocess, "run") as run:
+                    self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+                run.assert_not_called()
+                self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "pending")
+                self.assertTrue(os.path.exists(self.p.deferred))
+        with self.subTest(stale="old pending file"):
+            old = "".join(line + "\n" for line in t.splitlines() if not line.startswith(("version=", "audio=")))
+            self.pending(old)
+            self.bound(t)
+            with mock.patch.object(prov.subprocess, "run") as run:
+                self.assertEqual(prov.cmd_activate(self.args("activate"), self.p), 0)
+            run.assert_not_called()
+            self.assertTrue(os.path.exists(self.p.deferred))
+
     def test_switch_test_activate_does_not_wait_on_the_session(self):
         """The switch test passed while the seat user's PipeWire runs (a
         switch in a live session): activate starts the user's graph unit and
@@ -670,10 +786,9 @@ class Graph(Base):
         activate must end the pending state first, or the two wait on each
         other until the user manager's timeout and the switch test fails."""
         home = self.provisioned()
-        prov.write_atomic(self.p.deferred, "kernel=k\n")
-        digest = prov.sha256_file(self.p.params)
-        prov.write_atomic(os.path.join(self.p.state, "selfcheck.bind"),
-                          f"result=pass\nkernel={os.uname().release}\nparams_sha256={digest}\n")
+        t = self.targets()
+        self.pending(t)
+        self.bound(t)
         started = []
 
         def refresh(p, user, changed_us, unit):
@@ -757,6 +872,45 @@ class Sleep(Base):
     def test_helper_amps_needs_a_fresh_report(self):
         self.assertIsNone(prov.helper_amps({}, 0))
         self.assertIsNone(prov.helper_amps({"SGV2_UID": "999999999"}, 0))
+
+    def _helper_report(self):
+        d = os.path.join(self.root, "run", "1000", "helper")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "session")
+
+    def _helper_amps(self):
+        return prov.helper_amps({"SGV2_UID": "1000"}, 5, run=os.path.join(self.root, "run"))
+
+    def test_helper_amps_reads_a_regular_report(self):
+        with open(self._helper_report(), "w") as f:
+            f.write("mono_ns=10 amps=0\n")
+        self.assertIs(self._helper_amps(), False)
+
+    def test_helper_amps_read_with_the_supervisors_limits(self):
+        """Not following a link, not blocking on a FIFO, at most 255 bytes."""
+        import threading
+        path = self._helper_report()
+        good = os.path.join(self.root, "report")
+        with open(good, "w") as f:
+            f.write("mono_ns=10 amps=1\n")
+        os.symlink(good, path)
+        self.assertIsNone(self._helper_amps())
+        os.unlink(path)
+        with open(path, "w") as f:
+            f.write("mono_ns=10 amps=1" + " " * 300 + "\n")
+        self.assertIsNone(self._helper_amps())
+        os.unlink(path)
+        os.mkfifo(path)
+        out = []
+        t = threading.Thread(target=lambda: out.append(self._helper_amps()), daemon=True)
+        t.start()
+        t.join(5)
+        blocked = t.is_alive()
+        if blocked:
+            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(5)
+        self.assertFalse(blocked, "blocked opening a FIFO report")
+        self.assertEqual(out, [None])
 
     def _pcm(self, card, name, first):
         d = os.path.join(self.p.proc_asound, card, name, "sub0")
@@ -1105,6 +1259,84 @@ class LV2Shadow(unittest.TestCase):
     def test_system_dirs_are_the_packaged_ones(self):
         self.assertEqual(self.scan(environ={"LV2_PATH": "/usr/lib64/lv2:/usr/lib/lv2"}), [])
 
+    def test_only_the_seat_users_home_is_looked_at(self):
+        """Root runs this before logins: another user's home is not read, and
+        with no seat user provisioned no home is."""
+        from unittest import mock
+        other = os.path.join(self.root, "home", "o")
+        self.bundle(os.path.join(other, ".lv2", "sgv2.lv2"))
+        pw = lambda name, home, uid: types.SimpleNamespace(pw_name=name, pw_dir=home, pw_uid=uid)
+        accounts = {1000: pw("u", self.home, 1000), 1001: pw("o", other, 1001)}
+
+        def getpwuid(uid):
+            if uid not in accounts:
+                raise KeyError(uid)
+            return accounts[uid]
+
+        for conf, want in (({"SGV2_UID": "1000"}, 0), ({}, 0), ({"SGV2_UID": "1001"}, 1)):
+            with mock.patch.object(self.sc, "read_conf", return_value=conf), \
+                    mock.patch.object(pwd, "getpwall", return_value=list(accounts.values())), \
+                    mock.patch.object(pwd, "getpwuid", side_effect=getpwuid):
+                self.assertEqual(len(self.sc.lv2_shadows(etc=self.etc, environ={})), want, conf)
+
+    def _no_block(self, fifo, call):
+        """`call()` returns at once although `fifo` has no writer."""
+        import threading
+        out = []
+        t = threading.Thread(target=lambda: out.append(call()), daemon=True)
+        t.start()
+        t.join(5)
+        blocked = t.is_alive()
+        if blocked:  # let the reader go
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            t.join(5)
+        self.assertFalse(blocked, f"blocked opening {fifo}")
+        return out[0]
+
+    def test_a_fifo_in_the_users_files_does_not_block(self):
+        envd = os.path.join(self.home, ".config", "environment.d")
+        os.makedirs(envd)
+        os.mkfifo(os.path.join(envd, "50-lv2.conf"))
+        self.assertEqual(self._no_block(os.path.join(envd, "50-lv2.conf"), self.scan), [])
+        os.makedirs(os.path.join(self.home, ".lv2", "x.lv2"))
+        man = os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl")
+        os.mkfifo(man)
+        self.assertEqual(self._no_block(man, self.scan), [])
+
+    def test_links_reach_only_regular_files_and_reads_are_bounded(self):
+        # A linked manifest (dotfile managers, per-file profiles) still counts
+        target = os.path.join(self.root, "elsewhere")
+        self.bundle(target)
+        os.makedirs(os.path.join(self.home, ".lv2", "x.lv2"))
+        os.symlink(os.path.join(target, "manifest.ttl"), os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl"))
+        self.assertEqual(len(self.scan()), 1)
+        os.unlink(os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl"))
+        # A link to a FIFO is not opened for a blocking read
+        fifo = os.path.join(self.root, "fifo")
+        os.mkfifo(fifo)
+        os.symlink(fifo, os.path.join(self.home, ".lv2", "x.lv2", "manifest.ttl"))
+        self.assertEqual(self.scan(), [])
+        big = os.path.join(self.home, ".lv2", "big.lv2")
+        os.makedirs(big)
+        with open(os.path.join(big, "manifest.ttl"), "w") as f:
+            f.write(" " * self.sc.USER_FILE_MAX + f"<{self.sc.PLUGIN_URI}x> a lv2:Plugin .\n")
+        self.assertEqual(self.scan(), [])
+
+    def test_a_link_to_a_device_is_never_opened_for_reading(self):
+        from unittest import mock
+        os.makedirs(os.path.join(self.home, ".lv2", "d.lv2"))
+        os.symlink("/dev/null", os.path.join(self.home, ".lv2", "d.lv2", "manifest.ttl"))
+        real, opened = os.open, []
+
+        def spy(path, flags, *a, **k):
+            fd = real(path, flags, *a, **k)
+            if not flags & os.O_PATH:
+                opened.append(os.path.realpath(f"/proc/self/fd/{fd}"))
+            return fd
+        with mock.patch.object(os, "open", spy):
+            self.assertEqual(self.scan(), [])
+        self.assertNotIn("/dev/null", opened)
+
 class Umask(Base):
     def test_graph_dirs_are_readable_whatever_the_callers_umask(self):
         """RC8 E2E B4: aurora-speaker-upgrade runs with umask 077; the graph
@@ -1163,11 +1395,11 @@ class Deactivate(Base):
 
 
 class Gate(Base):
-    def decide(self, iface="v2", gate_data=None, cmd="v2"):
+    def decide(self, iface="v2", gate_data=None, cmd="v2", card=None):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
             json.dump(GATE if gate_data is None else gate_data, f)
-        self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, None))
+        self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, card))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
         # the gate runs as root on a Mac (ExecCondition=+...); no waits here
         self.patch(gate, "privileged", lambda: True)
@@ -1211,6 +1443,45 @@ class Gate(Base):
         with open(self.p.params, "ab") as f:
             f.write(b"new-blob")
         self.assertEqual(self.decide(), (False, False))
+
+    def test_unreadable_controls_on_a_registered_card_start_neither(self):
+        # the speaker card is there but its controls could not be read in
+        # the wait: no answer, so neither stack starts (never the older
+        # daemons beside v2); no speaker card at all keeps today's answer
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        for cmd in ("v2", "legacy", "prepare"):
+            self.assertEqual(self.decide(None, cmd=cmd, card="AppleX"), (False, False), cmd)
+            self.assertIn("could not be read", self.why)
+        self.assertEqual(self.decide(None), (False, True))
+
+    def test_has_control_tells_a_missing_control_from_a_failed_open(self):
+        # only "the card opened and has no such control" is a "no": amixer
+        # failing to find or open the card (still registering, gone, no
+        # access) says nothing about the kernel's controls
+        out = {}
+        self.patch(gate.subprocess, "run", lambda cmd, **kw: types.SimpleNamespace(**out))
+        self.patch(gate, "log", lambda *a: None)
+        for rc, err, want in (
+                (0, "", True),
+                (1, "amixer: Cannot find the given element from control sysdefault:1\n\n", False),
+                (1, "Invalid card number 'AppleJ700'.\n", None),
+                (1, "amixer: Control sysdefault:1 open error: No such device\n\n", None),
+                (1, "amixer: Control sysdefault:1 open error: Permission denied\n\n", None)):
+            out.update(returncode=rc, stdout="", stderr=err)
+            self.assertIs(gate.has_control("AppleJ700", "Speaker Protection"), want, err)
+
+    def test_kernel_interface_asks_again_within_the_wait(self):
+        # the card was found but amixer could not read it yet: asked again
+        # until the wait ends, then the real answer counts
+        self.patch(gate, "speaker_card", lambda sysfs=None: "AppleX")
+        answers = [None, None, True]
+        self.patch(gate, "has_control", lambda card, name: answers.pop(0) if answers else True)
+        self.patch(gate.time, "sleep", lambda s: None)
+        self.assertEqual(gate.kernel_interface(10), ("dual", "AppleX"))
+        self.assertEqual(answers, [])
+        answers[:] = [False, None, False, False]
+        self.assertEqual(gate.kernel_interface(10), ("legacy", "AppleX"))
 
     def test_kernel_interface_reads_the_selector(self):
         self.patch(gate, "speaker_card", lambda sysfs=None: "AppleX")
@@ -1342,7 +1613,7 @@ class Gate(Base):
         from unittest import mock
         sc = load("sc", "speakerguardd-selfcheck")
         self.board("j999")
-        self.ctl({"board": "j999", "unit": "lsm2"})
+        self.ctl({"board": "j999", "unit": "lsm2", "aid": "AID44"})
         self.assertEqual(self.run_(), 0)
         fx = gen.fixture("j700")
         hw = fx["hw"]
@@ -1368,6 +1639,41 @@ class Gate(Base):
                 self.assertIn("sgv2#voicing", f.read())
             with open(os.path.join(args.wireplumber_dir, "60-sgv2-j999.conf")) as f:
                 self.assertIn("node.software-dsp.rules = []", f.read())
+            # The speaker tables are read by the speaker identity the record's
+            # wiring carries (the bundle's AID): a 4-lane AID13 bound on this
+            # 2-amp Mac refuses its voicing, and a record without one cannot
+            # generate the voicing at all.
+            record = os.path.join(self.p.state, "selfcheck.json")
+            with open(record) as f:
+                saved = f.read()
+            with open(self.p.report) as f:
+                prov_saved = f.read()
+            for aid in ("AID13", None):
+                report = json.loads(saved)
+                report["wiring"]["aid"] = aid
+                with open(record, "w") as f:
+                    json.dump(report, f)
+                # the provisioned bundle names the same identity, so the
+                # speaker table itself decides
+                with open(self.p.report, "w") as f:
+                    json.dump(dict(json.loads(prov_saved), aid=aid), f)
+                with self.assertRaises(ValueError, msg=aid):
+                    sc.cmd_generate(args)
+            with open(self.p.report, "w") as f:
+                f.write(prov_saved)
+            # The record's identity must be the provisioned bundle's: one
+            # that differs (a record and a bundle that drifted apart) refuses
+            # generation, before any speaker table is read.
+            report = json.loads(saved)
+            report["wiring"]["aid"] = "AID9"
+            with open(record, "w") as f:
+                json.dump(report, f)
+            with self.assertRaises(SystemExit) as e:
+                sc.cmd_generate(args)
+            self.assertIn("provisioned bundle 'AID44'", str(e.exception))
+            with open(record, "w") as f:
+                f.write(saved)
+            self.assertEqual(sc.cmd_generate(args), 0)
             # Kernel and blob changes re-run the silent check. Until it
             # passes again, the stale graph record cannot admit the board.
             self.checked(kernel="old-kernel")
@@ -1383,6 +1689,53 @@ class Gate(Base):
             self.assertEqual(pcm.call_count, 3)
             # A self-check alone cannot approve an uncompiled replacement.
             self.assertEqual(self.decide(), (False, False))
+
+    def test_a_deferred_run_names_what_the_next_pass_must_bind(self):
+        """`run --defer` on a sense board writes the record version and every
+        BOUND field to the pending file; the run after login rewrites it with
+        what it binds itself (here a sound module loaded in between: another
+        audio stack) before the switch test, so its activate finds the
+        record current."""
+        import gen
+        import wiring
+        from unittest import mock
+        sc = load("sc", "speakerguardd-selfcheck")
+        self.board("j999")
+        self.ctl({"board": "j999", "unit": "lsm2"})
+        self.assertEqual(self.run_(), 0)
+        fx = gen.fixture("j700")
+        hw = fx["hw"]
+        hw.update(board="j999", compatible=["apple,j999", "apple,t8140"],
+                  sound_compatible=["apple,j999-macaudio", "apple,macaudio"], model="Synthetic Mac J999")
+        w = wiring.derive(hw, fx["tuning"])
+        w["method"] = "derived"
+        desc = wiring.describe(hw, w)
+        args = types.SimpleNamespace(state=self.p.state, params=self.p.params, force=False, defer=True, deferred=self.p.deferred,
+                                     pipewire_dir=os.path.join(self.t, "pw"), wireplumber_dir=os.path.join(self.t, "wp"))
+        audio = ["a-before-login"]
+        seen = []
+
+        def tested(*a, **kw):
+            seen.append(prov.read_kv(self.p.deferred))
+            return []
+        with mock.patch.object(sc, "derive_live", return_value=(hw, w, desc, [])), \
+                mock.patch.object(sc, "lv2_shadows", return_value=[]), \
+                mock.patch.object(sc, "blob_rate", return_value=w["rate"]), \
+                mock.patch.object(sc, "find_card", return_value=(0, desc["card"])), \
+                mock.patch.object(sc, "audio_of", side_effect=lambda hw: audio[0]), \
+                mock.patch.object(sc, "active", side_effect=tested):
+            self.assertEqual(sc.cmd_run(args), 0)
+            want = prov.read_kv(self.p.deferred)
+            self.assertEqual(set(want), {"version", *sc.BOUND, "card"})
+            self.assertEqual(want["card"], desc["card"])
+            self.assertEqual((want["version"], want["board"], want["kernel"], want["wiring"], want["audio"]),
+                             (str(sc.VERSION), "j999", os.uname().release, w["hash"], "a-before-login"))
+            self.assertEqual(want["params_sha256"], prov.sha256_file(self.p.params))
+            audio[0] = "a-after-login"
+            args.defer = False
+            self.assertEqual(sc.cmd_run(args), 0)
+        self.assertEqual(seen[0]["audio"], "a-after-login")
+        self.assertTrue(prov.deferral_satisfied(self.p))
 
     def test_refusal_or_compiler_failure_stays_muted(self):
         self.board("j999")
@@ -1454,6 +1807,68 @@ class Gate(Base):
         policy["board_overrides"] = {"k116": "allow"}
         self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
 
+    def test_lsid_qualifies_only_when_the_compiler_releases_it(self):
+        policy = dict(GATE, units_at_parity=["spp3", "atsp", "lsm2", "lsid"])
+        gated = "warning[lsm2-release-gated] compile: unqualified companion/model/flow laws: output MUTED"
+        released = "warning[lsid-static-release] compile: the LSID estimator is not run"
+        for board, warning, ok in (("k116", gated, False), ("j713", released, True)):
+            with self.subTest(board=board):
+                self.board(board)
+                self.ctl({"board": board, "unit": "lsm2", "lsid": True, "warnings": [warning]})
+                self.assertEqual(self.run_(), 0 if ok else 1)
+                if ok:
+                    self.checked()
+                self.assertEqual(self.decide(gate_data=policy), (ok, False))
+
+    def test_lsid_static_release_needs_playback_rows_for_its_speaker(self):
+        import gen
+        released = "warning[lsid-static-release] compile: the LSID estimator is not run"
+        # Keyed by the speaker identity the bundle names, not the board: the
+        # same board compiles for a proven speaker and fails for one without
+        # rows. A graph without LSID needs no row for provisioning (AID21).
+        for aid, lsid, ok in (("AID37", True, True), ("AID42", True, False), ("AID44", True, True),
+                              ("AID21", False, True)):
+            with self.subTest(aid=aid):
+                self.board("j713")
+                self.ctl({"board": "j713", "unit": "lsm2", "lsid": lsid, "aid": aid, "warnings": [released] if lsid else []})
+                # The gate does not even start provisioning for it (no failed unit).
+                self.assertEqual(self.decide(gate_data=gen.load_gate(), cmd="prepare"), (ok, False))
+                self.assertEqual(self.run_(), 0 if ok else 1)
+                if ok:
+                    self.checked()
+                else:
+                    self.assertIn(f"lsid on {aid}: no protected playback row", " ".join(self.record()["reasons"]))
+                    self.assertFalse(os.path.exists(self.p.params))
+                self.assertEqual(self.decide(gate_data=gen.load_gate()), (ok, False))
+
+    def test_playback_rows_need_every_cover_with_evidence(self):
+        import gen
+        row = lambda covers, evidence="lab row": {"date": "2026-11-23", "board": "j000", "what": "w",
+                                                  "covers": covers, "evidence": evidence}
+        base = {"playback_covers": ["loud-step", "thermal-ramp"], "units_need_playback_rows": ["lsid"]}
+        for record, proven in (({"AID7": [row(["loud-step", "thermal-ramp"])]}, True),
+                               ({"AID7": [row(["loud-step"]), row(["thermal-ramp"])]}, True),
+                               ({"AID7": [row(["loud-step"])]}, False),
+                               ({"AID7": [row(["loud-step", "thermal-ramp"], evidence="")]}, False),
+                               ({"AID8": [row(["loud-step", "thermal-ramp"])]}, False),
+                               ({"AID7": [row(["loud-step", "thermal-ramp"], evidence="  ")]}, False),
+                               ({"AID7": [row(["loud-step", "thermal-ramp"], evidence=["x"])]}, False),
+                               ({"AID7": [row([["loud-step"], "thermal-ramp"])]}, False),
+                               ({"AID7": "yes"}, False), (["AID7"], False)):
+            g = dict(base, playback_rows=record)
+            self.assertEqual(bool(gen.playback_rows("AID7", g)), proven, record)
+            if proven:
+                gen.playback_policy("AID7", ["lsm2", "lsid"], g)
+            else:
+                with self.assertRaises(gen.wiring.Refused):
+                    gen.playback_policy("AID7", ["lsm2", "lsid"], g)
+            gen.playback_policy("AID7", ["lsm2"], g)
+        self.assertEqual(gen.playback_rows("AID7", dict(base, playback_covers=[], playback_rows={"AID7": [row([])]})), [])
+        self.assertEqual(gen.playback_rows("AID7", dict(base, playback_covers=[["loud-step"]],
+                                                        playback_rows={"AID7": [row(["loud-step"])]})), [])
+        with self.assertRaises(gen.wiring.Refused):
+            gen.playback_policy("AID7", ["spp3"], dict(base, units_need_playback_rows=["nope"]))
+
     def test_four_reference_boards_qualify_without_a_board_list(self):
         import gen
         for board, kind in (("j316s", "spp3"), ("j413", "spp3"), ("j616s", "spp3"), ("j700", "lsm2")):
@@ -1474,13 +1889,30 @@ class Gate(Base):
     def test_shipped_data(self):
         with open(os.path.join(HERE, "gate.json")) as f:
             g = json.load(f)
-        self.assertEqual(g["units_at_parity"], ["spp3", "lsm2", "atsp"])
+        self.assertEqual(g["units_at_parity"], ["spp3", "lsm2", "atsp", "lsid"])
         self.assertNotIn("qualified", g)
         self.assertNotIn("require_qualified_board", g)
         self.assertEqual(g["denied_boards"], [])
         self.assertEqual(g["board_overrides"], {})
         self.assertEqual(g["voicing_pre"], {"j316s": True, "j413": True, "j616s": True, "j700": True})
         self.assertFalse(os.path.exists(os.path.join(HERE, "machines.json")))
+        # Every recorded speaker is proven by its own rows, each with evidence.
+        import gen
+        self.assertEqual(g["playback_covers"], ["loud-step", "thermal-ramp"])
+        self.assertEqual(g["units_need_playback_rows"], ["lsid"])
+        for aid, rows in g["playback_rows"].items():
+            self.assertRegex(aid, r"^AID[1-9][0-9]*$")
+            for r in rows:
+                self.assertRegex(r["date"], r"^2[0-9]{3}-[0-9]{2}-[0-9]{2}$", aid)
+                self.assertTrue(r["board"] and r["what"] and r["evidence"], aid)
+                self.assertLessEqual(set(r["covers"]), set(g["playback_covers"]), aid)
+            self.assertTrue(gen.playback_rows(aid, g), aid)
+        # AID12 (J473, atsp), AID21 (J615, spp3) and AID37 (J713, LSID) have
+        # their loud/thermal-ramp rows; AID42 (J813) has none yet.
+        self.assertIn("AID12", g["playback_rows"])
+        self.assertIn("AID21", g["playback_rows"])
+        self.assertIn("AID37", g["playback_rows"])
+        self.assertNotIn("AID42", g["playback_rows"])
 
 
 JACK = b"apple,j616-macaudio-jack\0apple,macaudio\0"
@@ -1555,19 +1987,50 @@ class SpeakerRouting(Base):
         self.assertEqual((self.reads, self.writes), (0, []))
 
 
+def gate_proc(case):
+    """A private /proc/asound for the gate's card lookup in `case`."""
+    proc = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, proc, True)
+    orig = gate.PROC
+    gate.PROC = proc
+    case.addCleanup(setattr, gate, "PROC", orig)
+    return proc
+
+
+def alsa_card(sysfs, n, ident, compat, link, registered=True):
+    """Card n in a test /sys/class/sound (its device tree node behind
+    device/of_node), registered in full by ALSA (controlCN, the proc id in
+    gate.PROC) unless `registered` is False: then it is mid-registration,
+    with only its device, id and of_node link."""
+    node = os.path.join(sysfs, f"card{n}", "device", "of_node")
+    os.makedirs(os.path.join(node, "dai-link@0"))
+    with open(os.path.join(sysfs, f"card{n}", "id"), "w") as f:
+        f.write(ident + "\n")
+    with open(os.path.join(node, "compatible"), "wb") as f:
+        f.write(compat)
+    with open(os.path.join(node, "dai-link@0", "link-name"), "wb") as f:
+        f.write(link + b"\0")
+    if registered:
+        register(sysfs, n, ident)
+
+
+def register(sysfs, n, ident):
+    """ALSA finishes registering card n: controlCN, then its proc entries."""
+    open(os.path.join(sysfs, f"card{n}", f"controlC{n}"), "w").close()
+    os.makedirs(os.path.join(gate.PROC, f"card{n}"), exist_ok=True)
+    with open(os.path.join(gate.PROC, f"card{n}", "id"), "w") as f:
+        f.write(ident + "\n")
+
+
 class SpeakerCard(unittest.TestCase):
     """The gate's speaker card is the macaudio card with the speaker link,
     whichever card number the jack-only card took."""
 
-    def card(self, sysfs, n, ident, compat, link):
-        node = os.path.join(sysfs, f"card{n}", "device", "of_node")
-        os.makedirs(os.path.join(node, "dai-link@0"))
-        with open(os.path.join(sysfs, f"card{n}", "id"), "w") as f:
-            f.write(ident + "\n")
-        with open(os.path.join(node, "compatible"), "wb") as f:
-            f.write(compat)
-        with open(os.path.join(node, "dai-link@0", "link-name"), "wb") as f:
-            f.write(link + b"\0")
+    def setUp(self):
+        gate_proc(self)
+
+    def card(self, sysfs, n, ident, compat, link, registered=True):
+        alsa_card(sysfs, n, ident, compat, link, registered)
 
     def test_the_jack_card_first_is_skipped(self):
         with tempfile.TemporaryDirectory() as sysfs:
@@ -1577,12 +2040,40 @@ class SpeakerCard(unittest.TestCase):
             self.assertEqual(gate.speaker_card(sysfs), "AppleJ616")
 
     def test_the_provisioner_skips_the_jack_card(self):
-        with tempfile.TemporaryDirectory() as sysfs:
-            self.card(sysfs, 1, "AppleJack", JACK, b"Headphone Jack")
-            self.card(sysfs, 2, "AppleJ616", b"apple,j616-macaudio\0apple,macaudio\0", b"Speakers")
-            self.assertEqual(prov.find_card("AppleJ616", 0, sysfs), (2, "AppleJ616"))
+        with tempfile.TemporaryDirectory() as d:
+            sysfs, proc, dt = os.path.join(d, "sys"), os.path.join(d, "proc"), os.path.join(d, "dt")
+            for n, node, ident in ((1, "sound-jack", "AppleJack"), (2, "sound", "AppleJ616")):
+                os.makedirs(os.path.join(dt, node))
+                os.makedirs(os.path.join(sysfs, f"card{n}", "device"))
+                os.symlink(os.path.join(dt, node), os.path.join(sysfs, f"card{n}", "device", "of_node"))
+                open(os.path.join(sysfs, f"card{n}", f"controlC{n}"), "w").close()
+                os.makedirs(os.path.join(proc, f"card{n}"))
+                with open(os.path.join(proc, f"card{n}", "id"), "w") as f:
+                    f.write(ident + "\n")
+            hw = {"sound": "sound"}
+            self.assertEqual(prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc), (2, "AppleJ616"))
+            # another model-derived name is logged, not refused: the id is the card's own
+            self.assertEqual(prov.find_card(hw, "AppleJ614", 0, dt, sysfs, proc), (2, "AppleJ616"))
             with self.assertRaises(prov.Failed):
-                prov.find_card("AppleJ614", 0, sysfs)
+                prov.find_card({"sound": "sound-missing"}, "AppleJ616", 0, dt, sysfs, proc)
+            # a card still registering (of_node link, no id yet) is waited
+            # for, not refused: the wait runs out with "no card bound"
+            os.unlink(os.path.join(proc, "card2", "id"))
+            with self.assertRaises(prov.Failed) as e:
+                prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc)
+            self.assertIn("no ALSA card bound", str(e.exception))
+            # the same before its control device: the bounded wait covers it
+            with open(os.path.join(proc, "card2", "id"), "w") as f:
+                f.write("AppleJ616\n")
+            os.unlink(os.path.join(sysfs, "card2", "controlC2"))
+            with self.assertRaises(prov.Failed) as e:
+                prov.find_card(hw, "AppleJ616", 0, dt, sysfs, proc)
+            self.assertIn("no ALSA card bound", str(e.exception))
+            import threading
+            t = threading.Timer(0.6, lambda: open(os.path.join(sysfs, "card2", "controlC2"), "w").close())
+            t.start()
+            self.addCleanup(t.cancel)
+            self.assertEqual(prov.find_card(hw, "AppleJ616", 10, dt, sysfs, proc), (2, "AppleJ616"))
 
     def test_no_speaker_link_is_no_speaker_card(self):
         with tempfile.TemporaryDirectory() as sysfs:
@@ -1601,6 +2092,7 @@ class CardOrder(unittest.TestCase):
     def setUp(self):
         self.sysfs = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.sysfs, True)
+        gate_proc(self)
         self.asked = []
         # the jack card has no speaker controls; the speaker card has both
         controls = {"AppleJ616": {"Speaker Protection Interface", "Speaker Protection"}}
@@ -1611,14 +2103,14 @@ class CardOrder(unittest.TestCase):
         gate.log = lambda *a: None
         self.addCleanup(setattr, gate, "log", orig_log)
 
-    def card(self, n, ident, compat, link):
-        SpeakerCard.card(None, self.sysfs, n, ident, compat, link)
+    def card(self, n, ident, compat, link, registered=True):
+        alsa_card(self.sysfs, n, ident, compat, link, registered)
 
     def jack(self, n):
         self.card(n, "AppleJack", JACK, b"Headphone Jack")
 
-    def speaker(self, n):
-        self.card(n, "AppleJ616", self.SPEAKER, b"Speakers")
+    def speaker(self, n, registered=True):
+        self.card(n, "AppleJ616", self.SPEAKER, b"Speakers", registered)
 
     def test_jack_first(self):
         self.card(0, "AppleJ616HPAI", b"apple,aop-audio\0", b"Speakers")
@@ -1643,6 +2135,42 @@ class CardOrder(unittest.TestCase):
         self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
         self.assertGreaterEqual(time.monotonic() - t0, 0.5)
         self.assertEqual(set(self.asked), {"AppleJ616"})
+
+    def test_a_card_still_registering_is_waited_for(self):
+        # the Neo race (speakerguardd#235): the card's directory, id and
+        # of_node link exist before ALSA registered its control device and
+        # proc entries. amixer cannot open it then; the gate used to take
+        # that for "no Speaker Protection control" = a definite legacy
+        # answer. A card counts only once it is registered in full.
+        def amixer(card, name):
+            self.asked.append(card)
+            if not os.path.exists(os.path.join(self.sysfs, "card1", "controlC1")):
+                return False  # the old reading of a failed open
+            return name in {"Speaker Protection Interface", "Speaker Protection"}
+        gate.has_control = amixer
+        self.speaker(1, registered=False)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), (None, None))
+        self.assertEqual(self.asked, [])
+        # controlC1 is there, the proc entries are not yet: still registering
+        open(os.path.join(self.sysfs, "card1", "controlC1"), "w").close()
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), (None, None))
+        self.assertEqual(self.asked, [])
+        os.unlink(os.path.join(self.sysfs, "card1", "controlC1"))
+        import threading
+        t = threading.Timer(0.6, register, (self.sysfs, 1, "AppleJ616"))
+        t.start()
+        self.addCleanup(t.cancel)
+        t0 = time.monotonic()
+        self.assertEqual(gate.kernel_interface(10, self.sysfs), ("dual", "AppleJ616"))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+
+    def test_without_alsa_proc_the_control_device_decides(self):
+        # a kernel without ALSA's proc interface: controlCN alone
+        gate.PROC = os.path.join(self.sysfs, "no-proc")
+        self.speaker(1, registered=False)
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), (None, None))
+        open(os.path.join(self.sysfs, "card1", "controlC1"), "w").close()
+        self.assertEqual(gate.kernel_interface(0, self.sysfs), ("dual", "AppleJ616"))
 
     def test_jack_only_is_no_speaker_card(self):
         # the bounded wait ends without a speaker card: the caller keeps
@@ -1726,6 +2254,534 @@ class CardOrder(unittest.TestCase):
         # a registered speaker card answers whatever the tree scan says
         self.speaker(1)
         self.assertEqual(gate.kernel_interface(0, self.sysfs, dt=self.dt({})), ("dual", "AppleJ616"))
+
+
+def write_mic_dt(root, chassis="J316", compatible=b"apple,t6000-aop-audio\0apple,aop-audio\0", dma=b"dma\0", status=None):
+    """The AOP audio node of a Mac with a microphone array, as the kernel's
+    device trees have it (soc/aop@.../audio)."""
+    d = os.path.join(root, "soc", "aop@293c00000", "audio")
+    os.makedirs(d, exist_ok=True)
+    props = {"compatible": compatible, "dma-names": dma, "apple,chassis-name": chassis.encode() + b"\0"}
+    for k, v in props.items():
+        with open(os.path.join(d, k), "wb") as f:
+            f.write(v)
+    if status:
+        with open(os.path.join(os.path.dirname(d), "status"), "wb") as f:
+            f.write(status)
+
+
+class Microphone(Base):
+    """The built-in microphone step: after the speakers, never part of
+    their result."""
+
+    def setUp(self):
+        super().setUp()
+        write_mic_dt(self.dt)
+        self.mic_card()
+        self.checks = []
+
+        def check(blob, args):
+            self.checks.append(blob)
+            return {"result": "pass", "detail": "stand-in plugin", "blob_sha256": prov.sha256_file(blob)}
+
+        self.patch(prov, "mic_check", check)
+        self.home = os.path.join(self.t, "home")
+        os.environ["XDG_CONFIG_HOME"] = self.home
+
+    def tearDown(self):
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        super().tearDown()
+
+    def board(self, b):
+        # Base.board() rewrites soc/: keep the microphone node
+        had = os.path.exists(os.path.join(self.dt, "soc", "aop@293c00000"))
+        super().board(b)
+        if had:
+            write_mic_dt(self.dt)
+
+    def mic_card(self, card="AppleJ316HPAI", dev=0, pcm_id="hpai"):
+        d = os.path.join(self.p.proc_asound if hasattr(self, "p") else os.path.join(self.root, "proc", "asound"), card, f"pcm{dev}c")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "info"), "w") as f:
+            f.write(f"card: 1\ndevice: {dev}\nsubdevice: 0\nstream: CAPTURE\nid: {pcm_id}\nname: High-Quality Microphone\n")
+
+    def mic_record(self):
+        with open(self.p.mic_report) as f:
+            return json.load(f)
+
+    def mic_confs(self):
+        return sorted(os.path.relpath(f, self.p.mic_graph) for f in glob.glob(os.path.join(self.p.mic_graph, "*", "*.conf")))
+
+    def links(self):
+        out = []
+        for d in ("pipewire/pipewire.conf.d", "wireplumber/wireplumber.conf.d"):
+            try:
+                out += sorted(os.listdir(os.path.join(self.home, d)))
+            except OSError:
+                pass
+        return out
+
+    def speaker_state(self):
+        """Everything the speaker steps leave, without the times of day."""
+        out = {}
+        for f in (self.p.params, self.p.bind, self.p.conf, self.p.report, os.path.join(self.p.raw, "59-sgv2-raw.conf")):
+            try:
+                with open(f, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                data = None
+            if data is not None and f in (self.p.conf, self.p.report):
+                data = re.sub(rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}", b"TIME", data)
+            out[os.path.relpath(f, self.root)] = data
+        return out
+
+    def assertNoMic(self, result):
+        self.assertFalse(os.path.exists(self.p.mic))
+        self.assertFalse(os.path.exists(self.p.mic_published))
+        self.assertEqual(self.mic_confs(), [])
+        self.assertEqual(self.mic_record()["result"], result)
+        self.assertEqual(prov.read_kv(self.p.mic_bind)["result"], result)
+        self.assertEqual(prov.mic_ready(self.p, ME.pw_uid), {})
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertEqual([n for n in self.links() if "mic" in n], [])
+
+    def test_compiles_binds_publishes_and_writes_the_graph(self):
+        import gen
+        import wiring
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(self.calls(), ["identify", "dump", "compile", "identify", "mic-compile"])
+        # never a partial design
+        self.assertFalse([l for l in self.call_lines() if "--allow-partial" in l])
+        rec = self.mic_record()
+        self.assertEqual((rec["result"], rec["board"], rec["card"], rec["dev"], rec["channels"], rec["rate"]),
+                         ("pass", "j316s", "AppleJ316HPAI", 0, 3, 48000))
+        self.assertTrue(rec["compiled"])
+        bind = prov.read_kv(self.p.mic_bind)
+        self.assertEqual(bind["result"], "pass")
+        self.assertEqual(bind["blob_version"], str(wiring.MIC_BLOB_VERSION))
+        self.assertEqual(bind["bundle_digest"], "d1")
+        self.assertEqual(bind["unit"], prov.read_kv(self.p.bind)["unit"])
+        self.assertEqual(bind["compiler"], prov.read_kv(self.p.bind)["compiler"])
+        self.assertEqual(bind["mic_sha256"], prov.sha256_file(self.p.mic))
+        # root only at rest; the plugin's copy is the checked blob
+        self.assertEqual(os.stat(self.p.mic).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(self.p.mic_report).st_mode & 0o777, 0o600)
+        self.assertEqual(self.checks, [self.p.mic])
+        self.assertEqual(prov.sha256_file(self.p.mic_published), bind["mic_sha256"])
+        self.assertEqual(os.path.basename(self.p.mic_published), os.path.basename(gen.MIC_PARAMS))
+        # the graph is the generator's, for the running card
+        desc = dict(gen.mic_machine("j316"), dev=0)
+        src = "the device tree of j316s"
+        self.assertEqual(self.mic_confs(), ["pipewire/sgv2-mic-j316.conf", "wireplumber/61-sgv2-mic-j316.conf"])
+        with open(os.path.join(self.p.mic_graph, "pipewire", "sgv2-mic-j316.conf")) as f:
+            self.assertEqual(f.read(), gen.mic_pipewire_conf(desc, src))
+        with open(os.path.join(self.p.mic_graph, "wireplumber", "61-sgv2-mic-j316.conf")) as f:
+            self.assertEqual(f.read(), gen.mic_wireplumber_conf(desc, src))
+        st = prov.read_kv(self.p.mic_state)
+        self.assertEqual((st["result"], st["uid"], st["sha256"]), ("pass", str(ME.pw_uid), bind["mic_sha256"]))
+
+    def test_the_speaker_steps_are_the_same_with_and_without_a_microphone(self):
+        self.assertEqual(self.run_(), 0)
+        with_mic = self.speaker_state()
+        graph = prov.graph_digest(self.p)
+        self.assertTrue(os.path.exists(self.p.mic_published))
+        shutil.rmtree(self.root)
+        shutil.rmtree(os.path.join(self.dt, "soc", "aop@293c00000"))
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(self.speaker_state(), with_mic)
+        self.assertEqual(prov.graph_digest(self.p), graph)
+        self.assertFalse(os.path.exists(self.p.mic_report))
+
+    def test_a_refusal_leaves_the_speakers_intact(self):
+        self.assertEqual(self.run_(), 0)
+        before = self.speaker_state()
+        self.assertTrue(os.path.exists(self.p.mic))
+        self.ctl({"mic_refuses": True})
+        self.assertEqual(self.run_(force=True), 0)
+        self.assertEqual(self.speaker_state(), before)
+        self.assertEqual(prov.read_kv(self.p.bind)["result"], "pass")
+        self.assertNoMic("refused")
+        self.assertIn("uncharacterised", "\n".join(self.mic_record()["reasons"]))
+        self.assertEqual(prov.read_kv(self.p.mic_state), {"result": "refused"})
+
+    def test_a_design_the_compiler_cannot_carry_whole_is_refused_not_made_partial(self):
+        self.ctl({"mic_uncharacterised": True})
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("refused")
+        self.assertFalse([l for l in self.call_lines() if "--allow-partial" in l])
+
+    def test_a_partial_blob_is_never_used(self):
+        self.ctl({"mic_partial": True})
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("refused")
+        self.assertIn("partial", "\n".join(self.mic_record()["reasons"]))
+        self.assertEqual(self.checks, [])
+
+    def test_a_blob_for_another_board_rate_or_count_is_refused(self):
+        for ctl, why in (({"mic_board": "j314s"}, "compiled for j314s"), ({"mic_rate": 44100}, "44100 Hz"),
+                         ({"mic_mics": 2}, "2 microphones")):
+            self.ctl(ctl)
+            self.assertEqual(self.run_(), 0)
+            self.assertNoMic("refused")
+            self.assertIn(why, "\n".join(self.mic_record()["reasons"]))
+
+    def test_bound_blob_is_kept_and_any_bound_change_compiles_again(self):
+        self.assertEqual(self.run_(), 0)
+        n = lambda: self.calls().count("mic-compile")  # noqa: E731
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(n(), 1)
+        self.assertFalse(self.mic_record()["compiled"])
+        self.assertEqual(self.mic_record()["result"], "pass")
+        # the bundle
+        self.ctl({"digest": "d2"})
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(n(), 2)
+        # the compiler
+        with open(self.cli, "a") as f:
+            f.write("# a newer build\n")
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(n(), 3)
+        # the blob itself
+        with open(self.p.mic, "ab") as f:
+            f.write(b"x")
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(n(), 4)
+        self.assertEqual(prov.read_kv(self.p.mic_bind)["mic_sha256"], prov.sha256_file(self.p.mic))
+        # --force
+        self.assertEqual(self.run_(force=True), 0)
+        self.assertEqual(n(), 5)
+        self.assertEqual(self.mic_record()["result"], "pass")
+
+    def test_a_stale_blob_version_compiles_again(self):
+        import wiring
+        self.assertEqual(self.run_(), 0)
+        # a blob of the first microphone release, bound and whole: the
+        # plugin would give silence, so it is never kept
+        self.ctl({"mic_version": 1})
+        prov.compile_mic(self.cli, [], self.p.mic)
+        with open(self.p.mic, "rb") as f:
+            self.assertEqual(wiring.mic_blob_header(f.read())["version"], 1)
+        bind = open(self.p.mic_bind).read().replace(prov.read_kv(self.p.mic_bind)["mic_sha256"], prov.sha256_file(self.p.mic))
+        prov.write_atomic(self.p.mic_bind, bind)
+        self.ctl({})
+        n = self.calls().count("mic-compile")
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(self.calls().count("mic-compile"), n + 1)
+        self.assertTrue(self.mic_record()["compiled"])
+        with open(self.p.mic, "rb") as f:
+            self.assertEqual(wiring.mic_blob_header(f.read())["version"], wiring.MIC_BLOB_VERSION)
+        self.assertEqual(prov.sha256_file(self.p.mic_published), prov.sha256_file(self.p.mic))
+
+    def test_the_bound_version_is_the_plugins(self):
+        import wiring
+        self.assertEqual(self.run_(), 0)
+        n = self.calls().count("mic-compile")
+        # a package whose plugin takes a newer blob: compile again, and
+        # refuse what an older compiler still writes
+        self.patch(wiring, "MIC_BLOB_VERSION", wiring.MIC_BLOB_VERSION + 1)
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(self.calls().count("mic-compile"), n + 1)
+        self.assertNoMic("refused")
+        self.assertIn("blob version", "\n".join(self.mic_record()["reasons"]))
+
+    def test_a_compiler_that_writes_the_wrong_version_is_refused(self):
+        self.ctl({"mic_version": 1})
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("refused")
+
+    def test_the_plugins_refusal_writes_no_graph(self):
+        self.patch(prov, "mic_check", lambda blob, args: {"result": "refused", "detail": "the packaged plugin refuses the blob (health 1)"})
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("refused")
+        self.assertIn("health 1", "\n".join(self.mic_record()["reasons"]))
+        self.assertEqual(prov.read_kv(self.p.bind)["result"], "pass")
+
+    def test_the_real_check_refuses_without_the_packaged_plugin(self):
+        # speakerguardd-selfcheck mic itself, on a host with no device tree
+        # and no packaged plugin for it: never a pass
+        self.patch(prov, "mic_check", self.saved[(prov, "mic_check")])
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("refused")
+
+    def test_no_microphone_array_is_no_step(self):
+        shutil.rmtree(os.path.join(self.dt, "soc", "aop@293c00000"))
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(self.calls(), ["identify", "dump", "compile"])
+        for f in (self.p.mic, self.p.mic_bind, self.p.mic_report, self.p.mic_published, self.p.mic_graph):
+            self.assertFalse(os.path.exists(f), f)
+
+    def test_a_mac_without_the_arrays_stream_or_with_the_aop_off_has_none(self):
+        import wiring
+        # a Mac mini / Mac Studio: the audio node lists no microphone stream
+        write_mic_dt(self.dt, chassis="J773", compatible=b"apple,t6041-aop-audio\0apple,t6030-aop-audio\0", dma=b"spkr\0cout\0cin\0")
+        self.assertIsNone(wiring.read_mic_dt(self.dt))
+        self.assertEqual(self.run_(), 0)
+        self.assertNotIn("mic-compile", self.calls())
+        self.assertFalse(os.path.exists(self.p.mic_report))
+        # the AOP disabled in the device tree
+        write_mic_dt(self.dt, status=b"disabled\0")
+        self.assertIsNone(wiring.read_mic_dt(self.dt))
+
+    def test_what_another_mac_left_is_removed_on_a_mac_without_an_array(self):
+        self.assertEqual(self.run_(), 0)
+        shutil.rmtree(os.path.join(self.dt, "soc", "aop@293c00000"))
+        self.assertEqual(self.run_(), 0)
+        for f in (self.p.mic, self.p.mic_bind, self.p.mic_report, self.p.mic_published, self.p.mic_state):
+            self.assertFalse(os.path.exists(f), f)
+        self.assertEqual(self.mic_confs(), [])
+
+    def test_no_microphone_pcm_is_absent(self):
+        shutil.rmtree(os.path.join(self.p.proc_asound, "AppleJ316HPAI"))
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("absent")
+        self.assertNotIn("mic-compile", self.calls())
+        self.assertEqual(prov.read_kv(self.p.bind)["result"], "pass")
+
+    def test_the_pcm_is_found_by_its_id_else_the_drivers_device(self):
+        import wiring
+        desc = wiring.describe_mic(wiring.read_mic_dt(self.dt))
+        self.assertEqual(wiring.live_mic_pcm(desc, self.p.proc_asound), 0)
+        self.mic_card(dev=3, pcm_id="hpai")
+        self.mic_card(dev=0, pcm_id="lpai")
+        self.assertEqual(wiring.live_mic_pcm(desc, self.p.proc_asound), 3)
+        self.assertEqual(self.run_(), 0)
+        with open(os.path.join(self.p.mic_graph, "pipewire", "sgv2-mic-j316.conf")) as f:
+            self.assertIn('api.alsa.path          = "hw:CARD=AppleJ316HPAI,DEV=3"', f.read())
+        with open(os.path.join(self.p.mic_graph, "wireplumber", "61-sgv2-mic-j316.conf")) as f:
+            self.assertIn('{ api.alsa.path = "hw:AppleJ316HPAI,3" }', f.read())
+        # a kernel that does not name the PCM: the driver's own device
+        shutil.rmtree(os.path.join(self.p.proc_asound, "AppleJ316HPAI"))
+        self.mic_card(dev=0, pcm_id="AOP")
+        self.assertEqual(wiring.live_mic_pcm(desc, self.p.proc_asound), 0)
+
+    def test_a_speaker_failure_does_not_stop_the_microphone(self):
+        self.ctl({"compile_fails": True})
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(prov.read_kv(self.p.bind)["result"], "fail")
+        self.assertFalse(os.path.exists(self.p.params) or os.path.exists(self.p.conf))
+        self.assertEqual(self.mic_record()["result"], "pass")
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertEqual(self.links(), ["sgv2-mic-j316.conf", "61-sgv2-mic-j316.conf"])
+
+    def test_no_bundle_is_a_refusal_of_both_and_they_do_not_mix(self):
+        self.ctl({"no_bundle": True})
+        self.assertEqual(self.run_(), 1)
+        self.assertNoMic("refused")
+        self.assertEqual(self.record()["result"], "fail")
+        self.assertNotIn("mic", self.record())
+
+    def test_an_internal_error_in_the_microphone_step_is_not_the_speakers(self):
+        def boom(*a, **kw):
+            raise RuntimeError("boom")
+        self.patch(prov, "mic_step", boom)
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(prov.read_kv(self.p.bind)["result"], "pass")
+        self.patch(prov, "mic_step", self.saved[(prov, "mic_step")])
+        self.patch(prov, "find_mic_pcm", boom)
+        self.assertEqual(self.run_(), 0)
+        self.assertNoMic("refused")
+
+    def test_a_user_file_at_one_name_leaves_neither_microphone_link(self):
+        self.assertEqual(self.run_(), 0)
+        g = lambda: prov.cmd_graph_user(self.args("graph-user"), self.p)  # noqa: E731
+        pw = os.path.join(self.home, "pipewire", "pipewire.conf.d", "sgv2-mic-j316.conf")
+        wp = os.path.join(self.home, "wireplumber", "wireplumber.conf.d", "61-sgv2-mic-j316.conf")
+        self.assertEqual(g(), 0)
+        self.assertTrue(os.path.islink(pw) and os.path.islink(wp))
+        before = self.speaker_state()
+        # the user puts a file of their own at the WirePlumber name: our
+        # PipeWire half goes too, their file stays untouched
+        os.unlink(wp)
+        with open(wp, "w") as f:
+            f.write("# the user's own\n")
+        self.assertEqual(g(), 0)
+        self.assertFalse(os.path.lexists(pw))
+        self.assertFalse(os.path.islink(wp))
+        self.assertEqual(open(wp).read(), "# the user's own\n")
+        self.assertEqual(self.speaker_state(), before)
+        # the same at the PipeWire name
+        os.unlink(wp)
+        with open(pw, "w") as f:
+            f.write("# the user's own\n")
+        self.assertEqual(g(), 0)
+        self.assertFalse(os.path.lexists(wp))
+        self.assertEqual(open(pw).read(), "# the user's own\n")
+        # their file gone: both again
+        os.unlink(pw)
+        self.assertEqual(g(), 0)
+        self.assertTrue(os.path.islink(pw) and os.path.islink(wp))
+
+    def test_a_failing_second_microphone_link_removes_the_first(self):
+        self.assertEqual(self.run_(), 0)
+        pw = os.path.join(self.home, "pipewire", "pipewire.conf.d", "sgv2-mic-j316.conf")
+        wp = os.path.join(self.home, "wireplumber", "wireplumber.conf.d", "61-sgv2-mic-j316.conf")
+        real = os.symlink
+        made = []
+
+        def second_fails(target, path):
+            if "mic" in os.path.basename(path):
+                made.append(path)
+                if len(made) == 2:
+                    raise OSError(28, "No space left on device")
+            real(target, path)
+        self.patch(os, "symlink", second_fails)
+        before = self.speaker_state()
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertEqual(len(made), 2)
+        self.assertFalse(os.path.lexists(pw) or os.path.lexists(wp))
+        self.assertEqual(self.speaker_state(), before)
+        self.patch(os, "symlink", real)
+        self.assertEqual(prov.cmd_graph_user(self.args("graph-user"), self.p), 0)
+        self.assertTrue(os.path.islink(pw) and os.path.islink(wp))
+
+    def test_a_session_links_both_files_or_neither(self):
+        self.assertEqual(self.run_(), 0)
+        g = lambda: prov.cmd_graph_user(self.args("graph-user"), self.p)  # noqa: E731
+        mic = ["sgv2-mic-j316.conf", "61-sgv2-mic-j316.conf"]
+        raw = ["59-sgv2-raw.conf"]
+        self.assertEqual(g(), 0)
+        # the speaker self-check has not passed: the microphone does not wait for it
+        self.assertEqual(self.links(), [mic[0]] + sorted(raw + [mic[1]]))
+        pw = os.path.join(self.home, "pipewire", "pipewire.conf.d", mic[0])
+        self.assertEqual(os.readlink(pw), os.path.join(self.p.mic_graph, "pipewire", mic[0]))
+        state = open(self.p.mic_state).read()
+        # one file missing: neither
+        wp = os.path.join(self.p.mic_graph, "wireplumber", mic[1])
+        text = open(wp).read()
+        os.unlink(wp)
+        self.assertEqual(g(), 0)
+        self.assertEqual(self.links(), raw)
+        prov.write_atomic(wp, text)
+        self.assertEqual(g(), 0)
+        self.assertEqual(len(self.links()), 3)
+        # the published blob is not the checked one: neither
+        prov.write_atomic(self.p.mic_published, b"another blob")
+        self.assertEqual(g(), 0)
+        self.assertEqual(self.links(), raw)
+        os.unlink(self.p.mic_published)
+        self.assertEqual(g(), 0)
+        self.assertEqual(self.links(), raw)
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(g(), 0)
+        self.assertEqual(len(self.links()), 3)
+        # another user's session: neither
+        prov.write_atomic(self.p.mic_state, state.replace(f"uid={ME.pw_uid}", f"uid={ME.pw_uid + 1}"))
+        self.assertEqual(g(), 0)
+        self.assertEqual(self.links(), raw)
+        # a state that names a file outside the graph: neither
+        prov.write_atomic(self.p.mic_state, state.replace("pipewire=sgv2-mic-j316.conf", "pipewire=../../raw/59-sgv2-raw.conf"))
+        self.assertEqual(prov.mic_ready(self.p, ME.pw_uid), {})
+
+    def test_the_speaker_graphs_own_bookkeeping_never_sees_the_microphone(self):
+        self.assertEqual(self.run_(), 0)
+        digest = prov.graph_digest(self.p)
+        self.assertEqual(prov.graph_pcms(self.p), [])
+        prov.clear_graph(self.p)
+        self.assertEqual(len(self.mic_confs()), 2)
+        self.assertEqual(prov.read_kv(self.p.mic_state)["result"], "pass")
+        self.ctl({"mic_refuses": True})
+        self.assertEqual(self.run_(force=True), 0)
+        self.assertEqual(prov.graph_digest(self.p), digest)
+
+    def test_the_constants_are_the_engines(self):
+        import wiring
+        crates = os.path.join(HERE, "..", "..", "crates")
+        art = os.path.join(crates, "sgv2-core", "src", "mic", "artifact.rs")
+        if not os.path.exists(art):
+            self.skipTest("no engine source beside the session files")
+        text = open(art).read()
+        self.assertEqual(int(re.search(r"pub const VERSION: u32 = (\d+);", text).group(1)), wiring.MIC_BLOB_VERSION)
+        self.assertEqual(int(re.search(r"pub const HEADER_LEN: usize = (\d+);", text).group(1)), wiring.MIC_BLOB_HEADER)
+        self.assertIn('pub const MAGIC: [u8; 8] = *b"SGV2MIC\\0";', text)
+        self.assertIn("pub const MAX_BYTES: usize = 4 * 1024 * 1024;", text)
+        lv2 = open(os.path.join(crates, "sgv2-lv2", "src", "mic.rs")).read()
+        variants = [int(n) for n in re.findall(r'sgv2#mic-(\d)ch\\0", \1\)', lv2)]
+        self.assertEqual(variants, list(range(1, wiring.MIC_PLUGIN_MAX + 1)))
+        self.assertIn(f'pub const DEFAULT_PATH: &str = "{__import__("gen").MIC_PARAMS}";', lv2)
+        self.assertEqual(self.p.mic_published, os.path.join(self.root, __import__("gen").MIC_PARAMS.lstrip("/")))
+
+
+class MicrophoneVerdict(Base):
+    """speakerguardd-selfcheck's microphone verdict, apart from the speakers'."""
+
+    def setUp(self):
+        super().setUp()
+        self.sc = load("sc_mic", "speakerguardd-selfcheck")
+        write_mic_dt(self.dt)
+        self.blob = os.path.join(self.t, "mic.bin")
+        self.health = (0, 1439)
+        self.probed = []
+
+        def probe(blob, mics, rate, lv2_dirs=None):
+            self.probed.append((blob, mics, rate))
+            return self.health
+
+        self.saved_probe = self.sc.mic_probe
+        self.sc.mic_probe = probe
+
+    def compile(self, **ctl):
+        self.ctl(ctl)
+        prov.compile_mic(self.cli, [], self.blob)
+
+    def verdict(self):
+        return self.sc.mic_verdict(self.blob, self.dt)
+
+    def test_pass_is_this_board_rate_count_version_and_plugin_health_0(self):
+        self.compile()
+        v = self.verdict()
+        self.assertEqual((v["result"], v["board"], v["mics"], v["rate"], v["version"], v["health"]),
+                         ("pass", "j316s", 3, 48000, 2, 0))
+        self.assertEqual(v["blob_sha256"], prov.sha256_file(self.blob))
+        self.assertEqual(self.probed, [(self.blob, 3, 48000)])
+
+    def test_plugin_health_1_is_refused(self):
+        self.compile()
+        self.health = (1, 0)
+        v = self.verdict()
+        self.assertEqual((v["result"], v["health"]), ("refused", 1))
+
+    def test_a_blob_the_plugin_would_refuse_is_refused_before_it_is_loaded(self):
+        for ctl, why in (({"mic_board": "j314s"}, "j314s"), ({"mic_rate": 44100}, "44100"), ({"mic_mics": 2}, "2 microphones"),
+                         ({"mic_version": 1}, "blob version 1"), ({"mic_partial": True}, "partial")):
+            self.compile(**ctl)
+            v = self.verdict()
+            self.assertEqual(v["result"], "refused", ctl)
+            self.assertIn(why, v["detail"])
+        self.assertEqual(self.probed, [])
+        self.compile()
+        data = bytearray(open(self.blob, "rb").read())
+        data[80] ^= 1
+        open(self.blob, "wb").write(bytes(data))
+        self.assertIn("checksum", self.verdict()["detail"])
+        open(self.blob, "wb").write(b"blob d1")
+        self.assertEqual(self.verdict()["result"], "refused")
+
+    def test_absent_without_an_array_or_a_blob(self):
+        v = self.verdict()
+        self.assertEqual(v["result"], "absent")
+        self.assertIn("no microphone blob", v["detail"])
+        shutil.rmtree(os.path.join(self.dt, "soc", "aop@293c00000"))
+        self.compile()
+        self.assertEqual(self.verdict()["result"], "absent")
+        self.assertEqual(self.probed, [])
+
+    def test_the_probe_without_the_packaged_plugin_refuses(self):
+        self.compile()
+        with self.assertRaises(self.sc.wiring.Refused):
+            self.saved_probe(self.blob, 3, 48000, lv2_dirs=(os.path.join(self.t, "no-lv2"),))
+
+    def test_the_command_reports_and_exits_by_the_verdict(self):
+        out = os.path.join(self.t, "mic.json")
+        a = types.SimpleNamespace(blob=self.blob, dt=self.dt, json=out)
+        self.assertEqual(self.sc.cmd_mic(a), 0)  # absent: nothing is wrong
+        self.assertEqual(json.load(open(out))["result"], "absent")
+        self.compile()
+        self.assertEqual(self.sc.cmd_mic(a), 0)
+        self.assertEqual(json.load(open(out))["result"], "pass")
+        self.health = (1, 0)
+        self.assertEqual(self.sc.cmd_mic(a), 1)
+        self.assertEqual(json.load(open(out))["result"], "refused")
+
 
 
 class Units(unittest.TestCase):

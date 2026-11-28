@@ -153,3 +153,40 @@ impl Default for Telemetry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_fields_are_nan_not_zero() {
+        let t = Telemetry::default();
+        assert_eq!(t.frame, 0);
+        assert_eq!(t.health, Health::OK);
+        for c in &t.channels {
+            assert!(c.gain.is_nan() && c.coil_temp_c.is_nan() && c.sense_r_ohm.is_nan());
+            assert!(c.axis_gain.iter().chain(&c.band_gain).all(|g| g.is_nan()));
+            assert!(!c.closed_loop);
+            assert_eq!(c.cl_fresh, 0);
+        }
+        assert!(t.global.power_gain.is_nan() && t.global.power_hard_limit_w.iter().all(|w| w.is_nan()));
+    }
+
+    #[test]
+    fn clear_keeps_the_frame_and_drops_everything_else() {
+        let mut t = Telemetry::new();
+        t.frame = 12_345;
+        t.health = Health(Health::FAILSAFE);
+        t.channels[3].gain = 0.5;
+        t.channels[3].closed_loop = true;
+        t.channels[3].cl_fresh = 1;
+        t.global.thermal_gain_db = -3.0;
+        t.clear();
+        assert_eq!(t.frame, 12_345);
+        assert_eq!(t.health, Health::OK);
+        assert!(t.channels[3].gain.is_nan());
+        assert!(!t.channels[3].closed_loop);
+        assert_eq!(t.channels[3].cl_fresh, 0);
+        assert!(t.global.thermal_gain_db.is_nan());
+    }
+}

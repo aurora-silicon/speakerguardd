@@ -253,4 +253,122 @@ mod tests {
         }
         assert_eq!(e.delay(), None);
     }
+
+    /// Synthetic noise bursts: the per-frame program energy, and the sensed
+    /// voltage energy, which is the program's delayed by `d` frames.
+    fn delayed_bursts(d: usize, n: usize) -> (std::vec::Vec<f32>, std::vec::Vec<f32>) {
+        let mut s = 1u32;
+        let mut o = std::vec::Vec::with_capacity(n);
+        for k in 0..n {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let env = if (k / 2400) % 3 == 0 { 1.0 } else { 0.1 };
+            let x = ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * env;
+            o.push(x * x);
+        }
+        let v = (0..n).map(|k| if k >= d { 0.7 * o[k - d] } else { 0.0 }).collect();
+        (o, v)
+    }
+
+    fn feed(e: &mut DelayEstimator, o: &[f32], v: &[f32]) {
+        for k in 0..o.len() {
+            e.push(o[k], v[k]);
+            if k % 512 == 511 {
+                e.end_block();
+            }
+        }
+    }
+
+    fn locked_at(d: usize) -> DelayEstimator {
+        let (o, v) = delayed_bursts(d, 48_000 * 4);
+        let mut e = DelayEstimator::new();
+        feed(&mut e, &o, &v);
+        assert_eq!(e.delay(), Some(d as u32));
+        e
+    }
+
+    #[test]
+    fn a_non_finite_point_restarts_the_evidence_but_keeps_the_lock() {
+        for (bad_o, bad_v) in [(f32::NAN, 0.0), (0.0, f32::INFINITY), (f32::NEG_INFINITY, f32::NAN)] {
+            let mut e = locked_at(1024);
+            e.push(1.0, 1.0);
+            e.push(bad_o, bad_v);
+            // the poison is only acted on at the point boundary
+            assert!(e.poisoned && e.filled > 0);
+            while e.room() > 1 {
+                e.push(1.0, 1.0);
+            }
+            e.push(1.0, 1.0);
+            assert!(!e.poisoned, "the poisoned point is discarded");
+            assert_eq!(e.filled, 0, "the correlation restarts");
+            assert!(e.corr.iter().all(|c| *c == 0.0));
+            assert_eq!(e.delay(), Some(1024), "the configuration's delay is kept");
+            // the restarted estimator relocks at a new delay from clean evidence
+            let (o, v) = delayed_bursts(512, 48_000 * 4);
+            feed(&mut e, &o, &v);
+            assert_eq!(e.delay(), Some(512));
+            assert!(e.corr.iter().all(|c| c.is_finite()));
+        }
+    }
+
+    #[test]
+    fn finite_inputs_that_overflow_the_correlation_restart_it_and_keep_the_lock() {
+        let mut e = locked_at(1536);
+        for _ in 0..ENV * 4 {
+            e.push(f32::MAX, f32::MAX);
+        }
+        e.end_block();
+        assert_eq!(e.filled, 0);
+        assert!(e.corr.iter().all(|c| *c == 0.0));
+        assert_eq!(e.delay(), Some(1536));
+    }
+
+    #[test]
+    fn silence_after_a_lock_keeps_it_and_reset_forgets_it() {
+        let mut e = locked_at(1536);
+        feed(&mut e, &[0.0; 48_000], &[0.0; 48_000]);
+        assert_eq!(e.delay(), Some(1536), "no evidence either way");
+        e.reset();
+        assert_eq!(e.delay(), None);
+        assert_eq!(e.room(), ENV);
+    }
+
+    #[test]
+    fn frames_fed_in_sums_match_frames_fed_one_by_one() {
+        let (o, v) = delayed_bursts(768, 48_000);
+        let mut one = DelayEstimator::new();
+        let mut sums = DelayEstimator::new();
+        let mut k = 0;
+        // uneven chunks, each at most `room()` frames
+        let mut step = 1;
+        while k < o.len() {
+            let n = step.min(sums.room()).min(o.len() - k);
+            let (so, sv) = (o[k..k + n].iter().sum::<f32>(), v[k..k + n].iter().sum::<f32>());
+            sums.push_sums(so, sv, n);
+            for j in k..k + n {
+                one.push(o[j], v[j]);
+            }
+            assert_eq!(sums.room(), one.room());
+            k += n;
+            step = step % 13 + 1;
+        }
+        assert_eq!(sums.filled, one.filled);
+        for (a, b) in sums.corr.iter().zip(&one.corr) {
+            assert!((a - b).abs() <= 1e-3 * b.abs().max(1e-6), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn block_sums_clear_to_an_empty_complete_block() {
+        let mut b = BlockSums {
+            i_sq: [1.0; MAX_CHANNELS],
+            v_sq: [2.0; MAX_CHANNELS],
+            vi: [3.0; MAX_CHANNELS],
+            frames: 7,
+            complete: false,
+        };
+        b.clear();
+        assert!(b.complete);
+        assert_eq!(b.frames, 0);
+        assert!(b.i_sq.iter().chain(&b.v_sq).chain(&b.vi).all(|x| *x == 0.0));
+    }
 }

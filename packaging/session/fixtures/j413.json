@@ -96,9 +96,20 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@24ac00000/audio",
+  "compatible": [
+   "apple,t8112-aop-audio",
+   "apple,aop-audio"
+  ],
+  "dma_names": [
+   "dma"
+  ],
+  "chassis": "J413"
+ },
  "tuning": {
   "tuning": {
-   "aid": "synthetic",
+   "aid": "AID13",
    "selection": {
     "sample_rate": 48000,
     "substitutions": {

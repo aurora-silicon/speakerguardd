@@ -81,12 +81,16 @@ fn run(u: &mut Unstructured) -> Result<()> {
     }
     if let Ok(p) = lsm2::Params::from_blob(&bytes) {
         let mut un = lsm2::Unit::new(p);
-        let (g, l) = if un.is_failsafe() { (FAILSAFE_GAIN, 0) } else { (1.0, un.latency_frames() as usize) };
-        probe(&mut un, p.channels as usize, l, g, &x, "lsm2 from_blob");
+        let (g, l, boost) = if un.is_failsafe() {
+            (FAILSAFE_GAIN, 0, 0.0)
+        } else {
+            (1.0, un.latency_frames() as usize, LSM2_ALLOWANCE)
+        };
+        probe_p(&mut un, p.channels as usize, l, g, boost, &x, "lsm2 from_blob");
     }
     if let Ok(p) = atsp::Params::from_blob(&bytes) {
         let mut un = atsp::Unit::new(p);
-        let g = if un.is_failsafe() { FAILSAFE_GAIN } else { 1.0 };
+        let g = if un.is_failsafe() { FAILSAFE_GAIN } else { atsp_peak(&un) };
         probe(&mut un, p.channels as usize, 0, g, &x, "atsp from_blob");
     }
 
@@ -101,11 +105,13 @@ fn run(u: &mut Unstructured) -> Result<()> {
         AnyUnit::Placeholder(_) => panic!("load_unit gave the placeholder for Role::Protect"),
         other => {
             assert!(err.is_none());
-            (1.0, other.unit().latency_frames() as usize)
+            let g = if let AnyUnit::Atsp(a) = other { atsp_peak(a) } else { 1.0 };
+            (g, other.unit().latency_frames() as usize)
         }
     };
     let pilot = match &unit {
         AnyUnit::Spp3(u) => spp3_pilot(u.params()),
+        AnyUnit::Lsm2(_) => LSM2_ALLOWANCE,
         _ => 0.0,
     };
     if err.is_some() {

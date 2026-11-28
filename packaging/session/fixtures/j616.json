@@ -88,9 +88,24 @@
    }
   ]
  },
+ "mic": {
+  "node": "aop@510600000/audio",
+  "compatible": [
+   "apple,t6041-aop-audio",
+   "apple,t6030-aop-audio"
+  ],
+  "dma_names": [
+   "dma",
+   "spkr",
+   "sense",
+   "cout",
+   "cin"
+  ],
+  "chassis": "J616"
+ },
  "tuning": {
   "tuning": {
-   "aid": "synthetic",
+   "aid": "AID35",
    "selection": {
     "sample_rate": 48000,
     "substitutions": {

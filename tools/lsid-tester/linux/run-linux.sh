@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# LSID tester kit, Linux step 2:   sudo bash linux/run-linux.sh [--bundle PATH] [--collection TARBALL] [--out FILE]
+# LSID tester kit, Linux step 2:   sudo bash linux/run-linux.sh [--bundle PATH] [--out FILE]
 #
 # Silent. Nothing here plays sound: the self-check's streams are all-zero
 # samples, and speakerguardd v2 keeps LSID speakers muted whatever happens.
@@ -17,22 +17,19 @@
 # directory that is deleted at exit. The log holds results, numbers, hashes and
 # error text only; redact-check.sh runs on it at the end.
 #
-# --bundle PATH       the tuning bundle (directory or .tar.gz from collect-macos.sh);
+# --bundle PATH       the tuning bundle (directory or .tar.gz);
 #                     default: the one aurora-speaker-upgrade stored, else the system firmware
-# --collection FILE   also pass this collection tarball to aurora-speaker-upgrade --check
 # --out FILE          log path (default ./lsid-tester-linux-<UTC time>.log)
 set -u
 export LC_ALL=C
 KIT=$(cd "$(dirname "$0")/.." && pwd -P)
 BUNDLE=""
-COLLECTION=""
 OUT=""
 while [ $# -gt 0 ]; do
     case $1 in
         --bundle) BUNDLE=$2; shift 2 ;;
-        --collection) COLLECTION=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
-        *) echo "usage: sudo bash linux/run-linux.sh [--bundle PATH] [--collection TARBALL] [--out FILE]" >&2; exit 2 ;;
+        *) echo "usage: sudo bash linux/run-linux.sh [--bundle PATH] [--out FILE]" >&2; exit 2 ;;
     esac
 done
 [ "$(uname -s)" = Linux ] || { echo "run this under Linux (the macOS part is macos/run-macos.sh)" >&2; exit 2; }
@@ -178,7 +175,6 @@ fi
 # ---- aurora-speaker-upgrade --check (dry run; nothing stored or switched)
 if command -v aurora-speaker-upgrade >/dev/null 2>&1; then
     UARGS=(--check --json "$WORK/upgrade.json")
-    [ -n "$COLLECTION" ] && UARGS+=(--collection "$COLLECTION")
     timeout 600 aurora-speaker-upgrade "${UARGS[@]}" > "$WORK/up.out" 2>&1; URC=$?
     case $URC in 0) U=PASS ;; 1) U=REFUSED ;; 2) U="NOT-NOW" ;; *) U=FAIL ;; esac
     res upgrade_check "$U" "exit $URC"

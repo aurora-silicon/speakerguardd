@@ -26,6 +26,7 @@ the key (its URL, name or bytes) is ever printed or logged.
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -38,13 +39,18 @@ SEGMENT = 1 << 20
 CLUSTER_WIDTH = 256
 CLUSTER_HEADER = CLUSTER_WIDTH * 72 + 32
 MAX_METADATA = 1 << 20
-UA = "aurora-speaker-upgrade/1"
+UA = "aurora-firmware/1"
 KEY_HOSTS = ("wkms-public.apple.com", "fcs-keys-pub-prod.cdn-apple.com")
 KEY_PATH = re.compile(r"\A/fcs-keys/[A-Za-z0-9_-]{43}=\Z")
 
 
 class AeaError(Exception):
     pass
+
+
+class AeaUnavailable(AeaError):
+    """Apple's CDN or key service could not be reached (no network, a
+    timeout, a server error): worth trying again later, unlike an answer."""
 
 
 # --- HTTP ranges -------------------------------------------------------------
@@ -81,9 +87,12 @@ class Ranges:
                     raise AeaError("short range response")
                 self.fetched += n
                 return data
-            except (OSError, AeaError) as e:
+            except (OSError, AeaError, http.client.HTTPException) as e:
+                # HTTPException: a body cut short (IncompleteRead) is not
+                # an OSError either; it is retried and, after the last
+                # attempt, unavailability like any other transfer failure.
                 last = e
-        raise AeaError(f"range fetch failed: {last}")
+        raise AeaUnavailable(f"range fetch failed: {last}")
 
 
 class Slice:
@@ -179,10 +188,10 @@ def fetch_key(raw, opener=None):
     try:
         with op(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30) as r:
             if r.status != 200:
-                raise AeaError(f"Apple FCS key service returned HTTP {r.status}")
+                raise AeaUnavailable(f"Apple FCS key service returned HTTP {r.status}")
             data = r.read(16385)
     except OSError as e:
-        raise AeaError(f"Apple FCS key service unreachable: {type(e).__name__}") from None
+        raise AeaUnavailable(f"Apple FCS key service unreachable: {type(e).__name__}") from None
     if len(data) > 16384:
         raise AeaError("invalid Apple FCS response size")
     return data

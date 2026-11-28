@@ -3,7 +3,8 @@ import base64, contextlib, hashlib, json, os, plistlib, struct, sys, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from aurora_speaker_upgrade import aea_ro, collect  # noqa: E402
+from aurora_speaker_upgrade import collect  # noqa: E402
+from aurora_speaker_upgrade.asahi_firmware import aea_ro  # noqa: E402
 
 
 def fixture(name):
@@ -167,59 +168,15 @@ class SpeakerId(unittest.TestCase):
         self.assertIsNone(at.probe_speaker_id(collect.FakeRun(I(), "25C56", None)))
 
 
-class UnknownSpeakerIdGoesToRoute3(unittest.TestCase):
-    """An AID that selects its tuning by speaker ID, with no speaker ID from
-    the boot chain: routes 1 and 2 read the same tuning and cannot select
-    it, but the macOS collection (route 3) records the ID and must still be
-    tried."""
-
-    def test_route3_after_unknown_speaker_id(self):
-        import tempfile, types
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
-        from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-        tried = []
-        unit = "u" * 64
-        bundle = {at.MANIFEST: json.dumps({"unit_id": unit, "aid": "AID40", "macos_build": "26A428",
-                                           "speaker_id": 3}).encode()}
-
-        def r0(identity, a):
-            tried.append("0")
-            raise collect.CollectError("no installer bundle on this Mac")
-
-        def r1(identity, a, spid, known, scratch):
-            tried.append("1")
-            raise collect.SpeakerIdUnknown("AID40 selects its speaker tuning by speaker ID")
-
-        def r2(identity, a, spid, known, scratch):
-            tried.append("2")
-            return bundle, {"route": "2", "source": "ipsw"}
-
-        def r3(identity, a):
-            tried.append("3")
-            return bundle, {"route": "3", "source": "collection"}
-
-        with tempfile.TemporaryDirectory() as d:
-            a = types.SimpleNamespace(route="auto", chosen=None, installer_dirs=[], scratch=d, collection="c.tar.gz")
-            ident = types.SimpleNamespace(unit=unit)
-            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, None)), \
-                    mock.patch.object(up, "route0", r0), mock.patch.object(up, "route1", r1), \
-                    mock.patch.object(up, "route2", r2), mock.patch.object(up, "route3", r3):
-                b, prov = up.acquire(ident, a)
-        self.assertEqual(tried, ["0", "1", "3"])
-        self.assertEqual(prov["route"], "3")
-        self.assertEqual(prov["speaker_id"], 3)
-
-
 class RecordsThisReaderDoesNotRead(unittest.TestCase):
-    """A collection made by the installer's collector while it wrote the
-    BuzzKill matrix by default (aurora-installer#119): this speakerguardd's
-    tuning reader refuses the unknown `buzzkill_quadrature` key, so the tool
-    stores the bundle without it."""
+    """A record a newer installer writes before this speakerguardd reads it
+    (UNREAD_RECORDS) is dropped with its file; `buzzkill_quadrature`, which
+    speakerguardd v2 reads since #244, is kept."""
 
     BIN = "buzzkill-quadrature.bin"
+    FUTURE = {"future_record": "future-record.bin"}
 
-    def manifest(self, buzzkill):
+    def manifest(self, buzzkill, future=False):
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
         doc = {"schema": 2, "kind": "aurora-audio-tuning", "aid": "AID36", "acoustic_id": 36,
                "unit_id": "u" * 64, "board": "j999", "macos_build": "00A000", "complete": True,
@@ -230,69 +187,71 @@ class RecordsThisReaderDoesNotRead(unittest.TestCase):
             doc["buzzkill_quadrature"] = {"path": self.BIN, "bytes": 80, "sha256": "0" * 64,
                                           "version": 1, "format": "f32le-sos4-output-major",
                                           "sections": 4}
+        if future:
+            doc["future_record"] = {"path": "future-record.bin", "bytes": 4, "sha256": "0" * 64}
         return at.MANIFEST, json.dumps(doc, indent=2, sort_keys=True).encode("utf-8")
 
-    def bundle(self, buzzkill, with_file=True):
-        name, data = self.manifest(buzzkill)
+    def bundle(self, buzzkill, future=False, with_file=True):
+        name, data = self.manifest(buzzkill, future)
         b = {name: data, "AID36/a.plist": b"abc", "lsm2-mask-lattice.bin": b"L" * 800}
-        if buzzkill and with_file:
+        if buzzkill:
             b[self.BIN] = b"\x01" * 80
+        if future and with_file:
+            b["future-record.bin"] = b"FFFF"
         return b
 
-    def test_the_record_and_its_file_are_dropped(self):
-        b, dropped = collect.for_this_reader(self.bundle(True))
-        self.assertEqual(dropped, ["buzzkill_quadrature"])
-        # Exactly the bundle the collector writes without the matrix.
-        self.assertEqual(b, self.bundle(False))
-
-    def test_the_vendored_collector_keeps_the_record_without_its_file(self):
-        # The vendored collector predates the record: it carries the
-        # manifest unchanged but not the file the record names.
-        b, dropped = collect.for_this_reader(self.bundle(True, with_file=False))
-        self.assertEqual(dropped, ["buzzkill_quadrature"])
-        self.assertEqual(b, self.bundle(False))
-
-    def test_a_bundle_without_them_is_unchanged(self):
-        plain = self.bundle(False)
+    def test_the_buzzkill_matrix_is_kept(self):
+        self.assertNotIn("buzzkill_quadrature", collect.UNREAD_RECORDS)
+        plain = self.bundle(True)
         b, dropped = collect.for_this_reader(plain)
         self.assertIs(b, plain)
         self.assertEqual(dropped, [])
 
-    def test_a_malformed_record_refuses(self):
+    def test_an_unread_record_and_its_file_are_dropped(self):
+        from unittest import mock
+        with mock.patch.dict(collect.UNREAD_RECORDS, self.FUTURE):
+            b, dropped = collect.for_this_reader(self.bundle(True, future=True))
+            self.assertEqual(dropped, ["future_record"])
+            self.assertEqual(b, self.bundle(True))
+            b, dropped = collect.for_this_reader(self.bundle(True, future=True, with_file=False))
+            self.assertEqual(dropped, ["future_record"])
+            self.assertEqual(b, self.bundle(True))
+
+    def test_a_malformed_unread_record_refuses(self):
+        from unittest import mock
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-        b = self.bundle(True)
+        b = self.bundle(False, future=True)
         m = json.loads(b[at.MANIFEST])
-        m["buzzkill_quadrature"]["path"] = "AID36/a.plist"
+        m["future_record"]["path"] = "AID36/a.plist"
         b[at.MANIFEST] = json.dumps(m).encode()
-        with self.assertRaises(collect.CollectError):
+        with mock.patch.dict(collect.UNREAD_RECORDS, self.FUTURE), self.assertRaises(collect.CollectError):
             collect.for_this_reader(b)
 
-    def test_acquire_stores_a_route3_collection_without_it(self):
-        import tempfile, types
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
+def buzz_strip(subtype=0x62757A6B, kind=0x61756678, fmt=plistlib.FMT_BINARY):
+    """A strip naming one Audio Unit, the way the tuning's strips do."""
+    return plistlib.dumps({"Boxes": [{"unit": {"type": kind, "subtype": subtype, "manufacturer": "appl"}}]},
+                          fmt=fmt)
+
+
+class BuzzUnit(unittest.TestCase):
+    """has_buzz_unit: whether the tuning's graph names a BuzzKill unit."""
+
+    def test_integer_fourccs(self):
+        self.assertTrue(collect.has_buzz_unit({"AID1/s.austrip": buzz_strip()}))
+
+    def test_string_fourccs(self):
+        self.assertTrue(collect.has_buzz_unit({"AID1/s.austrip": buzz_strip("buzk", "aufx", plistlib.FMT_XML)}))
+
+    def test_other_units_and_files(self):
+        self.assertFalse(collect.has_buzz_unit({
+            "AID1/s.austrip": buzz_strip(subtype=0x7662656E),       # vben
+            "AID1/t.austrip": buzz_strip(kind=0x61756D78),          # aumx/buzk
+            "lsm2-mask-lattice.bin": b"buzk" * 200,                  # not a property list
+        }))
+
+    def test_the_manifest_is_not_read(self):
         from aurora_speaker_upgrade.asahi_firmware import audio_tuning as at
-
-        def r0(identity, a):
-            raise collect.CollectError("no installer bundle on this Mac")
-
-        def r3(identity, a):
-            return self.bundle(True, with_file=False), {"route": "3", "source": "collection"}
-
-        with tempfile.TemporaryDirectory() as d:
-            a = types.SimpleNamespace(route="auto", chosen=None, installer_dirs=[], scratch=d,
-                                      collection="c.tar.gz")
-            ident = types.SimpleNamespace(unit="u" * 64)
-            with mock.patch.object(up, "speaker_id_source", return_value=(None, False, None)), \
-                    mock.patch.object(up, "route0", r0), \
-                    mock.patch.object(up, "route1", mock.Mock(side_effect=collect.CollectError("x"))), \
-                    mock.patch.object(up, "route2", mock.Mock(side_effect=collect.CollectError("y"))), \
-                    mock.patch.object(up, "route3", r3), mock.patch.object(up, "say") as said:
-                b, prov = up.acquire(ident, a)
-        self.assertEqual(prov["route"], "3")
-        self.assertNotIn("buzzkill_quadrature", json.loads(b[at.MANIFEST]))
-        self.assertEqual(b, self.bundle(False))
-        self.assertTrue(any("buzzkill_quadrature" in c.args[0] for c in said.call_args_list))
+        self.assertFalse(collect.has_buzz_unit({at.MANIFEST: buzz_strip()}))
 
 
 class DualKernelRun(unittest.TestCase):
@@ -395,7 +354,7 @@ class DualKernelRun(unittest.TestCase):
             with contextlib.ExitStack() as es:
                 es.enter_context(mock.patch.object(up.collect, "Identity", Ident))
                 es.enter_context(mock.patch.object(up, "interface_mode", return_value=("dual", "1")))
-                es.enter_context(mock.patch.object(up, "acquire", return_value=({}, {"route": 1, "aid": "AID9"})))
+                es.enter_context(mock.patch.object(up, "acquire", return_value=({}, {"source": "ipsw", "aid": "AID9"})))
                 es.enter_context(mock.patch.object(up, "digest", return_value="dg"))
                 es.enter_context(mock.patch.object(up.Store, "put_bundle", lambda self, b: None))
                 es.enter_context(mock.patch.object(up.Store, "read_bundle", lambda self: None))
@@ -756,6 +715,122 @@ class RunRechecksTheLiveState(unittest.TestCase):
 
     def test_at_boot_trusts_the_record(self):
         self.assertEqual(self.run_with(True, False), (self.up.EXIT_OK, []))
+
+
+
+class BootMigrationNeedsPlaybackRows(unittest.TestCase):
+    """The boot unit moves a speaker to v2 only when protected playback rows
+    (loud step and thermal ramp) are on record for its AID; a silent
+    self-check pass alone does not move it. By hand, `run` still switches."""
+
+    def setUp(self):
+        import tempfile, types
+        from aurora_speaker_upgrade import upgrade as up
+        self.up, self.types = up, types
+        self.dir = tempfile.mkdtemp(prefix="sgup-rows-")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def gate_file(self, record, covers=("loud-step", "thermal-ramp")):
+        p = os.path.join(self.dir, "gate.json")
+        with open(p, "w") as f:
+            f.write(record if isinstance(record, str) else
+                    json.dumps({"playback_covers": list(covers), "playback_rows": record}))
+        return p
+
+    def row(self, covers, evidence="lab row"):
+        return {"date": "2026-11-23", "board": "j000", "what": "w", "covers": covers, "evidence": evidence}
+
+    def test_proof_needs_every_cover_and_evidence(self):
+        up = self.up
+        both = self.row(["loud-step", "thermal-ramp"])
+        cases = [
+            ({"AID7": [both]}, [both]),
+            ({"AID7": [self.row(["loud-step"]), self.row(["thermal-ramp"])]}, 2),
+            ({"AID7": [self.row(["loud-step"])]}, []),
+            ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence="")]}, []),
+            ({"AID8": [both]}, []),
+            ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence=" ")]}, []),
+            ({"AID7": [self.row(["loud-step", "thermal-ramp"], evidence={"x": 1})]}, []),
+            ({"AID7": [self.row([{"a": 1}, "loud-step", "thermal-ramp"])]}, []),
+            ({"AID7": "yes"}, []),
+            (["AID7"], []),
+            ("{not json", []),
+        ]
+        for record, want in cases:
+            got = up.playback_proof(7, paths=(self.gate_file(record),))
+            if isinstance(want, int):
+                self.assertEqual(len(got), want, record)
+            else:
+                self.assertEqual(got, want, record)
+        self.assertEqual(up.playback_proof(7, paths=(self.gate_file({"AID7": [both]}, covers=()),)), [])
+        self.assertEqual(up.playback_proof(7, paths=(self.gate_file({"AID7": [both]}, covers=(["x"],)),)), [])
+        self.assertEqual(up.playback_proof(7, paths=(os.path.join(self.dir, "missing.json"),)), [])
+
+    def run_with(self, at_boot, proven, switched=False, bundle_unit=None):
+        import contextlib, io
+        from unittest import mock
+        up, types = self.up, self.types
+        bundle = {up.audio_tuning.MANIFEST: json.dumps({"unit_id": bundle_unit, "aid": "AID37"})} if bundle_unit else None
+        store = types.SimpleNamespace(state=lambda: {"switched": switched}, interface="/x/interface",
+                                      read_bundle=lambda: bundle)
+        acquired = []
+        ident = types.SimpleNamespace(unit="U1", acoustic=37, matches_dt=lambda: True)
+        with mock.patch.object(up, "Store", return_value=store), \
+                mock.patch.object(up.collect, "Identity", return_value=ident), \
+                mock.patch.object(up, "interface_mode", return_value=("v2-only", "AppleJ713")), \
+                mock.patch.object(up, "playback_proof", return_value=[{"evidence": "x"}] if proven else []), \
+                mock.patch.object(up, "acquire", side_effect=lambda *x: acquired.append(1) or (_ for _ in ()).throw(up.Retry("stop here"))):
+            a = types.SimpleNamespace(store="/x", adt=None, at_boot=at_boot)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                try:
+                    rc = up._cmd_run(a)
+                except up.Retry:
+                    rc = "switching"
+        return rc, acquired, err.getvalue()
+
+    def test_boot_leaves_an_unproven_speaker_alone(self):
+        rc, acquired, err = self.run_with(True, False)
+        self.assertEqual((rc, acquired), (self.up.EXIT_OK, []))
+        self.assertIn("AID37: no protected playback row", err)
+
+    def test_a_switched_record_of_another_unit_does_not_skip_the_rule(self):
+        # A root file system moved from a switched Mac onto another one.
+        rc, acquired, err = self.run_with(True, False, switched=True, bundle_unit="OTHER")
+        self.assertEqual((rc, acquired), (self.up.EXIT_OK, []))
+        self.assertIn("no protected playback row", err)
+
+    def test_boot_moves_a_proven_speaker(self):
+        self.assertEqual(self.run_with(True, True)[:2], ("switching", [1]))
+
+    def test_by_hand_is_not_limited(self):
+        self.assertEqual(self.run_with(False, False)[:2], ("switching", [1]))
+
+    def test_a_new_playback_row_retries_a_refusal(self):
+        import types
+        from unittest import mock
+        up, g = self.up, os.path.join(self.dir, "gate.json")
+        ident = types.SimpleNamespace(unit="u1")
+        with mock.patch.object(up, "GATE", g):
+            self.gate_file({})
+            k1 = up.refusal_key(ident)
+            self.gate_file({"AID37": [self.row(["loud-step", "thermal-ramp"])]})
+            self.assertNotEqual(k1, up.refusal_key(ident))
+
+    def test_reads_the_shipped_gate_data(self):
+        # The source tree's gate.json (installed by speakerguardd-v2 as
+        # /usr/share/speakerguardd/gate.json): AID44, AID12, AID21 and AID37 are proven, AID42 not.
+        up = self.up
+        paths = up.gate_paths()[1:]
+        self.assertTrue(os.path.isfile(paths[0]), paths)
+        self.assertTrue(up.playback_proof(44, paths=paths))
+        self.assertTrue(up.playback_proof(12, paths=paths))
+        self.assertTrue(up.playback_proof(21, paths=paths))
+        self.assertTrue(up.playback_proof(37, paths=paths))
+        self.assertEqual(up.playback_proof(42, paths=paths), [])
 
 
 if __name__ == "__main__":

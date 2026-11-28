@@ -20,6 +20,13 @@
 //! method=derived
 //! ```
 //!
+//! A board with a gate.json cap on its operating volume
+//! (`operating_volume_cap_db`) adds it, in hundredths of a dB on the volume
+//! control's own TLV: `volume_cap_cdb=-1600`. The cap only lowers what the
+//! machine reports: the operating volume is the ceiling the card reports
+//! under the grant (the volume controls' TLV maximum), and a ceiling above
+//! the cap is not granted. Without the line there is no cap below 0 dB.
+//!
 //! The supervisor grants only with a passing record for exactly this board,
 //! this kernel release and this parameter blob, and then only while the
 //! session helper reports that the protect stage was built with the same
@@ -43,6 +50,9 @@ pub struct Bind {
     pub family: String,
     pub key: String,
     pub method: String,
+    /// gate.json's cap on the operating volume, cdB on the control's own
+    /// TLV (`volume_cap_cdb`; `None`: no cap below 0 dB).
+    pub volume_cap_cdb: Option<i32>,
     /// The first failure, for a failing record.
     pub reason: Option<String>,
 }
@@ -67,6 +77,21 @@ pub fn parse(text: &str) -> Result<Bind, String> {
         return Err(format!("schema {}", field("schema")?));
     }
     let num = |k: &str| field(k)?.parse::<usize>().map_err(|_| format!("{k} is not a number"));
+    // The operating volume itself is the machine's (the card's ceiling): a
+    // record that names one is from a self-check that took it from
+    // gate.json, and is checked again.
+    if get.contains_key("volume_cdb") {
+        return Err("volume_cdb is from a self-check that took the volume from gate.json: run it again".into());
+    }
+    // A cap only ever lowers the volume: at most 0 dB, and no lower than
+    // the -40 dB a speaker would still be worth granting at.
+    let volume_cap_cdb = match get.get("volume_cap_cdb") {
+        None => None,
+        Some(v) => match v.parse::<i32>() {
+            Ok(c) if (-4000..=0).contains(&c) => Some(c),
+            _ => return Err(format!("volume_cap_cdb {v:?} is not a volume from -4000 to 0 cdB")),
+        },
+    };
     Ok(Bind {
         result: field("result")?,
         board: field("board")?,
@@ -79,6 +104,7 @@ pub fn parse(text: &str) -> Result<Bind, String> {
         family: field("family")?,
         key: field("key")?,
         method: field("method")?,
+        volume_cap_cdb,
         reason: get.get("reason").map(|s| s.to_string()),
     })
 }
@@ -101,10 +127,13 @@ pub fn covers(bind: &Bind, board: &str, kernel: &str, params_sha256: &str) -> Re
         return Err(format!("the self-check ran on kernel {}, this is {kernel}: run it again", bind.kernel));
     }
     if bind.params_sha256 != params_sha256 {
+        // the first 12 characters: the record is text from a file, not
+        // necessarily the hex it should be
+        let short = |s: &str| s.chars().take(12).collect::<String>();
         return Err(format!(
             "the self-check ran with parameters {}, these are {}: run it again",
-            &bind.params_sha256[..bind.params_sha256.len().min(12)],
-            &params_sha256[..params_sha256.len().min(12)]
+            short(&bind.params_sha256),
+            short(params_sha256)
         ));
     }
     Ok(())
@@ -171,11 +200,38 @@ mod tests {
     }
 
     #[test]
+    fn a_parameter_hash_that_is_not_hex_is_refused_without_a_panic() {
+        // a multi-byte character across the 12 bytes the message quotes
+        let t = GOOD.replace("params_sha256=aa11", "params_sha256=0123456789a\u{e9}f");
+        let b = parse(&t).unwrap();
+        let e = covers(&b, "j316s", "7.3.0-aurora-sgv2k5", "aa11").unwrap_err();
+        assert!(e.contains("0123456789a\u{e9}") && e.contains("aa11"), "{e}");
+        let e = covers(&parse(GOOD).unwrap(), "j316s", "7.3.0-aurora-sgv2k5", "0123456789a\u{e9}f").unwrap_err();
+        assert!(e.contains("parameters aa11"), "{e}");
+    }
+
+    #[test]
     fn a_failing_record_covers_nothing_and_says_why() {
         let t = GOOD.replace("result=pass", "result=fail") + "reason=Left Woofer 1 VSENSE off quietened channel 1\n";
         let b = parse(&t).unwrap();
         let e = covers(&b, "j316s", "7.3.0-aurora-sgv2k5", "aa11").unwrap_err();
         assert!(e.contains("failed") && e.contains("VSENSE"), "{e}");
+    }
+
+    #[test]
+    fn a_record_may_cap_the_volume_below_0_db() {
+        assert_eq!(parse(GOOD).unwrap().volume_cap_cdb, None);
+        assert_eq!(parse(&format!("{GOOD}volume_cap_cdb=-1600\n")).unwrap().volume_cap_cdb, Some(-1600));
+        assert_eq!(parse(&format!("{GOOD}volume_cap_cdb=0\n")).unwrap().volume_cap_cdb, Some(0));
+        // a cap only lowers the volume, within -40 dB, and is a number
+        for v in ["100", "1", "-4001", "-16.0", "", "x"] {
+            assert!(parse(&format!("{GOOD}volume_cap_cdb={v}\n")).is_err(), "{v:?}");
+        }
+        assert!(parse(&format!("{GOOD}volume_cap_cdb=-1600\nvolume_cap_cdb=-1600\n")).is_err());
+        // the volume itself is the card's: a record that names it is checked again
+        for v in ["-1600", "0"] {
+            assert!(parse(&format!("{GOOD}volume_cdb={v}\n")).is_err(), "{v:?}");
+        }
     }
 
     #[test]

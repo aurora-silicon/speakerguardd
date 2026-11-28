@@ -53,6 +53,7 @@
 pub mod attach;
 pub mod gate;
 pub mod handoff;
+pub mod mic;
 pub mod page;
 pub mod preroll;
 pub mod ttl;
@@ -657,18 +658,139 @@ const _: () = assert!(DESCRIPTORS.len() == VARIANTS.len());
 /// The LV2 entry point.
 #[no_mangle]
 pub extern "C" fn lv2_descriptor(index: u32) -> *const Lv2Descriptor {
-    DESCRIPTORS
-        .get(index as usize)
-        .map_or_else(|| voicing::descriptor(index as usize - DESCRIPTORS.len()), |d| d as *const _)
+    let i = index as usize;
+    if let Some(d) = DESCRIPTORS.get(i) {
+        return d as *const _;
+    }
+    let i = i - DESCRIPTORS.len();
+    if i < voicing::VARIANTS.len() {
+        voicing::descriptor(i)
+    } else {
+        mic::descriptor(i - voicing::VARIANTS.len())
+    }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The C ABI reads its paths from the environment: tests that set it
-    /// take turns.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::test_common as common;
+
+    /// A real C ABI instance, with a synthetic grant and no hardware watcher.
+    struct TestPlugin {
+        descriptor: &'static Lv2Descriptor,
+        handle: *mut c_void,
+        grant: std::sync::Arc<gate::Shared>,
+    }
+
+    impl TestPlugin {
+        fn new() -> Self {
+            // Check before instantiate: even a broken fixture must not scan
+            // real devices in this regression.
+            assert_eq!(std::env::var("SGV2_GRANT_GATE").as_deref(), Ok("0"));
+            // SAFETY: descriptor 0 is static; its valid handle is owned here
+            // until Drop, and all callbacks use that handle.
+            unsafe {
+                let descriptor = &*lv2_descriptor(0);
+                let handle = (descriptor.instantiate)(descriptor, 48_000.0, core::ptr::null(), core::ptr::null());
+                assert!(!handle.is_null());
+                let grant = (&*handle.cast::<Instance>()).gate.shared().clone();
+                (descriptor.activate.unwrap())(handle);
+                Self { descriptor, handle, grant }
+            }
+        }
+
+        fn render<const N: usize>(&mut self) -> [f32; N] {
+            let mut left = [1.0f32; N];
+            let mut right = [-1.0f32; N];
+            let mut out_left = [f32::NAN; N];
+            let mut out_right = [f32::NAN; N];
+            // SAFETY: the live handle's four audio ports point at separate
+            // N-frame buffers for this call; control ports may be null.
+            unsafe {
+                for (p, buf) in [left.as_mut_ptr(), right.as_mut_ptr(), out_left.as_mut_ptr(), out_right.as_mut_ptr()]
+                    .into_iter()
+                    .enumerate()
+                {
+                    (self.descriptor.connect_port)(self.handle, p as u32, buf.cast());
+                }
+                (self.descriptor.run)(self.handle, N as u32);
+            }
+            assert!(out_left.iter().zip(out_right).all(|(l, r)| *l == -r));
+            out_left
+        }
+    }
+
+    impl Drop for TestPlugin {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns the live handle and cleans it up once.
+            unsafe { (self.descriptor.cleanup)(self.handle) };
+        }
+    }
+
+    #[test]
+    fn the_c_abi_fixture_overrides_and_restores_ambient_inputs_even_on_unwind() {
+        use std::ffi::OsString;
+        let lock = common::lock();
+        let _original = common::TestEnv::new(&lock);
+        let keys = ["SGV2_PARAMS", "SGV2_ENGINE_PAGE", "SGV2_GRANT_GATE"];
+        let mut inherited = vec![None, Some(OsString::from("1")), Some(OsString::from("0"))];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            inherited.push(Some(OsString::from_vec(vec![0xff])));
+        }
+        for value in inherited {
+            for unwind in [false, true] {
+                // Synthetic ambient values only; restoration never instantiates
+                // a plugin until the fixture has disabled the watcher again.
+                for key in keys {
+                    match &value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                let before = keys.map(std::env::var_os);
+                let result = std::panic::catch_unwind(|| {
+                    let _env = common::TestEnv::new(&lock);
+                    assert_eq!(std::env::var("SGV2_PARAMS").as_deref(), Ok("/nonexistent/sgv2-test"));
+                    assert_eq!(std::env::var("SGV2_ENGINE_PAGE").as_deref(), Ok("/nonexistent/sgv2-test"));
+                    let mut plugin = TestPlugin::new();
+                    assert!((plugin.render::<1024>()[1023] - sgv2_core::FAILSAFE_GAIN).abs() < 1e-7);
+                    assert!(!unwind, "exercise fixture cleanup on panic");
+                });
+                assert_eq!(result.is_err(), unwind);
+                assert_eq!(keys.map(std::env::var_os), before);
+            }
+        }
+    }
+
+    #[test]
+    fn the_c_abi_mutes_and_ramps_with_a_synthetic_grant() {
+        let lock = common::lock();
+        let _env = common::TestEnv::new(&lock);
+        let mut plugin = TestPlugin::new();
+        plugin.grant.set(false, false);
+        // Reproduce the zero output without reading the host's control.
+        assert!(plugin.render::<1024>().iter().all(|&x| x == 0.0));
+        plugin.grant.set(true, true);
+        let hold = plugin.render::<2400>(); // gate::HOLD_MS at 48 kHz
+        assert!(hold.iter().all(|&x| x == 0.0));
+        let ramp = plugin.render::<480>(); // gate::RAMP_IN_MS at 48 kHz
+        assert!(ramp[0] > 0.0 && ramp[0] < 1e-5);
+        assert!(ramp.windows(2).all(|w| w[1] >= w[0]));
+        assert!((ramp[479] - sgv2_core::FAILSAFE_GAIN).abs() < 1e-7);
+        assert!(plugin.render::<1024>().iter().all(|&x| (x - sgv2_core::FAILSAFE_GAIN).abs() < 1e-7));
+        plugin.grant.set(false, true);
+        let out = plugin.render::<256>();
+        assert!(out[0] > 0.0 && out[0] < sgv2_core::FAILSAFE_GAIN);
+        assert!(out.windows(2).all(|w| w[1] <= w[0]));
+        assert!(out[96..].iter().all(|&x| x == 0.0)); // gate::RAMP_OUT_MS
+    }
 
     /// The plugin builds spp3 for the board its blob names, so only a board
     /// proven for the relaxed closed loop may relax; a blob for any other
@@ -727,13 +849,13 @@ mod tests {
 
     #[test]
     fn runs_the_failsafe_through_the_c_abi() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-test");
-        std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
+        let lock = common::lock();
+        let _env = common::TestEnv::new(&lock);
         let d = lv2_descriptor(0);
         assert!(!d.is_null());
         assert!(!lv2_descriptor(VARIANTS.len() as u32).is_null());
-        assert!(lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len()) as u32).is_null());
+        assert!(!lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len()) as u32).is_null());
+        assert!(lv2_descriptor((VARIANTS.len() + voicing::VARIANTS.len() + mic::VARIANTS.len()) as u32).is_null());
         unsafe {
             let h = ((*d).instantiate)(d, 48_000.0, core::ptr::null(), core::ptr::null());
             // past the ramp in that follows activate (gate::RAMP_IN_MS)
@@ -769,13 +891,13 @@ mod tests {
     /// frame, with no ramp cutting into them.
     #[test]
     fn a_wake_plays_the_first_frames_once_the_amps_play() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = common::lock();
+        let _env = common::TestEnv::new(&lock);
         let dir = std::env::temp_dir().join(format!("sgv2-wake-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("engine");
         let sup = page::EnginePage::create(path.to_str().unwrap()).unwrap();
         sup.set_amps(false);
-        std::env::set_var("SGV2_PARAMS", "/nonexistent/sgv2-test");
         std::env::set_var("SGV2_ENGINE_PAGE", &path);
         let d = lv2_descriptor(0);
         unsafe {
@@ -831,7 +953,8 @@ mod tests {
     #[test]
     fn activate_keeps_the_thermal_state_across_streams_and_instances() {
         use sgv2_core::blob::Pod;
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = common::lock();
+        let _env = common::TestEnv::new(&lock);
         let _clock = handoff::test_clock::Clock::at(1_000_000_000);
         let mut p = spp3::Params {
             channels: 2,
@@ -864,7 +987,6 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sgv2-handoff-test-{}.bin", std::process::id()));
         std::fs::write(&path, blob).unwrap();
         std::env::set_var("SGV2_PARAMS", &path);
-        std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
         let d = lv2_descriptor(0);
         let l = [1.0f32; 512];
         let r = [1.0f32; 512];
@@ -916,7 +1038,8 @@ mod tests {
     fn the_prestage_filters_the_program_ahead_of_the_unit() {
         use sgv2_core::blob::Pod;
         use sgv2_core::prestage::{Params as Pre, Section, FLAG_FROM_TUNING};
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = common::lock();
+        let _env = common::TestEnv::new(&lock);
         let mut p = spp3::Params {
             channels: 2,
             sample_rate: 48_000,
@@ -977,7 +1100,6 @@ mod tests {
         let run = |blob: &[u8]| -> (f32, f32, u32) {
             std::fs::write(&path, blob).unwrap();
             std::env::set_var("SGV2_PARAMS", &path);
-            std::env::set_var("SGV2_ENGINE_PAGE", "/nonexistent/sgv2-test");
             let d = lv2_descriptor(0);
             let n = 48_000usize;
             let tone: std::vec::Vec<f32> =

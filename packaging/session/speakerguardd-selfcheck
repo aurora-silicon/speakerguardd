@@ -7,6 +7,8 @@ speakerguardd may grant.
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
+    speakerguardd-selfcheck mic      [--blob BLOB] [--json FILE|-]   (the built-in microphone's verdict, apart
+                                                                      from the speakers': see mic_verdict)
 
 It runs as root, before the supervisor, while the kernel holds the speakers
 at its floor, in two units:
@@ -156,6 +158,15 @@ PCM_WAIT_S = 15
 # channels show 40-80 distinct values in 0.4-1 s, switched-off ones 1-3.
 LIVE = 16
 QUIET = 4
+# With digital silence playing, an amp's live sense is its idle noise: a few
+# counts to a few tens of counts RMS (J316, J413, J615: 7-9). A capture that
+# samples the serial words a bit clock early or late is just as "live" by the
+# count of distinct values, but each word then carries a bit of its neighbour
+# in place of its sign bit, so idle noise reads near full scale (J615 before
+# its receiver was moved one bit clock: about 23,000 RMS on every channel) and
+# the power computed from it is meaningless. Above this many counts RMS, in
+# S16, a live idle channel is not an amp's sense.
+IDLE_RMS_MAX = 2048
 
 # ALSA control ioctls (include/uapi/sound/asound.h, 64-bit)
 _ID_FMT = "IiII44sI"
@@ -200,16 +211,10 @@ def sha256(path):
 
 def find_card(hw, dt="/proc/device-tree"):
     """(index, id) of the ALSA card whose device is the DT sound node."""
-    want = os.path.realpath(os.path.join(dt, hw["sound"]))
-    for d in sorted(os.listdir("/sys/class/sound")):
-        if not re.fullmatch(r"card\d+", d):
-            continue
-        of = f"/sys/class/sound/{d}/device/of_node"
-        if os.path.exists(of) and os.path.realpath(of) == want:
-            idx = int(d[4:])
-            with open(f"/proc/asound/card{idx}/id") as f:
-                return idx, f.read().strip()
-    raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+    live = wiring.live_card(hw, dt)
+    if live is None:
+        raise wiring.Refused(f"no ALSA card for the device tree's {hw['sound']} node (is the kernel's macaudio driver loaded?)")
+    return live
 
 
 def pcm_ids(idx):
@@ -474,6 +479,12 @@ def classify(st):
     return ["live" if c["distinct"] >= LIVE else "quiet" if c["distinct"] <= QUIET else "unclear" for c in st["ch"]]
 
 
+def idle_too_loud(st):
+    """The channels of a capture taken with digital silence playing whose
+    RMS no amp's idle sense reaches (IDLE_RMS_MAX)."""
+    return [k for k, c in enumerate(st["ch"]) if c["rms"] > IDLE_RMS_MAX]
+
+
 class Streams:
     """One capture, armed before playback, spans the entire silent test.
 
@@ -714,7 +725,10 @@ def check_sense(ctl, idx, card, devs, w, runs, widths=None):
     names = {}
     for a in amps:
         for kind in ("V", "I"):
-            names[(a["prefix"], kind)] = f"{a['prefix']} {kind}SENSE Switch"
+            # The amp's own control prefix: none on a lone desktop amp
+            # (wiring.derive labels it "Speaker", ALSA does not).
+            ctl_prefix = a.get("control_prefix", a["prefix"])
+            names[(a["prefix"], kind)] = f"{ctl_prefix} {kind}SENSE Switch".lstrip()
     saved = {}
     for nm in names.values():
         v = switch_get(card, nm)
@@ -733,6 +747,12 @@ def check_sense(ctl, idx, card, devs, w, runs, widths=None):
         cls = classify(base)
         if any(c != "live" for c in cls):
             errs.append(f"with every sense switch on, sense channels {[k for k, c in enumerate(cls) if c != 'live']} are not live")
+            return errs, st.fmt
+        loud = idle_too_loud(base)
+        if loud:
+            errs.append(f"with digital silence playing, sense channels {loud} read up to "
+                        f"{max(base['ch'][c]['rms'] for c in loud):.0f} counts RMS (an amp's idle sense is a few counts, "
+                        f"at most {IDLE_RMS_MAX}): the sense words are misframed, e.g. sampled a bit clock early or late")
             return errs, st.fmt
         if not k:
             for p, a, kind in switches:
@@ -819,39 +839,67 @@ SYSTEM_LV2 = ("/usr/lib64/lv2", "/usr/lib/lv2", "/usr/local/lib64/lv2", "/usr/lo
               "/run/current-system/sw/lib/lv2", "/nix/var/nix/profiles/default/lib/lv2")
 
 
-def _env_lv2_paths(files):
-    """LV2_PATH values set in environment files (KEY=VALUE lines)."""
+# The most of a user's environment.d file or of a bundle's manifest.ttl
+# this check reads; a longer one is skipped as not readable.
+USER_FILE_MAX = 1 << 20
+
+
+def _env_lv2_paths(files, user=False):
+    """LV2_PATH values set in environment files (KEY=VALUE lines). A user's
+    files (`user`) are read with wiring.read_user_file's rules."""
     out = []
     for f in files:
-        try:
-            with open(f, errors="replace") as fh:
-                for line in fh:
-                    m = re.match(r"\s*(?:export\s+)?LV2_PATH\s*=\s*['\"]?([^'\"\n]*)", line)
-                    if m:
-                        out.append((m.group(1), f))
-        except OSError:
-            pass
+        if user:
+            text = wiring.read_user_file(f, USER_FILE_MAX, follow=True)
+        else:
+            try:
+                with open(f, errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                text = None
+        for line in (text or "").splitlines():
+            m = re.match(r"\s*(?:export\s+)?LV2_PATH\s*=\s*['\"]?([^'\"\n]*)", line)
+            if m:
+                out.append((m.group(1), f))
     return out
 
 
-def lv2_shadows(users=None, etc="/etc", environ=None):
-    """Every copy of the sgv2 plugin that a user's PipeWire could load
-    instead of the packaged one: a bundle in any user's ~/.lv2 (lilv searches
-    it before the system directories), or in a directory an LV2_PATH names
-    (system-wide, in a user's environment.d, or in this environment) that
-    is not a system LV2 directory. Hand installs from bring-up leave such
-    copies behind, and an old plugin there runs the speakers with code no
-    package shipped. Returns (path, why) pairs."""
-    import glob as _glob
+def seat_users(conf=None):
+    """[(name, home)] of the seat user provisioning names (SGV2_UID in the
+    units' configuration), or [] when none is provisioned."""
     import pwd as _pwd
+    uid = read_conf(conf).get("SGV2_UID", "")
+    if not uid.isdigit():
+        return []
+    try:
+        u = _pwd.getpwuid(int(uid))
+    except KeyError:
+        return []
+    return [(u.pw_name, u.pw_dir)] if u.pw_dir and u.pw_dir != "/" else []
+
+
+def lv2_shadows(users=None, etc="/etc", environ=None):
+    """Every copy of the sgv2 plugin that the seat user's PipeWire could load
+    instead of the packaged one: a bundle in the seat user's ~/.lv2 (lilv
+    searches it before the system directories), or in a directory an
+    LV2_PATH names (system-wide, in the seat user's environment.d, or in
+    this environment) that is not a system LV2 directory. Hand installs
+    from bring-up leave such copies behind, and an old plugin there runs the
+    speakers with code no package shipped. Only the seat user's session
+    runs the speaker graph, so other users' homes are not looked at; with no
+    seat user provisioned, no home is. Files the user controls (their
+    environment.d, every manifest.ttl) are read with wiring.read_user_file's
+    rules; a link to a regular file is followed, as lilv and systemd do.
+    Returns (path, why) pairs."""
+    import glob as _glob
     environ = os.environ if environ is None else environ
     if users is None:
-        users = [(u.pw_name, u.pw_dir) for u in _pwd.getpwall() if u.pw_dir and u.pw_dir not in ("/", "")]
+        users = seat_users()
     dirs = []
     for name, home in users:
         dirs.append((os.path.join(home, ".lv2"), f"{name}'s ~/.lv2"))
         envd = sorted(_glob.glob(os.path.join(home, ".config", "environment.d", "*.conf")))
-        dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(envd) for d in v.split(":")]
+        dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(envd, user=True) for d in v.split(":")]
     etcf = [os.path.join(etc, "environment")] + sorted(_glob.glob(os.path.join(etc, "environment.d", "*.conf")))
     dirs += [(d, f"LV2_PATH in {f}") for v, f in _env_lv2_paths(etcf) for d in v.split(":")]
     if environ.get("LV2_PATH"):
@@ -865,20 +913,34 @@ def lv2_shadows(users=None, etc="/etc", environ=None):
             real = os.path.realpath(os.path.dirname(man))
             if real in seen or os.path.dirname(real) in system:
                 continue
-            try:
-                with open(man, errors="replace") as fh:
-                    if PLUGIN_URI not in fh.read():
-                        continue
-            except OSError:
+            text = wiring.read_user_file(man, USER_FILE_MAX, follow=True)
+            if text is None or PLUGIN_URI not in text:
                 continue
             seen.add(real)
             found.append((os.path.dirname(man), why))
     return found
 
 
+# What a passing record is bound to: a reused pass must match all of them.
+# "audio" (wiring.audio_stack) covers what the kernel release does not: the
+# sound modules actually loaded and the device tree nodes that carry the
+# speaker and sense words.
+BOUND = ("board", "kernel", "params_sha256", "wiring", "audio")
+
+
+def audio_of(hw):
+    return wiring.audio_stack(hw.get("sound", ""))
+
+
 def bind_lines(rec):
-    keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "card", "amps", "sense", "family", "key", "method"]
-    out = [f"{k}={rec[k]}" for k in keys]
+    keys = ["schema", "version", "result", "board", "kernel", "params_sha256", "wiring", "audio", "card", "amps", "sense", "family", "key", "method"]
+    # a record from before "audio" was bound has none: written as "-",
+    # which no fingerprint equals, so its pass is never reused
+    out = [f"{k}={rec.get(k, '-') if k == 'audio' else rec[k]}" for k in keys]
+    # no cap (every board without a gate.json entry) is the line's absence;
+    # the operating volume itself is the card's ceiling, read under the grant
+    if rec.get("volume_cap_cdb") is not None:
+        out.append(f"volume_cap_cdb={rec['volume_cap_cdb']}")
     if rec["reasons"]:
         out.append("reason=" + rec["reasons"][0].replace("\n", " "))
     return "\n".join(out) + "\n"
@@ -930,13 +992,32 @@ def derive_live(args):
 
 def report_matches(path, bind):
     """The self-check record at `path` is a pass for the same board,
-    kernel, parameters and wiring as `bind`."""
+    kernel, parameters, wiring and audio stack as `bind`."""
     try:
         with open(path) as f:
             r = json.load(f)["record"]
     except (OSError, ValueError, KeyError, TypeError):
         return False
-    return r.get("result") == "pass" and all(str(r.get(k)) == bind.get(k) for k in ("board", "kernel", "params_sha256", "wiring"))
+    # a record from before "audio" was bound has none: "-", as bind_lines
+    # writes it (run_locked never reuses such a pass: a fingerprint is no "-")
+    def same(k):
+        if k == "audio":
+            return str(r.get(k, "-")) == bind.get(k, "-")
+        return str(r.get(k)) == bind.get(k)
+    return r.get("result") == "pass" and all(same(k) for k in BOUND)
+
+
+def deferral_text(rec, kernel):
+    """What a deferred switch test must bind before any graph starts, in the
+    pending file: this self-check's own currency rule, the record version and
+    every BOUND field, as the run that defers (or the run after login that
+    tests) computed them, and the id of the card the graph will open (a pass
+    is reused only while that card keeps its id, so a record naming another
+    card is not current either). speakerguardd-provision's activate compares
+    a record against these values; it never re-derives them."""
+    vals = {"version": str(VERSION), "board": rec["board"], "kernel": kernel, "params_sha256": rec["params_sha256"],
+            "wiring": rec["wiring"], "audio": rec.get("audio", "-"), "card": rec["card"]}
+    return "".join(f"{k}={vals[k]}\n" for k in ("version", *BOUND, "card"))
 
 
 def set_deferred(path, text=None):
@@ -970,8 +1051,8 @@ def run_locked(args):
     kernel = os.uname().release
     rec = {
         "schema": 1, "version": VERSION, "result": "fail", "board": "-", "kernel": kernel,
-        "params_sha256": "-", "wiring": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
-        "method": "-", "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "params_sha256": "-", "wiring": "-", "audio": "-", "card": "-", "amps": 0, "sense": 0, "family": "-", "key": "-",
+        "method": "-", "volume_cap_cdb": None, "reasons": [], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     report = {"record": rec}
     errs = []
@@ -988,31 +1069,63 @@ def run_locked(args):
             errs.append(f"the parameters are compiled for {blob_rate(args.params)} Hz, the tuning's graph runs at {w['rate']} Hz")
         report["machine"] = desc
         rec.update(board=hw["board"], wiring=w["hash"], amps=len(w["amps"]), sense=len(w["sense"]),
-                   family=w["family"], key=w["key"], method=w["method"])
+                   family=w["family"], key=w["key"], method=w["method"], audio=audio_of(hw))
+        # gate.json's cap on the operating volume, if any. The volume itself
+        # is the machine's: the supervisor reads the card's ceiling (the amp
+        # volumes' TLV maximum) under the grant, grants only at it, and only
+        # while it is at or below this cap.
+        import gen
+
+        try:
+            cap = gen.operating_volume_cap_db(hw["board"])
+            rec["volume_cap_cdb"] = None if cap is None else round(100 * cap)
+        except (wiring.Refused, OSError, ValueError) as e:
+            errs.append(f"gate.json: {e}")
         report["wiring"] = w
         old = read_bind(bind_path)
+        # The graph opens the card by its id (hw:CARD=): a bound pass is
+        # reused only while the card bound to the sound node still has the
+        # recorded id. A card that is not there yet (an AOP card can bind
+        # after this unit) cannot contradict it; the graph then opens the
+        # recorded id, and a card that comes up under another id is not
+        # opened (fail closed) until the next boot checks again.
+        live = wiring.live_card(hw)
+        if live is not None and old.get("card") not in (None, live[1]):
+            log(f"the speaker card is {live[1]} now, the passing record names {old.get('card')}: checking again")
         if (
             not args.force and not errs
             and old.get("result") == "pass" and old.get("version") == str(VERSION)
-            and all(old.get(k) == str(rec[k]) for k in ("board", "kernel", "params_sha256", "wiring"))
+            and all(old.get(k) == str(rec[k]) for k in BOUND)
+            and (live is None or old.get("card") == live[1])
+            # a record with another cap, or from before the volume came from
+            # the card (volume_cdb), is checked again
+            and "volume_cdb" not in old
+            and old.get("volume_cap_cdb") == (None if rec["volume_cap_cdb"] is None else str(rec["volume_cap_cdb"]))
             # the graph is generated from the record: a bind without its
             # record (lost or removed) is checked again, not reused
             and report_matches(report_path, old)
         ):
             set_deferred(args.deferred)
-            log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}: nothing to do")
+            log(f"a passing self-check is bound to {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}, wiring {w['hash']}, "
+                f"audio stack {rec['audio']}: nothing to do")
             return 0
         idx, card = find_card(hw)
         rec["card"] = card
+        # The card is the one bound to the device tree's sound node, and its
+        # id is the card's own (wiring.cap_card): the graph opens that card,
+        # whatever name the device tree's model would suggest.
         if card != desc["card"]:
-            errs.append(f"the speaker card is {card}; macaudio names it {desc['card']} from the device tree's model")
+            log(f"the speaker card is {card} (bound to {hw['sound']}); the device tree's model suggests {desc['card']}")
+        desc = wiring.describe(hw, w, (idx, card))
+        report["machine"] = desc
+        # every capability the description rests on, with its source
+        report["caps"] = wiring.caps_report(wiring.probe(hw, (idx, card), w))
         if args.defer and w["method"] == "derived":
             if not errs:
                 # No record is written: the previous one stays (stale for
                 # this kernel or blob, so neither the supervisor nor the gate
                 # accepts it), and no graph is generated (provision activate).
-                set_deferred(args.deferred, f"board={hw['board']}\nkernel={kernel}\nparams_sha256={rec['params_sha256']}\n"
-                                            f"wiring={w['hash']}\n")
+                set_deferred(args.deferred, deferral_text(rec, kernel))
                 log(f"no passing self-check for {hw['board']}, {kernel}, params {rec['params_sha256'][:12]}: the silent switch "
                     "test runs after login (speakerguardd-switchtest); no speaker graph and no grant until it passes")
                 return 0
@@ -1021,6 +1134,11 @@ def run_locked(args):
         elif w["method"] in ("derived-static", "derived-nosense"):
             errs += static(idx, w, report)
         elif w["method"] == "derived":
+            if os.path.exists(args.deferred):
+                # The run after login: what this run binds (its audio stack
+                # may have grown since the run before login, as sound modules
+                # load on demand) is what activate waits for.
+                set_deferred(args.deferred, deferral_text(rec, kernel))
             try:
                 errs += active(idx, card, w, report, args)
             finally:
@@ -1028,6 +1146,9 @@ def run_locked(args):
                     os.unlink(MARKER)
                 except OSError:
                     pass
+        else:
+            # Fail closed: a method no branch proves is never a pass.
+            errs.append(f"no check proves a {w['method']!r} wiring")
     except wiring.Refused as e:
         errs.append(str(e))
     except Exception as e:  # noqa: BLE001 - every failure is a failing record
@@ -1170,13 +1291,104 @@ def cmd_pending(args):
 
 def cmd_check(args):
     b = read_bind(os.path.join(args.state, "selfcheck.bind"))
-    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    hw = wiring.read_dt()
+    want = {"board": hw["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params), "audio": audio_of(hw)}
     bad = [k for k, v in want.items() if b.get(k) != v]
     if b.get("result") != "pass" or bad or not report_matches(os.path.join(args.state, "selfcheck.json"), b):
         log(f"no passing self-check for this kernel and these parameters (result {b.get('result')}, stale {bad})")
         return 1
     log(f"bound: {b.get('board')} {b.get('kernel')} wiring {b.get('wiring')}")
     return 0
+
+
+# ------------------------------------------------------------------ microphone
+
+MIC_BLOB = os.path.join(STATE, "mic.bin")
+MIC_PROBE_S = 30
+
+
+def mic_probe(blob, mics, rate, lv2_dirs=SYSTEM_LV2):
+    """(health, latency) of the packaged plugin's microphone variant on
+    `blob` (wiring.mic_plugin_health), from a process of its own: the probe
+    loads the plugin's native code, and whatever that does must not end a
+    speaker check. Refuses when the probe gives no answer."""
+    cmd = [sys.executable, "-I", os.path.join(HERE, os.path.basename(__file__)), "mic-probe", "--blob", blob,
+           "--mics", str(mics), "--rate", str(rate), "--lv2-dir", ":".join(lv2_dirs)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=MIC_PROBE_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise wiring.Refused(f"the plugin probe did not run ({e})") from None
+    m = re.fullmatch(r"health=(-?\d+) latency=(-?\d+)", r.stdout.strip())
+    if r.returncode != 0 or not m:
+        raise wiring.Refused(f"the plugin probe failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def cmd_mic_probe(args):
+    try:
+        health, latency = wiring.mic_plugin_health(wiring.mic_plugin_lib(args.lv2_dir.split(":")), args.blob,
+                                                   args.mics, args.rate)
+    except wiring.Refused as e:
+        log(f"mic-probe: {e}")
+        return EXIT_REFUSED
+    print(f"health={health} latency={latency}")
+    return 0
+
+
+def mic_verdict(blob, dt="/proc/device-tree"):
+    """The built-in microphone's verdict, apart from the speakers':
+
+    - absent: this Mac has no microphone array, or no microphone blob is
+      provisioned (the distribution's own microphone graph is in use);
+    - pass: the blob is this board's, complete, of the version, rate and
+      microphone count the packaged plugin's variant for this Mac's array
+      takes, and that plugin runs it (health 0);
+    - refused: anything else, with the reasons.
+
+    Read-only: the blob's header and one silent block through the plugin;
+    the microphone itself is never opened."""
+    out = {"result": "refused", "board": "-", "detail": "", "blob_sha256": "-"}
+    try:
+        mic = wiring.read_mic_dt(dt)
+        if mic is None:
+            return dict(out, result="absent", detail="this Mac has no built-in microphone array")
+        desc = wiring.describe_mic(mic)
+        out["board"] = wiring.board_of(wiring._strs(wiring._read(os.path.join(dt, "compatible"))))
+        out.update(card=desc["card"], channels=desc["channels"], rate=desc["rate"])
+        try:
+            with open(blob, "rb") as f:
+                data = f.read(wiring.MIC_BLOB_MAX + 1)
+        except FileNotFoundError:
+            return dict(out, result="absent", detail=f"no microphone blob is provisioned ({blob})")
+        out["blob_sha256"] = hashlib.sha256(data).hexdigest()
+        h = wiring.mic_blob_header(data)
+        out.update(version=h["version"], mics=h["mics"], latency=h["latency"])
+        errs = wiring.mic_blob_errors(h, out["board"], desc)
+        if errs:
+            return dict(out, detail="; ".join(errs))
+        health, latency = mic_probe(blob, desc["channels"], desc["rate"])
+        out["health"] = health
+        if health != 0:
+            return dict(out, detail=f"the packaged plugin refuses the blob (health {health})")
+        if latency != h["latency"]:
+            return dict(out, detail=f"the plugin reports {latency} frames of latency, the blob {h['latency']}")
+        return dict(out, result="pass",
+                    detail=f"{h['mics']} microphones at {h['rate']} Hz, blob version {h['version']}, plugin health 0")
+    except (wiring.Refused, OSError) as e:
+        return dict(out, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - the verdict is a report, never an error of the caller
+        return dict(out, detail=f"internal error: {type(e).__name__}: {e}")
+
+
+def cmd_mic(args):
+    """`mic`: the microphone verdict alone (exit 0 pass or absent, 1 refused)."""
+    v = mic_verdict(args.blob or MIC_BLOB, args.dt)
+    if args.json == "-":
+        print(json.dumps(v, indent=1))
+    elif args.json:
+        write_atomic(args.json, json.dumps(v, indent=1) + "\n")
+    log(f"mic: {v['result']}: {v['detail']}")
+    return EXIT_REFUSED if v["result"] == "refused" else EXIT_PASS
 
 
 # ------------------------------------------------------------------ verify
@@ -1234,7 +1446,8 @@ def verify_hardware(args):
     if not os.path.exists(args.params):
         raise Cannot(f"no parameter blob at {args.params}: provision first")
     b = read_bind(os.path.join(args.state, "selfcheck.bind"))
-    want = {"board": wiring.read_dt()["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params)}
+    hw = wiring.read_dt()
+    want = {"board": hw["board"], "kernel": os.uname().release, "params_sha256": sha256(args.params), "audio": audio_of(hw)}
     if not b:
         raise Cannot("the silent hardware self-check has not run (speakerguardd-selfcheck run)")
     stale = [k for k, v in want.items() if b.get(k) != v]
@@ -1445,11 +1658,15 @@ def cmd_verify(args):
     except Exception as e:  # noqa: BLE001 - an internal error refuses
         out["steps"].append({"name": "internal", "result": "error", "detail": f"{type(e).__name__}: {e}"})
         out["result"], code = "error", EXIT_ERROR
+    # The built-in microphone's verdict, reported beside the speakers': it
+    # is not a step, and changes neither the result nor the exit code.
+    out["mic"] = mic_verdict(os.path.join(args.state, "mic.bin"))
     if args.json:
         write_atomic(args.json, json.dumps(out, indent=1) + "\n")
     for st in out["steps"]:
         log(f"verify {st['name']}: {st['result']}: {st['detail']}")
     log(f"verify: {out['result']} ({out['board']}, {out['kernel']})")
+    log(f"verify mic (apart from the result above): {out['mic']['result']}: {out['mic']['detail']}")
     return code
 
 
@@ -1466,7 +1683,7 @@ def cmd_generate(args):
     units = wiring.qualification(args.state, rec["board"], os.uname().release)
     gen.qualification_policy(rec["board"], units)
     m = rec["key"]
-    c = dict(c, board=rec["board"])
+    c = dict(c, board=rec["board"], aid=w.get("aid"))
     enabled = gen.runtime_voicing_enabled(rec["board"])
     bind_path = os.path.join(args.state, "provision.bind")
     bound_mode = False
@@ -1475,6 +1692,17 @@ def cmd_generate(args):
             bound_mode = any(line.strip() == "voicing_pre=true" for line in f)
     if enabled != bound_mode:
         raise SystemExit("voicing gate changed since compilation: run speakerguardd-provision again")
+    if enabled:
+        # The speaker identity selects the voicing trims: the record's must
+        # be the one of the bundle provisioning compiled the blob from.
+        try:
+            with open(os.path.join(args.state, "provision.json")) as f:
+                provisioned = json.load(f).get("aid")
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"the provisioning record cannot be read ({e}): run speakerguardd-provision again")
+        if provisioned != c["aid"]:
+            raise SystemExit(f"the self-check record names speaker identity {c['aid']!r}, the provisioned bundle "
+                             f"{provisioned!r}: run speakerguardd-provision and the self-check again")
     src = f"the self-check of {rec['board']} ({rec['kernel']})"
     for d, name, text in (
         (args.pipewire_dir, f"sgv2-{m}.conf", gen.pipewire_conf(m, c, (w["unit_channels"], w["sense_ports"], w["hash"]), src, voicing_pre=enabled)),
@@ -1489,7 +1717,7 @@ def cmd_generate(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
-    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify"])
+    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify", "mic", "mic-probe"])
     ap.add_argument("--params")
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
@@ -1509,14 +1737,21 @@ def main():
     ap.add_argument("--conf", default=None,
                     help="verify: the units' environment file (default /etc/speakerguardd/speakerguardd.conf; "
                          "aurora-speaker-upgrade --check passes its private root's)")
+    ap.add_argument("--blob", help="mic: the microphone blob (default the provisioned one)")
+    ap.add_argument("--dt", default="/proc/device-tree", help="mic: the device tree")
+    ap.add_argument("--mics", type=int, help="mic-probe: the plugin variant's microphone count")
+    ap.add_argument("--rate", type=int, help="mic-probe: the sample rate")
+    ap.add_argument("--lv2-dir", default=":".join(SYSTEM_LV2), help="mic-probe: the LV2 directories to load the plugin from")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
     args = ap.parse_args()
     if args.cmd in ("run", "check", "verify") and not args.params:
         ap.error("--params is required")
     if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):
         ap.error("--pipewire-dir and --wireplumber-dir are required")
+    if args.cmd == "mic-probe" and not (args.blob and args.mics and args.rate):
+        ap.error("--blob, --mics and --rate are required")
     return {"run": cmd_run, "pending": cmd_pending, "check": cmd_check, "generate": cmd_generate,
-            "verify": cmd_verify}[args.cmd](args)
+            "verify": cmd_verify, "mic": cmd_mic, "mic-probe": cmd_mic_probe}[args.cmd](args)
 
 
 if __name__ == "__main__":

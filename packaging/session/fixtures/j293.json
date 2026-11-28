@@ -91,9 +91,20 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@24ac00000/audio",
+  "compatible": [
+   "apple,t8103-aop-audio",
+   "apple,aop-audio"
+  ],
+  "dma_names": [
+   "dma"
+  ],
+  "chassis": "J293"
+ },
  "tuning": {
   "tuning": {
-   "aid": "synthetic",
+   "aid": "-",
    "selection": {
     "sample_rate": 48000,
     "substitutions": {

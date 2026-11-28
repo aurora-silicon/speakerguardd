@@ -662,8 +662,17 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             "compile",
             "legacy model fields preserved without supplying missing modern parameters; mandatory muted output",
         );
-        return finish_lsm2(t, b, diags, p);
+        return finish_lsm2(t, b, diags, p, false);
     }
+    // A companion that is not the six-lane schema has no estimator topology,
+    // so the unit never runs its estimator; beside the complete model checked
+    // above it is released on that static model, which is the unit's own mode
+    // when it holds no valid estimate (lsm2::companion::Companion::is_static).
+    // Every mechanism of that model must then be representable, exactly as
+    // without a companion; only the two the companion owns (system
+    // identification and closed-loop temperature) are left to it, unrun.
+    let static_release = guarded && n != 6;
+    let control_power = get(id::controller(id::C_CONTROL_POWER))? != 0.0;
 
     let flag = |i: u32| -> Result<u32> { Ok((get(i)? != 0.0) as u32) };
     let whole = |i: u32, what: &str| -> Result<u32> {
@@ -674,34 +683,39 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         Ok(v as u32)
     };
     let refuse = |what: &str| bad(format!("{what}: the engine's payload cannot represent it (TODO(lane B))"));
-    if !guarded {
+    if !guarded || static_release {
         // Report the independent missing mechanisms together. Returning only
         // the first one made a new board appear to need just a prefilter when
         // its own tuning also requested an estimator and a different current
         // model. Nothing here substitutes model-only operation or drops a flag.
+        //
+        // For a released companion: the mid/high rail, battery and soft-knee
+        // amplifier models act only on the power axis, so with ControlPower
+        // off they change no gain (the engine's own rule, lsm2::Unit::new);
+        // the tuning bank only selects the pilot block whose amplitude the
+        // peak axis reserves (rig law 6), since the bank's estimator is not
+        // run; the admittance model's inductive branch is checked below.
+        let power_axis_only = static_release && !control_power;
         let mut unsupported = Vec::new();
-        for (key, name) in [
-            (id::controller(id::C_USE_FAST_PEAK), "UseFastPeakSampleControl"),
-            (id::controller(id::C_COMPENSATE_RESONATORS), "CompensateResonators integration"),
-            (id::ENABLE_CLOSED_LOOP_TEMPERATURE, "closed-loop temperature"),
-        ] {
-            if get(key)? != 0.0 {
-                unsupported.push(name.to_owned());
-            }
+        if get(id::controller(id::C_USE_FAST_PEAK))? != 0.0 {
+            unsupported.push("UseFastPeakSampleControl".to_owned());
         }
-        if get(id::BYPASS_SYS_ID)? != 1.0 {
+        if !static_release && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? != 0.0 {
+            unsupported.push("closed-loop temperature".to_owned());
+        }
+        if !static_release && get(id::BYPASS_SYS_ID)? != 1.0 {
             unsupported.push("system identification".to_owned());
         }
-        if get(id::amp0(id::A_USE_BATTERY))? != 0.0 {
+        if !power_axis_only && get(id::amp0(id::A_USE_BATTERY))? != 0.0 {
             unsupported.push("battery power model".to_owned());
         }
-        if (0..4).any(|j| g.get(id::amp0(id::A_SOFT_LIMIT + j)).is_some_and(|v| v != 100.0)) {
+        if !power_axis_only && (0..4).any(|j| g.get(id::amp0(id::A_SOFT_LIMIT + j)).is_some_and(|v| v != 100.0)) {
             unsupported.push("power soft limits other than 100 %".to_owned());
         }
         let mut selected_amp_model = None;
         for c in 0..n as u32 {
             let bank = whole(id::CH_TUNING + c, "ChTuning")?;
-            if bank != 0 {
+            if bank != 0 && !(static_release && bank <= 2) {
                 unsupported.push(format!("Ch{c}Tuning selects bank {bank} instead of 0"));
             }
             let ty = whole(id::CH_SPEAKER_TYPE + c, "ChSpeakerType")?;
@@ -725,7 +739,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
                 selected_amp_model = Some(model);
                 for (field, rail) in [(id::A_ENABLE_MID, "mid"), (id::A_ENABLE_HIGH, "high")] {
                     let key = if model == 0 { id::amp0(field) } else { id::amp(model, field - 1) };
-                    if get(key)? != 0.0 {
+                    if !power_axis_only && get(key)? != 0.0 {
                         let feature = format!("amplifier model {model} enables its {rail} rail");
                         if !unsupported.contains(&feature) {
                             unsupported.push(feature);
@@ -751,7 +765,8 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
                     (id::M_USE_COMPENSATION, "model compensation"),
                     (id::M_PASSIVE_RADIATOR, "passive radiator"),
                 ] {
-                    if get(id::model(m, ty, k))? != 0.0 {
+                    let bounded = static_release && m == id::MANAGER_ADMITTANCE && k == id::M_ENABLE_LR2;
+                    if !bounded && get(id::model(m, ty, k))? != 0.0 {
                         let feature = format!("type {ty} {manager} {name}");
                         if !unsupported.contains(&feature) {
                             unsupported.push(feature);
@@ -767,6 +782,23 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     let model_only =
         (guarded || (get(id::BYPASS_SYS_ID)? == 1.0 && get(id::ENABLE_CLOSED_LOOP_TEMPERATURE)? == 0.0)) as u32;
 
+    // The FIR bank's stage is the one the unit builds from its total Latency
+    // and look-ahead, never its FilterbankLatency record: the unit runs the
+    // same stage whatever that record says (a short preset leaves it out and
+    // the unit publishes a value it does not run), so the derived stage is
+    // used even where the published one would pass the cadence check. See
+    // `lsm2::effective_filterbank_latency_ms` for the evidence.
+    let speaker_response_lookahead_ms = get(id::controller(id::C_LOOKAHEAD))?;
+    let filterbank_latency_ms =
+        lsm2::effective_filterbank_latency_ms(get(id::controller(id::C_LATENCY))?, speaker_response_lookahead_ms, rate)
+            .ok_or_else(|| bad("lsm2 Latency and look-ahead give no filterbank stage"))?;
+    if g.get(id::controller(id::C_FILTERBANK_LATENCY)) != Some(filterbank_latency_ms) {
+        diags.info(
+            "lsm2-filterbank-latency-derived",
+            "compile",
+            "FilterbankLatency is not the stage the unit runs: compiled the stage its total Latency and look-ahead give",
+        );
+    }
     let mut p = lsm2::Params {
         channels: n as u32,
         sample_rate: rate,
@@ -783,11 +815,8 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         fast_release_time_ms: get(id::controller(id::C_FAST_RELEASE))?,
         slow_release_time_ms: get(id::controller(id::C_SLOW_RELEASE))?,
         low_band_release_time_ms: get(id::controller(id::C_LOW_BAND_RELEASE))?,
-        // This sizes the FIR bank. The engine derives its delay from that
-        // structure plus look-ahead and cadence, never controller(0)'s
-        // reported total Latency (which a short-preset AU can misreport).
-        filterbank_latency_ms: get(id::controller(id::C_FILTERBANK_LATENCY))?,
-        speaker_response_lookahead_ms: get(id::controller(id::C_LOOKAHEAD))?,
+        filterbank_latency_ms,
+        speaker_response_lookahead_ms,
         power_time_scale_s: [0.0; 4],
         power_hard_limit_w: [0.0; 4],
         power_soft_limit_pct: [0.0; 4],
@@ -816,6 +845,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         p.power_soft_limit_pct[j as usize] = get(id::amp0(id::A_SOFT_LIMIT + j))?;
     }
     let mut amp_model = None;
+    let pressure = pressure_records(guarded, pressure_record_count(t), &lane_sides(t, n));
     for c in 0..n as u32 {
         if whole(id::CH_TUNING + c, "ChTuning")? > if guarded { 2 } else { 0 } {
             return Err(refuse(&format!("Ch{c}Tuning selects a bank other than 0 (TODO(SPEC) banks)")));
@@ -918,16 +948,82 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
             bandwidth: whole(id::channel(c, id::CH_BANDWIDTH), "Bandwidth")?,
             ..lsm2::ChannelParams::default()
         };
+        // CompensateResonators: the type's acceleration-manager block that sets
+        // UseCompensation runs the resonator compensation ahead of the limiter.
+        // Its model resolves against the block's generic flags like the other
+        // managers' (spec 15.1); a block whose model the single-resonator
+        // transfer cannot represent is refused.
+        if get(id::controller(id::C_COMPENSATE_RESONATORS))? != 0.0 {
+            let m = id::MANAGER_ACCELERATION;
+            let k = |o: u32| get(id::model(m, ty, o));
+            if k(id::M_USE_COMPENSATION)? != 0.0 {
+                if k(id::M_ENABLE_RES1)? == 0.0 {
+                    return Err(refuse(&format!("channel {c} compensation without resonator 1")));
+                }
+                for (o, what) in [
+                    (id::M_ENABLE_RES2, "resonator 2"),
+                    (id::M_ENABLE_LR2, "LR2 inductance"),
+                    (id::M_CREEP, "creep model"),
+                    (id::M_PASSIVE_RADIATOR, "passive radiator"),
+                ] {
+                    if k(o)? != 0.0 {
+                        return Err(refuse(&format!("channel {c} compensation with {what}")));
+                    }
+                }
+                let own = row(m, ty)?;
+                let rdc = if k(id::M_USE_GENERIC_RDC)? != 0.0 { family[0] } else { own[0] };
+                let res1 = if k(id::M_USE_GENERIC_RES1)? != 0.0 { family } else { own };
+                x.compensation = [
+                    1.0,
+                    k(id::M_DESIRED_RESONATOR_HZ)?,
+                    k(id::M_DESIRED_RESONATOR_Q)?,
+                    k(id::M_MAX_DC_BOOST_DB)?,
+                    k(id::M_MAX_RESONANCE_CUT_DB)?,
+                    rdc,
+                    res1[1],
+                    res1[2],
+                    res1[3],
+                    res1[4],
+                ];
+            }
+        }
         // rig law 6: the peak axis reserves the bank's pilot amplitude
         // (PilotToneAmplitude_dB, offset 2 of the bank's pilot block)
         let bank = whole(id::CH_TUNING + c, "ChTuning")?;
         let pilot_db = get(id::PILOT[bank.min(2) as usize] + id::P_AMPLITUDE_DB)?;
         x.pilot_reserve = libm_pow10(f64::from(pilot_db) / 20.0) as f32;
         x.resolve_models();
+        if static_release && get(id::model(id::MANAGER_ADMITTANCE, ty, id::M_ENABLE_LR2))? != 0.0 {
+            // The current model has no inductive branch. Leaving it out is
+            // allowed only where it cannot lower the modeled power (see
+            // lr2_omission_is_conservative). A generic flag takes the branch
+            // from the type's impedance block, as for the other model parts.
+            let src = if get(id::model(id::MANAGER_ADMITTANCE, ty, id::M_USE_GENERIC_LR2))? != 0.0 {
+                id::MANAGER_IMPEDANCE
+            } else {
+                id::MANAGER_ADMITTANCE
+            };
+            let branch = [
+                get(id::model(src, ty, id::M_LR2_R2))?,
+                get(id::model(src, ty, id::M_LR2_LE))?,
+                get(id::model(src, ty, id::M_LR2_L2))?,
+            ];
+            if !lr2_omission_is_conservative(&x, branch, rate) {
+                return Err(bad(format!(
+                    "channel {c}'s admittance inductance would raise the modeled power above the model without it, \
+                     which the current model cannot represent"
+                )));
+            }
+            diags.info(
+                "lsm2-lr2-bounded",
+                "compile",
+                format!("channel {c}: the current model leaves out the admittance inductance, which only lowers the power it models"),
+            );
+        }
         arr(id::CH_VELOCITY_LIMIT0, &mut x.velocity_limit)?;
         arr(id::CH_MASK_ENERGY0, &mut x.mask_energy_db)?;
         arr(id::CH_BAND_CENTER0, &mut x.band_center_hz)?;
-        if let Some(fir) = (!guarded).then(|| pressure_response(t, c as usize, diags)).flatten() {
+        if let Some(fir) = pressure[c as usize].and_then(|r| pressure_response(t, r, diags)) {
             x.pressure_taps = lsm2::PRESSURE_TAPS as u32;
             x.pressure_fir = fir;
         }
@@ -949,10 +1045,43 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
     p.other_power_features = (get(mid)? != 0.0) as u32
         | ((get(high)? != 0.0) as u32) << 1
         | ((get(id::amp0(id::A_USE_BATTERY))? != 0.0) as u32) << 2;
-    finish_lsm2(t, b, diags, p)
+    finish_lsm2(t, b, diags, p, static_release)
 }
 
-fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) -> Result<Compiled> {
+/// Whether running the current model without its inductive branch keeps
+/// the modeled electrical power at or above the model with it. The power
+/// path integrates `u * i` with `i` from the admittance model, so for any
+/// signal it is enough that `Re Y` without the branch is not below `Re Y`
+/// with it at any frequency up to Nyquist. The branch is
+/// `Z = j w Le + (R2 * j w L2) / (R2 + j w L2)` in series with `Rdc` and the
+/// first resonator's motional impedance `Bl^2 / (Rms + j w Mms + Kms / (j w))`.
+fn lr2_omission_is_conservative(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3], rate: u32) -> bool {
+    let (r2, le, l2) = (f64::from(r2), f64::from(le), f64::from(l2));
+    if ![r2, le, l2].iter().all(|v| v.is_finite() && *v >= 0.0) {
+        return false;
+    }
+    let (rdc, bl, m, rms, k) =
+        (f64::from(c.rdc), f64::from(c.bl), f64::from(c.mms_kg), f64::from(c.rms), f64::from(c.kms));
+    let div = |(a, b): (f64, f64), (c, d): (f64, f64)| {
+        let n = c * c + d * d;
+        ((a * c + b * d) / n, (b * c - a * d) / n)
+    };
+    const POINTS: usize = 4096;
+    let (lo, hi) = (1.0f64, f64::from(rate) / 2.0);
+    (0..POINTS).all(|j| {
+        let f = lo * (hi / lo).powf(j as f64 / (POINTS - 1) as f64);
+        let w = 2.0 * core::f64::consts::PI * f;
+        let motional = div((bl * bl, 0.0), (rms, w * m - k / w));
+        let base = (rdc + motional.0, motional.1);
+        let parallel = if r2 == 0.0 || l2 == 0.0 { (0.0, 0.0) } else { div((0.0, r2 * w * l2), (r2, w * l2)) };
+        let full = (base.0 + parallel.0, base.1 + w * le + parallel.1);
+        let y_base = div((1.0, 0.0), base).0;
+        let y_full = div((1.0, 0.0), full).0;
+        y_full <= y_base * (1.0 + 1e-9)
+    })
+}
+
+fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params, release: bool) -> Result<Compiled> {
     let n = p.channels as usize;
     let guarded = t.lsid.is_some();
     let g = t.protection.state.global().ok_or_else(|| bad("LSM2 global state missing"))?;
@@ -981,8 +1110,12 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
             .and_then(|p| if let PropValue::UInt32(v) = p.value { Some(v) } else { None })
             .unwrap_or(0);
         let companion = Companion {
-            gates: UNQUALIFIED_VOICING
-                | if n == 6 { UNQUALIFIED_FLOW | UNQUALIFIED_MODEL } else { LEGACY_ESTIMATOR | UNQUALIFIED_MODEL },
+            gates: if release {
+                0
+            } else {
+                UNQUALIFIED_VOICING
+                    | if n == 6 { UNQUALIFIED_FLOW | UNQUALIFIED_MODEL } else { LEGACY_ESTIMATOR | UNQUALIFIED_MODEL }
+            },
             channels: n as u32,
             lsm2_records: g.params.clone(),
             lsid_records: lsid.state.global().ok_or_else(|| bad("LSID global state missing"))?.params.clone(),
@@ -995,8 +1128,19 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
         if let Some(why) = companion.geometry_error() {
             return Err(bad(why));
         }
+        if release && !companion.is_static() {
+            return Err(bad("the released LSID companion is not the static class"));
+        }
         payload.extend_from_slice(&companion.encode().map_err(|e| bad(format!("LSID companion bundle: {e:?}")))?);
-        diags.warn("lsm2-release-gated", "compile", "unqualified companion/model/flow laws: output MUTED by the single governing LSM2 unit; static saved model retained, adaptation disabled");
+        if release {
+            diags.warn(
+                "lsid-static-release",
+                "compile",
+                "the LSID estimator is not run: the single LSM2 unit protects on its complete static model, the unit's own mode without a valid estimate (open-loop temperature, no measured power)",
+            );
+        } else {
+            diags.warn("lsm2-release-gated", "compile", "unqualified companion/model/flow laws: output MUTED by the single governing LSM2 unit; static saved model retained, adaptation disabled");
+        }
     }
     let sense_channels = if guarded { 2 * p.channels } else { 0 };
     let blob = build_for(
@@ -1028,6 +1172,53 @@ fn finish_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics, p: lsm2::Params) 
 
 fn libm_pow10(x: f64) -> f64 {
     10f64.powf(x)
+}
+
+/// The number of `ChannelData` records in property 6632, 0 without one.
+fn pressure_record_count(t: &Tuning) -> usize {
+    t.protection
+        .property_files
+        .iter()
+        .find(|f| f.number == 6632)
+        .and_then(|f| f.value.as_dict())
+        .and_then(|d| d.get("ChannelData"))
+        .and_then(|v| v.as_array())
+        .map_or(0, |a| a.len())
+}
+
+/// The source channel feeding each of the unit's `n` lanes, when every
+/// lane starts at the same graph input port; `None` otherwise.
+fn lane_sides(t: &Tuning, n: usize) -> Vec<Option<u32>> {
+    let lanes = &t.protection.lanes;
+    let one_source = lanes.len() == n
+        && lanes.iter().all(|l| (&l.origin.node, l.origin.port) == (&lanes[0].origin.node, lanes[0].origin.port));
+    (0..n).map(|c| one_source.then(|| lanes[c].origin.channel)).collect()
+}
+
+/// Which `ChannelData` record of property 6632 each lane takes its
+/// `PressureResponse` from, chosen by the tuning's structure (never by
+/// board):
+/// - without an LSID companion, one record per lane: lane `c` takes
+///   record `c`;
+/// - with a companion and two records, when one two-channel source feeds
+///   the lanes and each source channel feeds exactly two of them (a
+///   woofer and a tweeter per side, four lanes): the records are per side,
+///   so a lane takes the record of the source channel that feeds it. Each
+///   record also carries its side's tweeter fields. The native unit's
+///   output matches with a record on every lane, not with records on the
+///   woofer lanes only (speakerguardd#185);
+/// - any other tuning with a companion (six lanes, other record counts,
+///   other sources): no record, so no masking path, as before. Nothing
+///   has been measured for those layouts.
+fn pressure_records(guarded: bool, records: usize, sides: &[Option<u32>]) -> Vec<Option<usize>> {
+    if !guarded {
+        return (0..sides.len()).map(Some).collect();
+    }
+    let per_side = |s: u32| sides.iter().filter(|&&x| x == Some(s)).count();
+    if records == 2 && sides.iter().all(|s| matches!(s, Some(0 | 1))) && per_side(0) == 2 && per_side(1) == 2 {
+        return sides.iter().map(|s| s.map(|s| s as usize)).collect();
+    }
+    vec![None; sides.len()]
 }
 
 /// Property 6632's `ChannelData[c].PressureResponse` (spec 9.8): 1,024
@@ -1149,4 +1340,51 @@ fn compile_atsp(t: &Tuning, b: &Bound) -> Result<Compiled> {
         calibration: false,
         blob,
     })
+}
+
+#[cfg(test)]
+mod pressure_record_tests {
+    use super::pressure_records;
+
+    #[test]
+    fn unguarded_lanes_take_their_own_record() {
+        assert_eq!(
+            pressure_records(false, 4, &[Some(0), Some(1), Some(0), Some(1)]),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+        // the record count and the routing do not matter without a companion
+        assert_eq!(pressure_records(false, 0, &[None, None]), [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn guarded_four_lanes_take_their_side_record() {
+        // woofer L, woofer R, tweeter L, tweeter R (J713/J813 routing)
+        assert_eq!(
+            pressure_records(true, 2, &[Some(0), Some(1), Some(0), Some(1)]),
+            [Some(0), Some(1), Some(0), Some(1)]
+        );
+        // the side comes from the routing, not the lane index
+        assert_eq!(
+            pressure_records(true, 2, &[Some(0), Some(0), Some(1), Some(1)]),
+            [Some(0), Some(0), Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn other_guarded_layouts_get_no_record() {
+        let six = [Some(0), Some(1), Some(0), Some(1), Some(0), Some(1)];
+        assert_eq!(pressure_records(true, 2, &six), [None; 6]);
+        let four = [Some(0), Some(1), Some(0), Some(1)];
+        for records in [0, 1, 3, 4] {
+            assert_eq!(pressure_records(true, records, &four), [None; 4], "{records} records");
+        }
+        for sides in [
+            [Some(0), Some(1), None, Some(1)],
+            [Some(0), Some(0), Some(0), Some(1)],
+            [Some(0), Some(1), Some(2), Some(3)],
+        ] {
+            assert_eq!(pressure_records(true, 2, &sides), [None; 4], "{sides:?}");
+        }
+        assert_eq!(pressure_records(true, 2, &[Some(0), Some(1)]), [None; 2]);
+    }
 }

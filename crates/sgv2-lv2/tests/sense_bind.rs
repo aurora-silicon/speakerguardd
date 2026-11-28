@@ -18,6 +18,8 @@ use sgv2_core::{
 use sgv2_lv2::page::{EnginePage, SENSE_BIND_STALE_NS, SENSE_BOUND, SENSE_NO_COMPANION, SENSE_UNBOUND};
 use sgv2_lv2::{load_unit, lv2_descriptor, AnyUnit, Role, VARIANTS};
 
+mod common;
+
 /// The synthetic preset and companion of sgv2-core's LSID tests: six
 /// channels, the twelve-lane source "synthetic-sense", release-gated.
 fn preset() -> Preset {
@@ -186,6 +188,8 @@ fn only_an_lsid_companion_binds_and_its_gates_still_mute() {
 /// the word is withdrawn or names another blob. The output stays muted.
 #[test]
 fn run_follows_the_supervisor_word_through_the_c_abi() {
+    let lock = common::lock();
+    let _env = common::TestEnv::new(&lock);
     let dir = std::env::temp_dir().join(format!("sgv2-sense-bind-{}-abi", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let blob_path = dir.join("params.bin");

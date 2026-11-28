@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the per-machine PipeWire and WirePlumber files of the v2 speaker graph.
+"""Generate the per-machine PipeWire and WirePlumber files of the v2 speaker graph
+(and, further down, of the built-in microphone graph).
 
     python3 -I packaging/session/gen.py            # rewrite the files
     python3 -I packaging/session/gen.py --check    # fail if any file is stale
@@ -39,6 +40,7 @@ The graph, per machine:
 import json
 import math
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,6 +85,44 @@ def qualification_policy(board, units, gate=None):
         raise wiring.Refused(f"protection types not at parity: {', '.join(u for u in units if u not in parity)}")
 
 
+def playback_rows(aid, gate=None):
+    """The recorded protected playback rows for speaker `aid` ("AID<n>"),
+    or [] unless those with evidence together cover gate.json's
+    playback_covers. A malformed record proves nothing."""
+    gate = load_gate() if gate is None else gate
+    covers = gate.get("playback_covers")
+    record = gate.get("playback_rows")
+    if not isinstance(covers, list) or not covers or not all(isinstance(c, str) for c in covers) \
+            or not isinstance(record, dict):
+        return []
+    rows = record.get(aid) if isinstance(aid, str) else None
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("evidence"), str) and r["evidence"].strip()
+            and isinstance(r.get("covers"), list) and all(isinstance(c, str) for c in r["covers"])] \
+        if isinstance(rows, list) else []
+    return rows if {c for r in rows for c in r["covers"]} >= set(covers) else []
+
+
+def held_for_playback_rows(units, gate=None):
+    """The graph's protection types the build releases only on a speaker
+    with protected playback rows on record (units_need_playback_rows)."""
+    gate = load_gate() if gate is None else gate
+    need = gate.get("units_need_playback_rows", [])
+    if not isinstance(need, list) or any(u not in wiring.PROTECTION_UNITS for u in need):
+        raise wiring.Refused("malformed playback row policy")
+    return [u for u in units if u in need]
+
+
+def playback_policy(aid, units, gate=None):
+    """A protection type the build releases without playback evidence yet
+    (units_need_playback_rows, e.g. LSID's static release) runs only on a
+    speaker whose protected playback rows are on record."""
+    gate = load_gate() if gate is None else gate
+    held = held_for_playback_rows(units, gate)
+    if held and not playback_rows(aid, gate):
+        raise wiring.Refused(f"{', '.join(held)} on {aid}: no protected playback row (loud step, thermal ramp) "
+                             "is on record for this speaker yet, so it stays muted")
+
+
 def voicing_enabled(board, gate=None):
     """Per-board deployment gate. Missing keys/boards keep the interim graph.
     Values must be literal JSON booleans; strings never enable a board.
@@ -110,31 +150,85 @@ def runtime_voicing_enabled(board):
     return True
 
 
-def voicing_bound(board, gate=None):
-    """Interim never-louder bound for a board's generated voicing: one gain
+SPEAKER_KEY = re.compile(r"AID[0-9]+")
+
+
+def speaker_table(name, gate):
+    """A gate.json table keyed by the speaker identity a tuning bundle names
+    (its AID). The values belong to the speaker, not the board, so a Mac
+    with the same speakers gets the same entry and no entry names a board.
+    A key that is not a speaker identity refuses the table: an entry left
+    under a board name would otherwise be skipped without a word.
+    """
+    t = gate.get(name, {})
+    if not isinstance(t, dict) or not all(isinstance(k, str) and SPEAKER_KEY.fullmatch(k) for k in t):
+        raise ValueError(f"{name}: keys must be speaker identities (AID<n>), got {sorted(t) if isinstance(t, dict) else type(t).__name__}")
+    return t
+
+
+def speaker_identity(c):
+    """The speaker identity (AID<n>) of the bundle a description was made
+    from. Only that form can match a speaker table's key, so anything else
+    (missing, "-", "13", "aid13", a placeholder) refuses the voicing rather
+    than reading no entry and silently dropping a speaker's bound."""
+    aid = c.get("aid")
+    if not isinstance(aid, str) or not SPEAKER_KEY.fullmatch(aid):
+        raise ValueError(f"{c.get('board', c.get('key'))}: the description names no speaker identity "
+                         f"(aid {aid!r}, want AID<n>)")
+    return aid
+
+
+def voicing_bound(aid, gate=None):
+    """Interim never-louder bound for a speaker's generated voicing: one gain
     in dB (<= 0) per unit lane, applied after the voicing plugin, from
-    gate.json voicing_pre_bound_db. It exists only while a voicing law is
-    still open (it keeps every lane at or below macOS on the full-chain
-    safety scan) and goes when the law is exact. Anything malformed, any
-    positive value or a wrong lane count refuses the board's voicing.
+    gate.json voicing_pre_bound_db, keyed by the bundle's speaker identity.
+    It exists only while a voicing law is still open (it keeps every lane at
+    or below macOS on the full-chain safety scan) and goes when the law is
+    exact. Anything malformed, any positive value or a wrong lane count
+    refuses the voicing.
     """
     if gate is None:
         gate = load_gate()
-    b = gate.get("voicing_pre_bound_db", {}).get(board)
+    b = speaker_table("voicing_pre_bound_db", gate).get(aid)
     if b is None:
         return None
     if not isinstance(b, list) or not all(isinstance(x, (int, float)) and not isinstance(x, bool) and -12.0 <= x <= 0.0 for x in b):
-        raise ValueError(f"voicing_pre_bound_db for {board}: want a list of dB values in [-12, 0]")
+        raise ValueError(f"voicing_pre_bound_db for {aid}: want a list of dB values in [-12, 0]")
     return [float(x) for x in b]
+
+
+def operating_volume_cap_db(board, gate=None):
+    """gate.json's cap on `board`'s operating volume, in dB on the volume
+    control's own TLV, or None (no entry: no cap below 0 dB). The operating
+    volume itself is the machine's: the ceiling the card reports under the
+    grant (every amp volume's TLV maximum: 0 dB, or on a machine whose
+    speaker only a lease may lift, macaudio's spk_fixed_ceiling, its
+    ceiling). The cap can only lower it: the supervisor grants only at the
+    card's ceiling, and only while that is at or below the cap; a card that
+    reports no ceiling is never granted, cap or not. The self-check records
+    the cap. Anything malformed, above 0 dB or below -40 dB refuses the
+    board.
+    """
+    if gate is None:
+        gate = load_gate()
+    table = gate.get("operating_volume_cap_db", {})
+    if not isinstance(table, dict):
+        raise wiring.Refused("malformed operating_volume_cap_db")
+    v = table.get(board)
+    if v is None:
+        return None
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not -40.0 <= v <= 0.0:
+        raise wiring.Refused(f"operating_volume_cap_db for {board}: want a volume in dB from -40 to 0")
+    return float(v)
 
 
 LOWPASS_ORDERS = (2, 4, 6, 8, 10, 12)
 
 
-def voicing_lowpass(board, gate=None):
-    """INTERIM never-louder band limit for a board's generated voicing, from
-    gate.json voicing_pre_lowpass: {"hz": corner, "order": even Butterworth
-    order}. It is not a macOS law. It exists only because one voicing law is
+def voicing_lowpass(aid, gate=None):
+    """INTERIM never-louder band limit for a speaker's generated voicing,
+    from gate.json voicing_pre_lowpass, keyed by the bundle's speaker
+    identity: {"hz": corner, "order": even Butterworth order}. It is not a macOS law. It exists only because one voicing law is
     still open and makes a board louder than macOS in a band no lane trim
     can hold: on the j700 (AID44) v2's ControlFreak lacks the AU's
     reconstruction low-pass, so above ~17 kHz the box is up to +23 dB
@@ -146,11 +240,11 @@ def voicing_lowpass(board, gate=None):
     bq_lowpass (RBJ) at the corner with the Butterworth Q of its pole pair,
     so the cascade is the bilinear Butterworth response, monotonic and
     never above 0 dB. It goes when the ControlFreak law is exact. Anything
-    malformed refuses the board's voicing.
+    malformed refuses the voicing.
     """
     if gate is None:
         gate = load_gate()
-    lp = gate.get("voicing_pre_lowpass", {}).get(board)
+    lp = speaker_table("voicing_pre_lowpass", gate).get(aid)
     if lp is None:
         return None
     hz = lp.get("hz") if isinstance(lp, dict) else None
@@ -165,7 +259,7 @@ def voicing_lowpass(board, gate=None):
         or isinstance(order, bool)
         or order not in LOWPASS_ORDERS
     ):
-        raise ValueError(f"voicing_pre_lowpass for {board}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
+        raise ValueError(f"voicing_pre_lowpass for {aid}: want {{\"hz\": 1000..23000, \"order\": one of {LOWPASS_ORDERS}}}")
     return float(hz), order
 
 
@@ -181,9 +275,10 @@ def voicing_conf(m, c, w):
     """
     amps = c["amps"]
     unit = w[0]
-    bound = voicing_bound(c.get("board", m))
+    aid = speaker_identity(c)
+    bound = voicing_bound(aid)
     if bound is not None and len(bound) != amps:
-        raise ValueError(f"voicing_pre_bound_db for {c.get('board', m)}: {len(bound)} lanes, the board has {amps}")
+        raise ValueError(f"voicing_pre_bound_db for {aid}: {len(bound)} lanes, this Mac has {amps}")
     trims = {k: bound[k] for k in range(amps) if bound and bound[k] < 0.0}
     outputs = " ".join(f'"b{unit[p]}:Out"' if unit[p] in trims else f'"voicing:out_{unit[p]}"' for p in range(amps))
     extra_nodes = "".join(
@@ -193,11 +288,11 @@ def voicing_conf(m, c, w):
     links = "".join(f' {{ output = "voicing:out_{k}" input = "b{k}:In" }}' for k in sorted(trims))
     inputs = '"voicing:in_0" "voicing:in_1"'
     pre_nodes = ""
-    lp = voicing_lowpass(c.get("board", m))
+    lp = voicing_lowpass(aid)
     if lp is not None:
         hz, order = lp
         if hz >= c["rate"] / 2:
-            raise ValueError(f"voicing_pre_lowpass for {c.get('board', m)}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
+            raise ValueError(f"voicing_pre_lowpass for {aid}: {hz} Hz is not below Nyquist at {c['rate']} Hz")
         qs = butterworth_q(order)
         for ch in (0, 1):
             pre_nodes += "".join(
@@ -296,7 +391,9 @@ def machine(m):
         raise SystemExit(f"{m}: {e}")
     if c["key"] != m:
         raise SystemExit(f"fixtures/{m}.json: its device tree names machine {c['key']}")
-    return c, (w["unit_channels"], w["sense_ports"], w["hash"])
+    # the speaker tables (voicing_pre_bound_db, voicing_pre_lowpass) are
+    # keyed by the bundle's speaker identity, as on a running Mac
+    return dict(c, aid=w["aid"]), (w["unit_channels"], w["sense_ports"], w["hash"])
 
 
 def pipewire_conf(m, c, w, source=None, voicing_pre=None):
@@ -605,11 +702,173 @@ node.software-dsp.rules = [
     return text
 
 
+# ---------------------------------------------------------------- microphones
+#
+# The built-in microphone graph, per machine with a microphone array
+# (wiring.read_mic_dt; recorded in the fixture's "mic"):
+#
+#     microphone array (ALSA, raw channels) ──► sgv2_mic ──► "Built-in Microphone"
+#
+# - The array's capture PCM is an ALSA node of sgv2's own, opened as
+#   hw:CARD=<card>,DEV=<n>. It stays a source applications can pick (the
+#   raw channels), below every other source in priority.
+# - The processed source is a filter-chain around the sgv2_mic plugin, which
+#   runs the blob provisioning compiled from this Mac's own tuning
+#   (/run/speakerguardd/mic.bin). It has the priority asahi-audio gives its
+#   microphone filter, so the headset rules that sit above that still do.
+# - WirePlumber's own node for the array's PCM is disabled. asahi-audio's
+#   microphone filter (its node.software-dsp rule for hw:<card>,<n>) is
+#   attached to that node, so with these files there is exactly one
+#   processed source, and without them asahi-audio's is unchanged.
+# These files are never installed statically: speakerguardd-provision
+# writes them into /run only after the blob compiled and the packaged plugin
+# ran it, and removes them otherwise; a session links the pair or neither.
+MIC_PIPEWIRE = "sgv2-mic-{}.conf"
+MIC_WIREPLUMBER = "61-sgv2-mic-{}.conf"
+MIC_PRIORITY = 2005
+MIC_RAW_PRIORITY = 100
+MIC_PARAMS = "/run/speakerguardd/mic.bin"
+
+
+def mic_names(k):
+    return {"raw": f"sgv2.mic.raw.{k}", "capture": f"sgv2.mic.{k}.in", "source": f"sgv2.mic.{k}"}
+
+
+def mic_machine(m):
+    """The description (wiring.describe_mic) of fixture `m`'s microphone
+    array, or None when the machine has none."""
+    fx = fixture(m)
+    if fx is None:
+        raise SystemExit(f"{m}: no fixture")
+    if not fx.get("mic"):
+        return None
+    try:
+        d = wiring.describe_mic(fx["mic"])
+    except wiring.Refused as e:
+        raise SystemExit(f"{m}: {e}")
+    if d["key"] != m:
+        raise SystemExit(f"fixtures/{m}.json: its microphone card is the {d['key']}'s")
+    return d
+
+
+def mic_pipewire_conf(d, source=None):
+    """The PipeWire file for microphone description `d` (wiring.describe_mic;
+    on a running Mac with the live card's PCM)."""
+    k, n, ch = d["key"], mic_names(d["key"]), d["channels"]
+    inputs = " ".join(f'"mic:in_{i}"' for i in range(ch))
+    return f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{k}.json'}; do not edit.
+# speakerguardd v2: the built-in microphone of the {k.upper()}, processed with the Mac's own tuning.
+
+context.objects = [
+    {{   factory = adapter
+        flags = [ nofail ]
+        args = {{
+            factory.name           = api.alsa.pcm.source
+            node.name              = "{n['raw']}"
+            node.description       = "Microphone Array (raw channels)"
+            media.class            = "Audio/Source"
+            # The same PCM as hw:{d['card']},{d['dev']}, under the name no
+            # asahi-audio rule matches (WirePlumber's own node for it is
+            # disabled while this file is linked).
+            api.alsa.path          = "hw:CARD={d['card']},DEV={d['dev']}"
+            audio.rate             = {d['rate']}
+            audio.channels         = {ch}
+            audio.position         = {aux(ch)}
+            # Listed, never the default while any other source exists.
+            priority.driver        = {MIC_RAW_PRIORITY}
+            priority.session       = {MIC_RAW_PRIORITY}
+            channelmix.disable     = true
+            monitor.channel-volumes = false
+            device.icon-name       = "audio-input-microphone"
+        }}
+    }}
+]
+
+context.modules = [
+    {{   name = libpipewire-module-filter-chain
+        flags = [ nofail ]
+        args = {{
+            node.description = "Built-in Microphone"
+            media.name       = "Built-in Microphone"
+            filter.graph = {{
+                nodes = [
+                    {{ type = lv2 name = mic plugin = "https://aurora-silicon.org/lv2/sgv2#mic-{ch}ch" }}
+                ]
+                inputs  = [ {inputs} ]
+                outputs = [ "mic:out" ]
+            }}
+            # The blob is for this rate only (the plugin is silent at any
+            # other): both streams stay at it, and their converters
+            # resample when the graph runs at another rate.
+            capture.props = {{
+                node.name          = "{n['capture']}"
+                node.description   = "Built-in Microphone input (internal)"
+                audio.rate         = {d['rate']}
+                audio.channels     = {ch}
+                audio.position     = {aux(ch)}
+                target.object      = "{n['raw']}"
+                # Only ever the array: never moved to another source.
+                node.dont-fallback = true
+                node.passive       = true
+                stream.dont-remix  = true
+                sgv2.stage         = "mic"
+                sgv2.machine       = "{k}"
+            }}
+            playback.props = {{
+                node.name          = "{n['source']}"
+                node.description   = "Built-in Microphone"
+                media.class        = "Audio/Source"
+                audio.rate         = {d['rate']}
+                audio.channels     = 1
+                audio.position     = [ MONO ]
+                priority.driver    = {MIC_PRIORITY}
+                priority.session   = {MIC_PRIORITY}
+                node.passive       = true
+                node.virtual       = false
+                device.icon-name   = "audio-input-microphone"
+                sgv2.stage         = "mic"
+                sgv2.machine       = "{k}"
+            }}
+        }}
+    }}
+]
+"""
+
+
+def mic_wireplumber_conf(d, source=None):
+    k = d["key"]
+    return f"""# Generated by packaging/session/gen.py from {source or f'fixtures/{k}.json'}; do not edit.
+# speakerguardd v2 on the {k.upper()}: the built-in microphone is sgv2's processed source.
+
+monitor.alsa.rules = [
+    # WirePlumber's own node for the microphone array's PCM (UCM and
+    # pro-audio profiles alike): never created, so asahi-audio's microphone
+    # filter, which is attached to it, is not created either. sgv2's own
+    # nodes (sgv2-mic-{k}.conf) are the array and the processed source.
+    {{
+        matches = [
+            {{ api.alsa.path = "hw:{d['card']},{d['dev']}" }}
+            {{ alsa.id = "{d['card']}", alsa.device = {d['dev']} }}
+        ]
+        actions = {{
+            update-props = {{
+                node.disabled = true
+            }}
+        }}
+    }}
+]
+"""
+
+
 def outputs():
     for m in machines():
         c, w = machine(m)
         yield os.path.join(PKG, "pipewire", f"sgv2-{m}.conf"), pipewire_conf(m, c, w)
         yield os.path.join(PKG, "wireplumber", f"60-sgv2-{m}.conf"), wireplumber_conf(m, c)
+        d = mic_machine(m)
+        if d is not None:
+            yield os.path.join(PKG, "pipewire", MIC_PIPEWIRE.format(m)), mic_pipewire_conf(d)
+            yield os.path.join(PKG, "wireplumber", MIC_WIREPLUMBER.format(m)), mic_wireplumber_conf(d)
 
 
 def main():

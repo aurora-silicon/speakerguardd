@@ -100,11 +100,15 @@ reports no version is recorded as version 0 and bound by the macOS build and
 the SHA-256 of its component executable. No tuning defaults are distributed.
 Existing companion/model/voicing release gates remain mandatory.
 
-The reported saved total `Latency` does not determine engine latency. The
-compiler uses the structural `FilterbankLatency` to construct the FIR bank;
-the engine derives delay from the constructed bank's tap count, look-ahead
-and controller buffering. Full-preset payload bytes are unaffected.
+The unit runs the filterbank stage its total `Latency` and look-ahead give,
+whatever its `FilterbankLatency` record says; a short preset leaves that
+record out and the unit then publishes a value it does not run. The compiler
+derives the stage the same way for every LSM2 tuning
+(`lsm2::effective_filterbank_latency_ms`); the engine derives its delay from
+the constructed bank's tap count, look-ahead and controller buffering.
+Full-preset payload bytes are unaffected: their records agree.
 
-For an older collection, `aurora-speaker-upgrade status` and `--check` point
-to `aurora-speaker-upgrade guide` (route 3), since a mounted system volume or
-restore image cannot host the owner's running macOS AudioUnit.
+Without that readback, `aurora-speaker-upgrade status` and `--check` say so:
+a restore image cannot host the AudioUnit, so the readback comes only from
+this unit's installer bundle, and only when it was read from exactly the
+pinned restore image's files and AudioDSP component.

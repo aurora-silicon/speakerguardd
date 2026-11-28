@@ -254,17 +254,22 @@ class Derivation(unittest.TestCase):
         self.assertEqual(stale, [])
 
 
-def capture(n, quiet=(), pattern=()):
+def capture(n, quiet=(), pattern=(), late=False):
     """Synthetic sense statistics: every channel live except `quiet` (zeros)
-    and `pattern` (a fixed two-value idle square)."""
+    and `pattern` (a fixed two-value idle square). `late`: the words were
+    sampled one bit clock late (J615 before its receiver delay): live idle
+    noise then reads near full scale and a quiet channel takes the previous
+    word's last bit as its sign bit."""
     ch = []
     for k in range(n):
         if k in quiet:
-            ch.append({"distinct": 1, "rms": 0.0, "mean": 0.0})
+            ch.append({"distinct": 2, "rms": 16383.5, "mean": -16384.0} if late and k else
+                      {"distinct": 1, "rms": 0.0, "mean": 0.0})
         elif k in pattern:
             ch.append({"distinct": 2, "rms": 2.0, "mean": -2.0})
         else:
-            ch.append({"distinct": 60, "rms": 8.0, "mean": -0.4})
+            ch.append({"distinct": 9000, "rms": 23170.0, "mean": 1100.0} if late else
+                      {"distinct": 60, "rms": 8.0, "mean": -0.4})
     return {"frames": 19200, "ch": ch}
 
 
@@ -273,7 +278,7 @@ class SenseCheck(unittest.TestCase):
     do: [I, V] per amp, V switched off gives an idle pattern, I gives
     zeros."""
 
-    def run_check(self, w, truth, also=None):
+    def run_check(self, w, truth, also=None, late=False):
         switches = {}
         also = also or {}
         n = len(w["amps"])
@@ -295,7 +300,7 @@ class SenseCheck(unittest.TestCase):
                         for ch in (truth[(prefix, kind)], also.get((prefix, kind))):
                             if ch is not None:
                                 (pattern if kind == "V" else quiet).append(ch)
-                return capture(2 * n, quiet, pattern)
+                return capture(2 * n, quiet, pattern, late)
 
             def stop(self):
                 calls.append("stop")
@@ -404,6 +409,20 @@ class SenseCheck(unittest.TestCase):
         errs = self.run_check(self.w, self.truth, also={("Left Tweeter", "I"): self.truth[("Left Woofer", "I")]})
         self.assertTrue(any("Left Woofer ISENSE" in e and "no single switch" in e for e in errs), errs)
         self.assertEqual(len(errs), 1, errs)
+
+    def test_sense_sampled_a_bit_clock_late_fails(self):
+        # J615 before its receiver delay: the switches still map one to one
+        # (a switched-off word reads 0 or -32768), but idle noise is near
+        # full scale, so the power the protection computes is meaningless.
+        errs = self.run_check(self.w, self.truth, late=True)
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("misframed", errs[0])
+        self.assertIn("23170 counts RMS", errs[0])
+
+    def test_idle_ceiling(self):
+        self.assertEqual(sgsc.idle_too_loud(capture(4)), [])
+        self.assertEqual(sgsc.idle_too_loud(capture(4, late=True)), [0, 1, 2, 3])
+        self.assertEqual(sgsc.idle_too_loud({"ch": [{"rms": 2048.0}, {"rms": 2048.5}]}), [1])
 
     def test_a_switch_that_quiets_nothing_fails(self):
         truth = dict(self.truth)
@@ -693,6 +712,34 @@ class Atsp(unittest.TestCase):
             wiring.derive(h, fx("j313")["tuning"])
         self.assertIn("no sound-name-prefix", str(cm.exception))
 
+    def test_mono_amp_sense_switches_have_no_prefix(self):
+        # The lone desktop amp has no sound-name-prefix, so ALSA names its
+        # switches "VSENSE Switch"/"ISENSE Switch" (the J473's card); the
+        # derivation's "Speaker" is a label, not part of the control name.
+        for board in ("j274", "j473"):
+            f = fx(board)
+            w = wiring.derive(f["hw"], f["tuning"])
+            self.assertEqual(w["amps"][0]["prefix"], "Speaker")
+            self.assertEqual(w["amps"][0]["control_prefix"], "")
+            asked = []
+
+            def get(card, name):
+                asked.append(name)
+                return None
+
+            saved = sgsc.switch_get
+            sgsc.switch_get = get
+            try:
+                errs, fmt = sgsc.check_sense(None, 0, "Apple" + board.upper(), (1, 2), w, {})
+            finally:
+                sgsc.switch_get = saved
+            self.assertEqual(asked, ["VSENSE Switch"], board)
+            self.assertEqual(errs, ["no 'VSENSE Switch' control"])
+        # an amp that names itself keeps its prefix in the control name
+        f = fx("j413")
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertNotIn("control_prefix", w["amps"][0])
+
     def test_tas2770_register_check(self):
         w = wiring.derive(fx("j313")["hw"], fx("j313")["tuning"])
         for p, a in enumerate(w["amps"]):
@@ -911,6 +958,40 @@ class NoSensePath(unittest.TestCase):
             wiring.derive(f["hw"], f["tuning"])
         self.assertIn("one amp only", str(cm.exception))
 
+    def test_aop_dma_sense_follows_the_named_channel(self):
+        # t8152_aop_audio (T8142, T6050): the J815 names "sense" and keeps
+        # its sense and its hash; without it, it is refused (its spp3 unit
+        # reads sense, and six amps could not run without it anyway).
+        f = fx("j815")
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr", "sense", "hpai"]]
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertEqual(wiring.derive(f["hw"], f["tuning"])["hash"], "725f518662e42388")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr"]]
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f["tuning"]["tuning"]["protection"]["kind"] = "lsm2"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_t6050_one_amp_without_sense(self):
+        # The M5 Mac Studio's shape: one SN012776 on the T6050 AOP whose
+        # audio node names no "sense" (its ADT audio-speaker is TX only).
+        f = j773g(("cout", "cin", "spkr"))
+        link = next(l for l in f["hw"]["links"] if l["name"] == "Speaker")
+        link["cpu_compatible"] = [["apple,t6050-aop-audio"]]
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertTrue(w["no_sense_path"])
+        self.assertEqual((w["unit_channels"], w["sense"]), ([0], []))
+        self.assertEqual(sgsc.method_of(w), "derived-nosense")
+        link["cpu_dma_names"] = [["cout", "cin", "spkr", "sense"]]
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        self.assertFalse(wiring.derive(f["hw"], f["tuning"])["no_sense_path"])
+
     def test_static_report_names_the_no_sense_case(self):
         f = j773g()
         w = wiring.derive(f["hw"], f["tuning"])
@@ -932,6 +1013,182 @@ class NoSensePath(unittest.TestCase):
         self.assertEqual(link["cpu_dma_names"], [["spkr", "cout", "cin"]])
         self.assertFalse(wiring.transport_senses(got))
         self.assertEqual(wiring.derive(got, j773g()["tuning"])["hash"], "d1d62e8a0aaaef3d")
+
+
+def t8152_six_amp(names=("hpai", "spkr", "sense", "cout", "cin")):
+    """Six SN012776 amps behind the T8152 AOP back-end (J804 shape), using the
+    generic J815 six-channel spp3 lane structure."""
+    f = fx("j815")
+    h = f["hw"]
+    h.update(board="j804", compatible=["apple,j804", "apple,t8152", "apple,arm-platform"],
+             sound_compatible=["apple,j804-macaudio", "apple,macaudio"], model="MacBook Pro J804")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["name"] = "Speakers"
+    link["cpu_compatible"] = [["apple,t8152-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    return f
+
+
+def t8152_one_amp(names=("cout", "cin", "spkr")):
+    """One SN012776 behind the T8152 AOP back-end (J873g shape) with a mono
+    atsp tuning."""
+    f = fx("j473")
+    h = f["hw"]
+    h.update(board="j873g", compatible=["apple,j873g", "apple,t8152", "apple,arm-platform"],
+             sound_compatible=["apple,j873-macaudio", "apple,macaudio"], model="Mac mini J873")
+    link = next(l for l in h["links"] if l["name"] == "Speaker")
+    link["cpu_compatible"] = [["apple,t8152-aop-audio"]]
+    link["cpu_dma_names"] = [list(names) if names is not None else None]
+    link["codecs"] = [{"node": "soc/i2c@33101c000/codec@38", "compatible": ["ti,sn012776", "ti,tas2764"],
+                       "vmon": 0, "imon": 2, "i2c": "1-0038"}]
+    return f
+
+
+class T8152Transport(unittest.TestCase):
+    """apple,t8152-aop-audio binds the same t8152_aop_audio driver (aop-dma)
+    as T8142/T6050: sense follows the back-end node's dma-names, and PCM
+    widths follow the link's amps and sense lanes."""
+
+    def test_six_amps_with_sense_derive_6ch_vi(self):
+        for names in (("hpai", "spkr", "sense", "cout", "cin"), None):
+            f = t8152_six_amp(names)
+            self.assertTrue(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertFalse(w["no_sense_path"], names)
+            self.assertEqual(len(w["sense"]), 12, names)
+            self.assertEqual(sgsc.method_of(w), "derived", names)
+            self.assertEqual(
+                (c["card"], c["transport"], c["plugin"], c["speaker_pcm"], c["sense_pcm"],
+                 c["alsa_format"], c["speaker_format"], c["speaker_irq"]),
+                ("AppleJ804", "aop-dma", "6ch-vi", 6, 12, "S24_LE", "S24_32LE", False),
+                names,
+            )
+
+    def test_six_amps_without_sense_channel_are_refused(self):
+        f = t8152_six_amp(("hpai", "spkr", "cout", "cin"))
+        self.assertFalse(wiring.transport_senses(f["hw"]))
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("carries none", str(cm.exception))
+        f["tuning"]["tuning"]["protection"]["kind"] = "lsm2"
+        with self.assertRaises(wiring.Refused) as cm:
+            wiring.derive(f["hw"], f["tuning"])
+        self.assertIn("one amp only", str(cm.exception))
+
+    def test_one_amp_with_sense_fails_closed_when_card_has_no_sense_pcm(self):
+        for names in (("cout", "cin", "spkr", "sense"), None):
+            f = t8152_one_amp(names)
+            self.assertTrue(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            self.assertFalse(w["no_sense_path"], names)
+            self.assertEqual(len(w["sense"]), 2, names)
+            self.assertEqual(sgsc.method_of(w), "derived", names)
+            with mock.patch.object(sgsc, "pcm_ids", return_value={("Secondary", "p"): 1}):
+                with self.assertRaises(wiring.Refused) as cm:
+                    sgsc.active(0, "AppleJ873", w, {})
+                self.assertIn("sense PCM None", str(cm.exception))
+
+    def test_one_amp_without_sense_channel_derives_nosense(self):
+        for names in (("cout", "cin", "spkr"), ("spkr", "cout", "cin")):
+            f = t8152_one_amp(names)
+            self.assertFalse(wiring.transport_senses(f["hw"]), names)
+            w = wiring.derive(f["hw"], f["tuning"])
+            c = wiring.describe(f["hw"], w)
+            self.assertTrue(w["no_sense_path"], names)
+            self.assertEqual((w["family"], w["unit_kind"], w["unit_channels"], w["sense"]),
+                             ("sn012776", "atsp", [0], []), names)
+            self.assertEqual((c["transport"], c["plugin"], c["speaker_pcm"], c["sense_pcm"], c["alsa_format"]),
+                             ("aop-dma", "1ch", 1, 0, "S24_LE"), names)
+            self.assertFalse(c["speaker_irq"], names)
+            self.assertEqual(sgsc.method_of(w), "derived-nosense", names)
+            self.assertEqual(w["hash"], "d1d62e8a0aaaef3d", names)
+
+    def test_t8142_keeps_its_sense_and_hash(self):
+        f = fx("j815")
+        self.assertTrue(wiring.transport_senses(f["hw"]))
+        w = wiring.derive(f["hw"], f["tuning"])
+        self.assertEqual((w["no_sense_path"], len(w["sense"]), w["hash"]), (False, 12, "725f518662e42388"))
+        self.assertEqual(wiring.describe(f["hw"], w)["transport"], "aop-dma")
+
+
+class RunLockedDispatch(unittest.TestCase):
+    """run_locked() proves each method on its own branch, and fails closed on
+    a method no branch names."""
+
+    def run_with(self, w, defer=False):
+        import tempfile
+        import types
+
+        f = j773g()
+        desc = wiring.describe(f["hw"], w)
+        calls = []
+
+        def static(idx, w2, report):
+            calls.append(("static", w2["method"]))
+            report["static"] = "spy"
+            return []
+
+        def active(idx, card, w2, report, args=None):
+            calls.append(("active", w2["method"]))
+            return []
+
+        with tempfile.TemporaryDirectory() as d:
+            params = os.path.join(d, "params.bin")
+            with open(params, "wb") as fh:
+                fh.write(b"params")
+            args = types.SimpleNamespace(state=d, params=params, force=False, defer=defer,
+                                         deferred=os.path.join(d, "deferred"))
+            with mock.patch.object(sgsc, "lv2_shadows", return_value=[]), \
+                    mock.patch.object(sgsc, "derive_live", return_value=(f["hw"], w, desc, [])), \
+                    mock.patch.object(sgsc, "blob_rate", return_value=w["rate"]), \
+                    mock.patch.object(sgsc, "read_bind", return_value={}), \
+                    mock.patch.object(sgsc, "find_card", return_value=(0, desc["card"])), \
+                    mock.patch.object(sgsc, "set_deferred"), \
+                    mock.patch.object(sgsc, "static", side_effect=static), \
+                    mock.patch.object(sgsc, "active", side_effect=active), \
+                    mock.patch.object(sgsc, "log"):
+                rc = sgsc.run_locked(args)
+            with open(os.path.join(d, "selfcheck.json")) as fh:
+                rec = json.load(fh)["record"]
+        return rc, rec, calls
+
+    def derived_j773g(self):
+        f = j773g()
+        w = wiring.derive(f["hw"], f["tuning"])
+        w["method"] = sgsc.method_of(w)
+        return w
+
+    def test_a_no_sense_mac_takes_the_static_branch(self):
+        for defer in (False, True):
+            rc, rec, calls = self.run_with(self.derived_j773g(), defer=defer)
+            self.assertEqual(calls, [("static", "derived-nosense")], defer)
+            self.assertEqual((rc, rec["result"], rec["method"], rec["sense"]), (0, "pass", "derived-nosense", 0), defer)
+
+    def test_an_unknown_method_fails_closed(self):
+        w = self.derived_j773g()
+        w["method"] = "derived-unproven"
+        rc, rec, calls = self.run_with(w)
+        self.assertEqual(calls, [])
+        self.assertEqual((rc, rec["result"]), (1, "fail"))
+        self.assertTrue(any("derived-unproven" in r for r in rec["reasons"]), rec["reasons"])
+
+
+class NoSenseUnits(unittest.TestCase):
+    def test_only_the_units_that_run_without_sense(self):
+        # an allowlist: atsp and plain lsm2 run on a transport without sense
+        for kind in wiring.NO_SENSE_UNITS:
+            f = j773g()
+            f["tuning"]["tuning"]["protection"]["kind"] = kind
+            self.assertTrue(wiring.derive(f["hw"], f["tuning"])["no_sense_path"], kind)
+        # anything else is refused there, a unit added later included
+        for kind in ("spp3", "lsid", "spp4"):
+            f = j773g()
+            f["tuning"]["tuning"]["protection"]["kind"] = kind
+            with self.assertRaises(wiring.Refused, msg=kind) as cm:
+                wiring.derive(f["hw"], f["tuning"])
+            self.assertIn("carries none", str(cm.exception), kind)
+        self.assertFalse(set(wiring.SENSE_UNITS) & set(wiring.NO_SENSE_UNITS))
 
 
 class NoHandMap(unittest.TestCase):
@@ -966,7 +1223,7 @@ class NoHandMap(unittest.TestCase):
         finally:
             wiring.read_dt, wiring.tuning_dump = saved
         self.assertEqual((w["method"], errs), ("derived", []))
-        self.assertEqual(c, gen.machine("j616")[0])
+        self.assertEqual(dict(c, aid=w["aid"]), gen.machine("j616")[0])
 
     def test_the_blob_header_names_its_rate(self):
         import tempfile
@@ -1136,6 +1393,73 @@ class Describe(unittest.TestCase):
             self.assertIn(f'hw:CARD={c["card"]},DEV=1', gen.pipewire_conf(m, c, w))
 
 
+class Microphones(unittest.TestCase):
+    """The built-in microphone graph's shipped files, from the fixtures'
+    microphone nodes (wiring.read_mic_dt of each board's device tree)."""
+
+    def with_mic(self):
+        return [m for m in gen.machines() if gen.mic_machine(m) is not None]
+
+    def test_shipped_files_are_the_fixtures_with_an_array(self):
+        pkg = os.path.dirname(os.path.dirname(os.path.abspath(gen.__file__)))
+        have = sorted(f[len("sgv2-mic-"):-len(".conf")] for f in os.listdir(os.path.join(pkg, "pipewire")) if f.startswith("sgv2-mic-"))
+        rules = sorted(f[len("61-sgv2-mic-"):-len(".conf")] for f in os.listdir(os.path.join(pkg, "wireplumber")) if f.startswith("61-sgv2-mic-"))
+        self.assertEqual(have, self.with_mic())
+        self.assertEqual(rules, self.with_mic())
+        self.assertTrue(have)
+        # a desktop Mac has no array, and every fixture says which it is
+        self.assertTrue(set(gen.machines()) - set(have))
+        for m in gen.machines():
+            self.assertIn("mic", gen.fixture(m), m)
+
+    def test_the_graph_is_the_arrays(self):
+        for m in self.with_mic():
+            d = gen.mic_machine(m)
+            fx = gen.fixture(m)["mic"]
+            t = wiring.mic_transport(fx)
+            self.assertIn(t["dma"], fx["dma_names"])
+            self.assertEqual((d["key"], d["card"], d["dev"]), (m, f"Apple{fx['chassis']}{t['card']}", t["dev"]))
+            pw, wp = gen.mic_pipewire_conf(d), gen.mic_wireplumber_conf(d)
+            for text in (pw, wp):
+                self.assertEqual(text.count("{"), text.count("}"))
+                self.assertEqual(text.count("["), text.count("]"))
+            # sgv2's own node on the PCM, by the name no other rule matches
+            self.assertIn(f'api.alsa.path          = "hw:CARD={d["card"]},DEV={d["dev"]}"', pw)
+            self.assertNotIn(f'"hw:{d["card"]},{d["dev"]}"', pw)
+            self.assertIn(f'sgv2#mic-{d["channels"]}ch"', pw)
+            self.assertEqual(pw.count('"mic:in_'), d["channels"])
+            self.assertEqual(pw.count(f"audio.rate         = {d['rate']}"), 2)
+            # exactly one source is called the built-in microphone, above the raw array
+            self.assertEqual(pw.count('node.description   = "Built-in Microphone"'), 1)
+            self.assertEqual(pw.count('media.class        = "Audio/Source"') + pw.count('media.class            = "Audio/Source"'), 2)
+            self.assertIn(f"priority.session       = {gen.MIC_RAW_PRIORITY}", pw)
+            self.assertIn(f"priority.session   = {gen.MIC_PRIORITY}", pw)
+            self.assertLess(gen.MIC_RAW_PRIORITY, gen.MIC_PRIORITY)
+            self.assertIn(f'target.object      = "{gen.mic_names(m)["raw"]}"', pw)
+            # WirePlumber's own node on that PCM is the one switched off
+            self.assertIn(f'{{ api.alsa.path = "hw:{d["card"]},{d["dev"]}" }}', wp)
+            self.assertIn(f'{{ alsa.id = "{d["card"]}", alsa.device = {d["dev"]} }}', wp)
+            self.assertIn("node.disabled = true", wp)
+            self.assertNotIn("software-dsp", wp.split("monitor.alsa.rules")[1])
+
+    def test_no_array_without_its_stream_or_its_card_name(self):
+        fx = gen.fixture(self.with_mic()[0])["mic"]
+        self.assertEqual(wiring.describe_mic(fx)["channels"], wiring.mic_transport(fx)["channels"])
+        with self.assertRaises(wiring.Refused):
+            wiring.describe_mic(dict(fx, chassis=None))
+        with self.assertRaises(wiring.Refused):
+            wiring.describe_mic(dict(fx, chassis="J3/16"))
+        with self.assertRaises(wiring.Refused):
+            wiring.describe_mic(dict(fx, compatible=["apple,other-audio"]))
+
+    def test_the_speaker_wiring_does_not_read_the_microphone_node(self):
+        for m in gen.machines():
+            fx = gen.fixture(m)
+            c, w = gen.machine(m)
+            fx2 = dict(fx, mic=None)
+            self.assertEqual(wiring.derive(fx2["hw"], fx2["tuning"])["hash"], w[2])
+
+
 class PcmWidths(unittest.TestCase):
     """A transport whose PCMs are wider than the link's amps: the T6040
     speaker service has six playback and twelve sense channels on every
@@ -1271,6 +1595,91 @@ class PcmWidths(unittest.TestCase):
         self.assertEqual(sgsc.amp_lanes(sgsc.stats(raw[: 16 * frames], 8), 4)["ch"], sgsc.stats(raw[: 16 * frames], 8)["ch"])
 
 
+class AudioStack(unittest.TestCase):
+    """wiring.audio_stack: the speaker card, the nodes its links point at and
+    the loaded sound modules, nothing else."""
+
+    @staticmethod
+    def be(*w):
+        import struct
+        return struct.pack(">%dI" % len(w), *w)
+
+    def tree(self, d):
+        import struct
+        root, mods = os.path.join(d, "dt"), os.path.join(d, "module")
+
+        def node(path, props):
+            p = os.path.join(root, path)
+            os.makedirs(p, exist_ok=True)
+            for k, v in props.items():
+                with open(os.path.join(p, k), "wb") as f:
+                    f.write(v)
+
+        be = self.be
+        node("", {"compatible": b"apple,j615\0"})
+        node("soc/i2s@2a3400000", {"compatible": b"apple,t8122-mca\0apple,mca\0", "phandle": be(1),
+                                   "#sound-dai-cells": be(1)})
+        node("soc/i2c@0/codec@38", {"compatible": b"ti,sn012776\0", "phandle": be(2)})
+        node("soc/gpu@0", {"compatible": b"apple,agx\0", "phandle": be(3)})
+        node("sound", {"compatible": b"apple,macaudio\0"})
+        node("sound/dai-link@0", {"link-name": b"Speakers\0"})
+        node("sound/dai-link@0/cpu", {"sound-dai": be(1, 0)})
+        node("sound/dai-link@0/codec", {"sound-dai": be(2)})
+        for m, v in (("snd_soc_apple_mca", b"\xaa" * 20), ("snd_soc_macaudio", b"\xbb" * 20), ("nvme", b"\xcc" * 20)):
+            os.makedirs(os.path.join(mods, m, "notes"))
+            with open(os.path.join(mods, m, "notes", ".note.gnu.build-id"), "wb") as f:
+                f.write(b"\x04\0\0\0\x14\0\0\0\x03\0\0\0GNU\0" + v)
+        return root, mods
+
+    def test_what_changes_the_fingerprint(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root, mods = self.tree(d)
+            be = self.be
+
+            def fp():
+                return wiring.audio_stack("sound", root, mods)
+            base = fp()
+            self.assertRegex(base, r"^[0-9a-f]{16}$")
+            self.assertEqual(fp(), base)
+            # unrelated: another node, another module
+            with open(os.path.join(root, "soc/gpu@0/status"), "wb") as f:
+                f.write(b"okay\0")
+            with open(os.path.join(mods, "nvme", "notes", ".note.gnu.build-id"), "ab") as f:
+                f.write(b"\xdd")
+            self.assertEqual(fp(), base)
+            # the serializer node a link points at (the J615's receiver delay)
+            with open(os.path.join(root, "soc/i2s@2a3400000/apple,rx-delay-bclks"), "wb") as f:
+                f.write(bytes.fromhex("00000001000000010000000000000000"))
+            with_prop = fp()
+            self.assertNotEqual(with_prop, base)
+            # a rebuilt sound module under the same kernel release (its
+            # build ID; srcversion where the module has one)
+            with open(os.path.join(mods, "snd_soc_apple_mca", "notes", ".note.gnu.build-id"), "r+b") as f:
+                f.seek(16)
+                f.write(b"\xee" * 20)
+            rebuilt_id = fp()
+            self.assertNotEqual(rebuilt_id, with_prop)
+            with open(os.path.join(mods, "snd_soc_apple_mca", "srcversion"), "w") as f:
+                f.write("EEEE\n")
+            self.assertNotEqual(fp(), rebuilt_id)
+            rebuilt = fp()
+            self.assertNotEqual(rebuilt, with_prop)
+            # an amp node a link points at
+            with open(os.path.join(root, "soc/i2c@0/codec@38/ti,imon-slot-no"), "wb") as f:
+                f.write(be(4))
+            self.assertNotEqual(fp(), rebuilt)
+            self.assertEqual(wiring.audio_stack("nowhere", root, mods), "-")
+
+    def test_the_bind_carries_it(self):
+        rec = {"schema": 1, "version": 1, "result": "pass", "board": "j615", "kernel": "k", "params_sha256": "ab",
+               "wiring": "a46e56034fa096f0", "audio": "0123456789abcdef", "card": "AppleJ615", "amps": 6, "sense": 12,
+               "family": "sn012776", "key": "j615", "method": "derived", "reasons": []}
+        self.assertIn("audio=0123456789abcdef", sgsc.bind_lines(rec).splitlines())
+        del rec["audio"]
+        self.assertIn("audio=-", sgsc.bind_lines(rec).splitlines())
+
+
 class Record(unittest.TestCase):
     def test_bind_lines_are_what_the_supervisor_parses(self):
         rec = {"schema": 1, "version": 1, "result": "fail", "board": "j316s", "kernel": "k", "params_sha256": "ab",
@@ -1282,6 +1691,41 @@ class Record(unittest.TestCase):
         self.assertEqual(len([l for l in lines if l.startswith("reason=")]), 1)
         self.assertTrue(all("=" in l for l in lines))
 
+
+    def test_a_record_carries_only_the_gate_cap_never_the_volume(self):
+        # no cap is no line; a cap (0 dB included) is volume_cap_cdb; the
+        # volume itself is the card's ceiling, so no record names it
+        rec = {"schema": 1, "version": 3, "result": "pass", "board": "j873g", "kernel": "k", "params_sha256": "ab",
+               "wiring": "d1d62e8a0aaaef3d", "card": "AppleJ873", "amps": 1, "sense": 0, "family": "sn012776",
+               "key": "j873", "method": "derived-nosense", "reasons": []}
+        for r in (rec, dict(rec, volume_cap_cdb=None)):
+            self.assertFalse(any(l.startswith("volume_") for l in sgsc.bind_lines(r).splitlines()))
+        for cap in (0, -1600):
+            lines = sgsc.bind_lines(dict(rec, volume_cap_cdb=cap)).splitlines()
+            self.assertEqual([l for l in lines if l.startswith("volume_")], [f"volume_cap_cdb={cap}"])
+
+
+class OperatingVolumeCap(unittest.TestCase):
+    """gate.json operating_volume_cap_db: a cap that can only lower the
+    ceiling the card reports under the grant, never a volume of its own.
+    No board, the J873g included, carries one: its -16 dB is the card's."""
+
+    def test_shipped_gate_names_no_board(self):
+        self.assertEqual(gen.load_gate()["operating_volume_cap_db"], {})
+        self.assertNotIn("operating_volume_db", gen.load_gate())
+        for board in ("j316s", "j413", "j616s", "j700", "j773g", "j813", "j815", "j873g"):
+            self.assertIsNone(gen.operating_volume_cap_db(board), board)
+
+    def test_malformed_values_refuse_the_board(self):
+        for v in (1.0, 0.5, -40.5, True, "-16", [-16]):
+            with self.assertRaises(wiring.Refused, msg=repr(v)):
+                gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": v}})
+        with self.assertRaises(wiring.Refused):
+            gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": [-16]})
+        self.assertIsNone(gen.operating_volume_cap_db("j873g", {}))
+        self.assertIsNone(gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": None}}))
+        self.assertEqual(gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": -40}}), -40.0)
+        self.assertEqual(gen.operating_volume_cap_db("j873g", {"operating_volume_cap_db": {"j873g": 0}}), 0.0)
 
 class BoundRecord(unittest.TestCase):
     """A bound pass is reused only with its record (the graph is generated
@@ -1428,7 +1872,7 @@ class Deferral(unittest.TestCase):
         self.w["method"] = "derived-static" if static else "derived"
         self.desc = wiring.describe(self.hw, self.w)
 
-    def run_sc(self, *argv, kernel="7.3.0-test"):
+    def run_sc(self, *argv, kernel="7.3.0-test", audio="a1a1a1a1a1a1a1a1", card=None, live=True):
         def active(idx, card, w, report, args=None):
             self.calls.append("active")
             return list(self.hw_errs)
@@ -1441,7 +1885,9 @@ class Deferral(unittest.TestCase):
         with mock.patch.object(sgsc, "lv2_shadows", return_value=self.shadows), \
                 mock.patch.object(sgsc, "derive_live", return_value=(self.hw, self.w, self.desc, [])), \
                 mock.patch.object(sgsc, "blob_rate", return_value=self.w["rate"]), \
-                mock.patch.object(sgsc, "find_card", return_value=(0, self.desc["card"])), \
+                mock.patch.object(sgsc, "audio_of", return_value=audio), \
+                mock.patch.object(sgsc, "find_card", return_value=(0, card or self.desc["card"])), \
+                mock.patch.object(sgsc.wiring, "live_card", return_value=(0, card or self.desc["card"]) if live else None), \
                 mock.patch.object(sgsc, "active", side_effect=active), \
                 mock.patch.object(sgsc, "static", side_effect=static), \
                 mock.patch.object(sgsc.os, "uname", return_value=fake), \
@@ -1476,6 +1922,65 @@ class Deferral(unittest.TestCase):
         self.assertEqual(self.calls, ["active"])
         self.assertEqual(self.run_sc("pending"), 0)
         self.assertEqual(self.bind()["kernel"], "7.3.0-test")
+
+    def test_a_changed_audio_stack_is_checked_again(self):
+        # J615: the same kernel release with the stock MCA module (sense one
+        # bit clock late) and with the fixed one. A pass bound to one never
+        # covers the other.
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
+        self.assertEqual(self.bind()["audio"], "a1a1a1a1a1a1a1a1")
+        self.assertEqual(self.run_sc("run", "--defer"), 0)
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("pending"), 1)
+        self.assertEqual(self.run_sc("run", "--defer", audio="b2b2b2b2b2b2b2b2"), 0)
+        self.assertEqual(self.run_sc("pending"), 0, "the switch test is due again")
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("run", audio="b2b2b2b2b2b2b2b2"), 0)
+        self.assertEqual(self.calls, ["active", "active"])
+        self.assertEqual(self.bind()["audio"], "b2b2b2b2b2b2b2b2")
+
+    def test_a_changed_card_id_is_checked_again(self):
+        # The graph opens hw:CARD=<id>: a pass bound to one card id is not
+        # reused when the card bound to the sound node has another, and the
+        # new record, its machine description and the generated graph all
+        # carry the running card's id.
+        import gen
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
+        self.assertEqual(self.bind()["card"], self.desc["card"])
+        self.assertEqual(self.run_sc("run", "--defer", card="AppleJ413Renamed"), 0)
+        self.assertEqual(self.run_sc("pending"), 0, "the switch test is due again")
+        self.assertEqual(self.calls, ["active"])
+        self.assertEqual(self.run_sc("run", card="AppleJ413Renamed"), 0)
+        self.assertEqual(self.calls, ["active", "active"])
+        self.assertEqual(self.bind()["card"], "AppleJ413Renamed")
+        with open(os.path.join(self.state, "selfcheck.json")) as f:
+            report = json.load(f)
+        self.assertEqual(report["record"]["card"], "AppleJ413Renamed")
+        self.assertEqual(report["machine"]["card"], "AppleJ413Renamed")
+        w = report["wiring"]
+        conf = gen.pipewire_conf(w["key"], dict(report["machine"], board=report["record"]["board"]),
+                                 (w["unit_channels"], w["sense_ports"], w["hash"]), "test", voicing_pre=False)
+        self.assertIn("hw:CARD=AppleJ413Renamed", conf)
+        self.assertNotIn(f"hw:CARD={self.desc['card']},", conf)
+        # a card not bound yet (an AOP card after this unit) cannot
+        # contradict the record: the pass is reused
+        self.assertEqual(self.run_sc("pending", "--clear"), 0)
+        self.assertEqual(self.run_sc("run", "--defer", live=False), 0)
+        self.assertEqual(self.run_sc("pending"), 1)
+        self.assertEqual(self.calls, ["active", "active"])
+
+    def test_a_pass_without_an_audio_stack_is_not_reused(self):
+        # a record from before the audio stack was bound
+        self.assertEqual(self.run_sc("run"), 0)
+        path = os.path.join(self.state, "selfcheck.bind")
+        with open(path) as f:
+            old = "".join(l for l in f if not l.startswith("audio="))
+        with open(path, "w") as f:
+            f.write(old)
+        self.assertEqual(self.run_sc("run"), 0)
+        self.assertEqual(self.calls, ["active", "active"])
 
     def test_a_failed_switch_test_after_login_fails_closed(self):
         self.assertEqual(self.run_sc("run", "--defer"), 0)
@@ -1543,6 +2048,227 @@ class GatePath(unittest.TestCase):
             with mock.patch.object(gen, "GATE_PATHS", (os.path.join(d, "missing.json"),)):
                 with self.assertRaises(FileNotFoundError):
                     gen.voicing_enabled("j413")
+
+
+class DumpRefusalReason(unittest.TestCase):
+    """A strict dump that the reader refuses names the reason (the journal
+    is all a user on a muted Mac sees)."""
+
+    def run_dump(self, rc, stdout, stderr=""):
+        r = mock.Mock(returncode=rc, stdout=stdout, stderr=stderr)
+        with mock.patch.object(wiring.subprocess, "run", return_value=r):
+            with self.assertRaises(wiring.Refused) as e:
+                wiring.tuning_dump(["bundle"], strict=True)
+        return str(e.exception)
+
+    def test_load_error_diagnostics(self):
+        out = json.dumps({"items": [
+            {"severity": "warning", "code": "w", "context": "x", "message": "ignored"},
+            {"severity": "error", "code": "load", "context": "DSP database",
+             "message": "speaker ID unknown (no speaker_id in the bundle manifest and no /chosen/asahi,speaker-id)"},
+        ]})
+        m = self.run_dump(1, out)
+        self.assertIn("(exit 1): load: speaker ID unknown (no speaker_id", m)
+        self.assertNotIn("ignored", m)
+
+    def test_errors_in_a_loaded_dump(self):
+        out = json.dumps({"tuning": {}, "diagnostics": {"items": [
+            {"severity": "error", "code": "spp3-channel-count", "context": "x", "message": "2 != 4"}]}})
+        self.assertIn("spp3-channel-count: 2 != 4", self.run_dump(1, out))
+
+    def test_no_json_falls_back_to_stderr(self):
+        self.assertIn("(exit 1): boom", self.run_dump(1, "", "line\nboom\n"))
+
+
+class Capabilities(unittest.TestCase):
+    """The capability probe (wiring.probe): every value the description
+    uses comes from the machine, says where from, and the board is an
+    identity only."""
+
+    PREFIXES = ("dt:", "alsa:", "driver:", "tuning:", "derived:")
+
+    def test_every_capability_has_a_machine_source(self):
+        for m in gen.machines():
+            f = fx(m)
+            w = wiring.derive(f["hw"], f["tuning"])
+            rep = wiring.caps_report(wiring.probe(f["hw"], None, w))
+            for k, v in rep.items():
+                self.assertTrue(v["source"].startswith(self.PREFIXES), f"{m} {k}: {v['source']!r}")
+            for k in ("transport", "amps", "family", "sense_path", "card", "speaker_format", "unit", "rate"):
+                self.assertIn(k, rep, m)
+
+    def test_the_board_selects_nothing(self):
+        # the same hardware and tuning under another board name: every
+        # capability but the identity is the same, and so is the description
+        for m in gen.machines():
+            f = fx(m)
+            w = wiring.derive(f["hw"], f["tuning"])
+            h = copy.deepcopy(f["hw"])
+            h["board"] = "j999"
+            h["compatible"] = ["apple,j999"] + h["compatible"][1:]
+            a = wiring.caps_report(wiring.probe(f["hw"], None, w))
+            b = wiring.caps_report(wiring.probe(h, None, w))
+            a.pop("board"), b.pop("board")
+            self.assertEqual(a, b, m)
+            da, db = wiring.describe(f["hw"], w), wiring.describe(h, w)
+            self.assertEqual(db.pop("board"), "j999")
+            da.pop("board")
+            self.assertEqual(da, db, m)
+
+    def test_sense_path_from_the_back_ends_dma_names(self):
+        f = j773g()
+        c = wiring.probe(f["hw"])
+        self.assertFalse(c["sense_path"].value)
+        self.assertIn("'sense'", c["sense_path"].source)
+        self.assertEqual(c["sense_slots"].value, 0)
+        f = j773g(("spkr", "sense", "cout", "cin"))
+        c = wiring.probe(f["hw"])
+        self.assertTrue(c["sense_path"].value)
+        self.assertEqual(c["sense_slots"].value, 2)
+        # no dma-names: the family's sense stands, to be proven on the card
+        c = wiring.probe(j773g(None)["hw"])
+        self.assertTrue(c["sense_path"].value)
+        self.assertIn("silent sense test", c["sense_path"].source)
+        # dma-names that name neither channel: the same, and the source
+        # does not claim the sense channel is named
+        c = wiring.probe(j773g(("tx", "rx"))["hw"])
+        self.assertTrue(c["sense_path"].value)
+        self.assertIn("silent sense test", c["sense_path"].source)
+        self.assertNotIn("(names", c["sense_path"].source)
+
+    def test_driver_capabilities_by_family(self):
+        self.assertEqual(wiring.probe(fx("j316")["hw"])["fault_status"].value, True)
+        self.assertEqual(wiring.probe(fx("j293")["hw"])["fault_status"].value, False)
+        j700 = wiring.probe(fx("j700")["hw"])
+        self.assertEqual((j700["gain_control"].value, j700["fault_status"].value), (False, False))
+        self.assertEqual(j700["sense_path"], wiring.Cap(False, "driver:max98360a returns no V/I sense"))
+
+    def test_unknown_blocks_refuse(self):
+        f = fx("j413")
+        h = copy.deepcopy(f["hw"])
+        next(l for l in h["links"] if l["name"] in ("Speaker", "Speakers"))["cpu_compatible"] = [["vendor,new-dai"]] * 2
+        with self.assertRaises(wiring.Refused):
+            wiring.probe(h)
+        h = copy.deepcopy(f["hw"])
+        for c in next(l for l in h["links"] if l["name"] in ("Speaker", "Speakers"))["codecs"]:
+            c["compatible"] = ["vendor,new-amp"]
+        with self.assertRaises(wiring.Refused):
+            wiring.probe(h)
+
+    def _sysfs(self, d, dt, card_of, idx=1, cid="AppleJ413Real"):
+        sysfs, proc = os.path.join(d, "sys"), os.path.join(d, "proc")
+        os.makedirs(os.path.join(sysfs, f"card{idx}", "device"))
+        os.symlink(os.path.join(dt, card_of), os.path.join(sysfs, f"card{idx}", "device", "of_node"))
+        open(os.path.join(sysfs, f"card{idx}", f"controlC{idx}"), "w").close()
+        os.makedirs(os.path.join(proc, f"card{idx}"))
+        with open(os.path.join(proc, f"card{idx}", "id"), "w") as fh:
+            fh.write(cid + "\n")
+        return sysfs, proc
+
+    def test_the_running_cards_own_id(self):
+        import tempfile
+
+        f = fx("j413")
+        with tempfile.TemporaryDirectory() as d:
+            dt = os.path.join(d, "dt")
+            os.makedirs(dt)
+            fake_dt(dt, f["hw"], jack_card=True)
+            hw = wiring.read_dt(dt, sysfs=os.path.join(d, "none"))
+            # a card on another node (the jack card) is not the speaker card
+            sysfs, proc = self._sysfs(d, dt, "sound-jack", idx=0, cid="AppleJack")
+            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
+            os.makedirs(os.path.join(sysfs, "card1", "device"))
+            os.symlink(os.path.join(dt, "sound"), os.path.join(sysfs, "card1", "device", "of_node"))
+            open(os.path.join(sysfs, "card1", "controlC1"), "w").close()
+            os.makedirs(os.path.join(proc, "card1"))
+            with open(os.path.join(proc, "card1", "id"), "w") as fh:
+                fh.write("AppleJ413Real\n")
+            live = wiring.live_card(hw, dt, sysfs, proc)
+            self.assertEqual(live, (1, "AppleJ413Real"))
+            w = wiring.derive(hw, f["tuning"])
+            c = wiring.probe(hw, live, w)
+            self.assertEqual(c["card"].value, "AppleJ413Real")
+            self.assertTrue(c["card"].source.startswith("alsa:card1"))
+            self.assertEqual(wiring.describe(hw, w, live)["card"], "AppleJ413Real")
+            # offline, macaudio's name from the model
+            self.assertEqual(wiring.describe(hw, w)["card"], wiring.card_id(hw))
+            self.assertTrue(wiring.probe(hw)["card"].source.startswith("dt:"))
+        self.assertIsNone(wiring.live_card(hw, "/nonexistent", "/nonexistent"))
+
+    def test_a_card_still_registering_is_not_bound_yet(self):
+        # snd_card_register() adds the card device (its id and of_node link)
+        # first, the control device controlCN after the card's other
+        # devices, and the card's proc entries last. Until both are there
+        # the card is "not bound yet" (None): provisioning keeps waiting and
+        # the self-check keeps its record. The sysfs id is read first; an id
+        # that exists but cannot be read refuses with its path.
+        import tempfile
+
+        f = fx("j413")
+        with tempfile.TemporaryDirectory() as d:
+            dt = os.path.join(d, "dt")
+            os.makedirs(dt)
+            fake_dt(dt, f["hw"])
+            hw = wiring.read_dt(dt, sysfs=os.path.join(d, "none"))
+            sysfs, proc = self._sysfs(d, dt, "sound", idx=1)
+            with open(os.path.join(sysfs, "card1", "id"), "w") as fh:
+                fh.write("AppleJ413Sys\n")
+            self.assertEqual(wiring.live_card(hw, dt, sysfs, proc), (1, "AppleJ413Sys"))
+            self.assertTrue(wiring.card_registered(os.path.join(sysfs, "card1"), proc))
+            # no proc entries yet (the id in sysfs is already there)
+            os.rename(os.path.join(proc, "card1", "id"), os.path.join(d, "proc-id"))
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "card1"), proc))
+            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
+            # nor the control device: the Neo's window (speakerguardd#235)
+            os.unlink(os.path.join(sysfs, "card1", "controlC1"))
+            os.rename(os.path.join(d, "proc-id"), os.path.join(proc, "card1", "id"))
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "card1"), proc))
+            self.assertIsNone(wiring.live_card(hw, dt, sysfs, proc))
+            # a kernel without ALSA's proc interface: the control device decides
+            self.assertFalse(wiring.card_registered(os.path.join(sysfs, "card1"), os.path.join(d, "no-proc")))
+            open(os.path.join(sysfs, "card1", "controlC1"), "w").close()
+            self.assertTrue(wiring.card_registered(os.path.join(sysfs, "card1"), os.path.join(d, "no-proc")))
+            self.assertEqual(wiring.live_card(hw, dt, sysfs, proc), (1, "AppleJ413Sys"))
+            os.unlink(os.path.join(sysfs, "card1", "id"))
+            os.makedirs(os.path.join(sysfs, "card1", "id"))
+            with self.assertRaises(wiring.Refused) as e:
+                wiring.live_card(hw, dt, sysfs, proc)
+            self.assertIn(os.path.join(sysfs, "card1", "id"), str(e.exception))
+
+    def test_back_end_nodes_are_recorded_for_the_report(self):
+        import tempfile
+
+        f = fx("j316")
+        with tempfile.TemporaryDirectory() as d:
+            fake_dt(d, f["hw"])
+            hw = wiring.read_dt(d, sysfs=os.path.join(d, "none"))
+        link = next(l for l in hw["links"] if l["name"] in ("Speaker", "Speakers"))
+        self.assertEqual(len(link["cpu_nodes"]), link["cpus"])
+        self.assertIn(link["cpu_nodes"][0], wiring.probe(hw)["transport"].source)
+
+    def test_caps_command(self):
+        import contextlib
+        import io
+        import tempfile
+
+        f = fx("j616")
+        with tempfile.TemporaryDirectory() as d:
+            hwp, tp = os.path.join(d, "hw.json"), os.path.join(d, "t.json")
+            json.dump(f["hw"], open(hwp, "w"))
+            json.dump(f["tuning"], open(tp, "w"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(wiring.main(["caps", "--hw", hwp]), 0)
+            rep = json.loads(out.getvalue())
+            self.assertEqual(rep["transport"]["value"], "aop-spkr")
+            self.assertNotIn("unit", rep)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(wiring.main(["caps", "--hw", hwp, "--tuning-json", tp]), 0)
+            self.assertIn("unit", json.loads(out.getvalue()))
+            # --live with no card bound to the node refuses (exit 2)
+            with mock.patch.object(wiring, "live_card", return_value=None), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(wiring.main(["caps", "--hw", hwp, "--live"]), 2)
 
 
 if __name__ == "__main__":

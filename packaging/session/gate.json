@@ -1,5 +1,5 @@
 {
-  "_doc": "Board qualification is derived: every protection type in the graph (including LSID) must compile without refusals and be in this build's units_at_parity, the silent DT/tuning wiring self-check must pass for this board, blob hash and kernel release, and the verified extraction record must bind the tuning to this Mac's own macOS. Missing, failed or stale records keep the speakers muted on v2 kernels. denied_boards and board_overrides (allow/deny) are policy only: deny wins, and allow never bypasses compilation, parity, provenance or self-check. Provisioning and self-check may run before qualification; only a current qualified record admits the supervisor. LSID is not at parity: K114/K116 remain muted.",
+  "_doc": "Board qualification is derived: every protection type in the graph (including LSID) must compile without refusals and be in this build's units_at_parity, the silent DT/tuning wiring self-check must pass for this board, blob hash and kernel release, and the verified extraction record must bind the tuning to this Mac's own macOS. Missing, failed or stale records keep the speakers muted on v2 kernels. denied_boards and board_overrides (allow/deny) are policy only: deny wins, and allow never bypasses compilation, parity, provenance or self-check. Provisioning and self-check may run before qualification; only a current qualified record admits the supervisor. LSID is at parity only where the compiler releases it: a companion whose estimator is never run, beside a complete LSM2 model (the four-lane J713/J813 tunings), runs on that static model. A companion the compiler still mutes (lsm2-release-gated, e.g. the six-lane K114/K116) fails provisioning, so those boards stay muted.",
   "_voicing_pre_doc": "Full generated voicing deployment overrides per physical board: literal true enables it, false keeps the interim convolver. At runtime a board without an override automatically compiles its own full chain; offline fixture artifacts retain their recorded mode. SPP3V owns promotion after numerical/acoustic qualification. Provision again after any change.",
   "voicing_pre": {
     "j316s": true,
@@ -7,16 +7,116 @@
     "j616s": true,
     "j700": true
   },
-  "_voicing_pre_bound_doc": "2026-11-08 Plan A RC5 (bound.py on the RC5 tree's full-chain safety scan; j413 from the default (exact LowFlow) build; j700 from the AID44 voicing VLS, never-above PASS): j316s -0.0, j413 woofers -0.043 / tweeters -0.0, j616s -0.0, j700 0 dB. A 0 means that board voicing is at parity on every scan row. History: 2026-11-08 Plan A SHIP (bound.py on the RC4 tree's full-chain safety scan against corrected macOS references: the DSP-database strip for each Mac's speaker ID (M1 Pro spid 0 = general_0) and the property strip (M2 AULowFlow 6620); j413 default exact-LowFlow build; j700 from the AID44 voicing VLS): j316s 0, j413 woofers -0.041 (bursts woofer velocity 1.0013x, VirtBass/Tone onset precision) / tweeters 0, j616s 0, j700 0 dB. The RC/RC4 j316s -0.097 and j413 -0.884 came from references that were not the macOS chain. A 0 means that board voicing is at parity on every scan row. History: 2026-11-08 Plan A RC4 (bound.py on the RC4 tree's full-chain safety scan; j413 from the default (exact LowFlow) build; j700 from the AID44 voicing VLS, never-above PASS): j316s -0.097, j413 woofers -0.884 / tweeters -0.0, j616s -0.0, j700 0 dB. A 0 means that board voicing is at parity on every scan row. History: 2026-11-08 Plan A RC (bound.py on the full-chain safety scan of the RC tree; M2 with the exact LowFlow build; j700 from the AID44 voicing VLS): j316s -0.097, j413 woofers -0.883 / tweeters 0.0, j616s 0.0, j700 0.0 dB. A 0 means that board voicing is at parity on every scan row. History: Interim never-louder bound (Ryan 2026-11-07: Plan A tonight on all four boards, open laws in their never-louder form): one gain in dB per unit lane, applied by the PipeWire voicing graph after the voicing plugin, so no lane of the generated voicing is louder than macOS while the Comp onset/param-69 (all four), AID44 q2 detector laws are still open (j413 woofers: -1.09 dB since the exact LowFlow landed, 2026-11-08, covering the Comp onset excess the exact LowFlow now passes through). Derived from the full-chain safety scan (packaging: bound.py = worst louder excess + 0.03 dB, L/R pairs equal) for j316s/j413/j616s and from the AID44 voicing-level VLS gate for j700; protection is unchanged and governs. Each entry goes when its board's laws are exact.",
+  "_voicing_pre_bound_doc": "Keyed by the speaker identity the tuning bundle names (its AID), not the board (2026-11-21): AID13 (the J413's speakers) woofers -0.043 / tweeters 0. The 0 dB entries (AID9, AID35, AID44) had no effect and are dropped; the values are unchanged. What it is: an interim never-louder bound, one gain in dB (<= 0) per unit lane, applied by the PipeWire voicing graph after the voicing plugin, so that no lane of the generated voicing is louder than macOS while a voicing law is still open. It is derived from our full-chain safety scan of v2's voicing against the macOS chain's own render (bound.py: worst louder excess + 0.03 dB, L/R pairs equal); protection is unchanged and governs. Each entry goes when its speaker's laws are exact. History: 2026-11-07 first bounds on four boards while the Comp onset/param-69 and the AID44 q2 detector laws were open (J413 woofers -1.09 dB). 2026-11-08: J413 woofers -0.883/-0.884 dB and J316s -0.097 dB came from references that were not the macOS chain; against corrected references (each Mac's DSP-database strip for its speaker ID, and the property strip) the J413 woofers need -0.041 dB (woofer bursts at velocity 1.0013x, VirtBass/Tone onset precision) and every other lane 0; re-run on the next tree: J413 woofers -0.043 dB, all else 0. A 0 means that lane is at parity on every scan row.",
   "voicing_pre_bound_db": {
-    "j316s": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "j413": [-0.043, -0.043, 0.0, 0.0],
-    "j616s": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "j700": [0.0, 0.0]
+    "AID13": [-0.043, -0.043, 0.0, 0.0]
   },
-  "_voicing_pre_lowpass_doc": "INTERIM never-louder band limit, not a macOS law (AUD-CUT2 2026-11-07, Ryan's parity rule: never-louder is fine as interim). {hz, order}: an even-order Butterworth low-pass built from PipeWire bq_lowpass sections in FRONT of the voicing plugin. j700 only: v2's AID44 ControlFreak lacks the AU's reconstruction low-pass, so above ~17 kHz the box is up to +23 dB (+30 dB at 0 dBFS) louder than macOS and its saturation aliases a loud high-frequency input into 9-16.5 kHz; the lane trim cannot hold either. 17.4 kHz order 8 (with the j700 trim): AID44 box rig (installed AU, 362 tones/pink/steps incl. 16-23.75 kHz probes) 0 louder cases, worst -0.58 dB; full AID44 voicing VLS 30 Hz-19.5 kHz 0 louder bands, worst -0.03 dB; cost at 16 kHz -0.1 dB. Goes when the ControlFreak law is exact (Daybreak t-5511). 2026-11-08: no board carries it; the AID44 ControlFreak saturation, reconstruction and drive laws are exact on the box rig (steady and 20 kHz), so the j700 trim alone (-0.35 dB from the AID44 VLS, worst +0.311) holds.",
+  "_voicing_pre_lowpass_doc": "Keyed by the bundle's speaker identity (AID<n>), like voicing_pre_bound_db (2026-11-21). Interim never-louder band limit, not a macOS law. {hz, order}: an even-order Butterworth low-pass built from PipeWire bq_lowpass sections in FRONT of the voicing plugin. History: 2026-11-07, J700 only: v2's AID44 ControlFreak lacked the AU's reconstruction low-pass, so above ~17 kHz the box was up to +23 dB (+30 dB at 0 dBFS) louder than macOS and its saturation aliased a loud high-frequency input into 9-16.5 kHz; the lane trim could hold neither. 17.4 kHz order 8 (with the J700 trim): AID44 box rig (installed AU, 362 tones/pink/steps incl. 16-23.75 kHz probes) 0 louder cases, worst -0.58 dB; full AID44 voicing VLS 30 Hz-19.5 kHz 0 louder bands, worst -0.03 dB; cost at 16 kHz -0.1 dB. 2026-11-08: the AID44 ControlFreak saturation, reconstruction and drive laws are exact on the box rig (steady and 20 kHz), so no speaker carries the low-pass; the mechanism stays for a future open law.",
   "voicing_pre_lowpass": {},
-  "units_at_parity": ["spp3", "lsm2", "atsp"],
+  "_operating_volume_cap_doc": "Per board: a cap on the operating volume, dB on the amp volume control's own TLV, from -40 to 0. It only lowers what the machine reports and is never a value of its own: the operating volume is the ceiling the card reports under the grant (every amp volume's TLV maximum: 0 dB, or on a machine whose speaker only a lease may lift, macaudio spk_fixed_ceiling, that ceiling: the J873g's -16 dB, aurora-silicon/linux#1862). The self-check records the cap (selfcheck.bind volume_cap_cdb); the supervisor grants only while every amp sits exactly at the card's ceiling and that ceiling is at or below the cap. A card that reports no ceiling is never granted, with or without an entry here. No board needs one today; anything malformed refuses the board.",
+  "operating_volume_cap_db": {},
+  "units_at_parity": ["spp3", "lsm2", "atsp", "lsid"],
+  "_playback_rows_doc": "Protected playback rows on record, by the tuning bundle's speaker identity (AID<n>, as identify names it). A row is sound played through speakerguardd v2's protection on that speaker and measured with V/I sense and the Mac's own microphone. covers: 'loud-step' = a step to full volume (slider 1.0); 'thermal-ramp' = a sustained hold long enough for the thermal model to climb (minutes), with the protection's temperatures and gain recorded. A speaker is proven when its rows (each with evidence) cover playback_covers; a silent self-check pass is not a playback row. Two users: provisioning refuses a graph with a protection type in units_need_playback_rows on a speaker that is not proven (LSID's static release, which runs the four-lane J713/J813 tunings open loop on their LSM2 model, so unproven speakers like AID42 stay muted until rows exist), and aurora-speaker-upgrade's boot unit moves no unproven speaker from the older daemons to v2 (by hand, `run` still can). A speaker with no rows (AID42) is not proven. Add a row only with its evidence.",
+  "playback_covers": ["loud-step", "thermal-ramp"],
+  "units_need_playback_rows": ["lsid"],
+  "playback_rows": {
+    "AID12": [
+      {
+        "date": "2026-11-25",
+        "board": "j473",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 288 s (pink noise, -18 dBFS), supervisor kill -9 at 150 s of 1.0, v2 thermal readback every second and V/I sense capture; speakerguardd-v2 0.59 (6c714e3b) with the speakerguardd#262 session helper on the fleet89 kernel (AID12 tuning from the macOS 27.2 26B123 restore image via aurora-speaker-upgrade)",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j473 ladder 2026-11-25 09:10-09:33 AEDT (https://gist.github.com/RyanTheTide/c008e4a963ba607de990a168560128cf): granted at every step, no protection event; sense I / V RMS -39.8 / -39.9, -29.6 / -29.5, -22.6 / -21.8 dBFS at 0.3 / 0.6 / 1.0; coil / magnet rise +44 / +52 K by the end of 1.0 with the thermal hold engaging (slow gain -0.1 dB from ~240 s, -0.37 dB at 288 s); kill -9: protection withdrawn 22 ms later, re-granted 1.1 s after the kill with the thermal state carried"
+      }
+    ],
+    "AID9": [
+      {
+        "date": "2026-11-07",
+        "board": "j316s",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s, mic capture, supervisor kill during the hold; v2 0.15 on the fleet20 kernel",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "lab row 2026-11-07 18:44 (m1pro ladder, fleet20): no amp or TDM fault; woofer temperature model reached 140.6 C and the limiter held -4.9 dB on all four woofers; tweeter closed-loop tracking stayed idle (not a safety fault)"
+      }
+    ],
+    "AID13": [
+      {
+        "date": "2026-11-07",
+        "board": "j413",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s, mic capture, supervisor kill during the hold; v2 0.15 on the fleet20 kernel",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "lab row 2026-11-07 18:34 (m2 ladder, fleet20): no amp or TDM fault; woofer temperature model reached 139.5 / 141.5 C and the limiter held -3.29 dB"
+      }
+    ],
+    "AID21": [
+      {
+        "date": "2026-11-26",
+        "board": "j615",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s (pink noise, -18 dBFS RMS), built-in mic capture; speakerguardd-v2 0.58 (b3aaa4a7) on the fleet85 kernel (AID21 tuning from the macOS 27.2 26B123 restore image via aurora-speaker-upgrade)",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j615 ladder 2026-11-26 07:57 UTC (https://gist.github.com/RyanTheTide/cbdd315bdd7929e147ecbd7de5be12d1): 40,732 engine records, lost 0, health_or 0x0, gain 0 dB, 0 amp faults on all 6 amps; closed-loop woofer DCR 3.93-4.19 ohm at 0.3 (= calibration) rising to 4.72-4.81 ohm; coil closed-loop max 103.4 C, open-loop model max 118.2 C, limiter not needed; mic -20 / -10 / -2 dBFS"
+      }
+    ],
+    "AID35": [
+      {
+        "date": "2026-11-07",
+        "board": "j616s",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s, mic capture, supervisor kill during the hold; v2 0.15 on the fleet20 kernel",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "lab row 2026-11-07 18:57 (j616s ladder, fleet20): no amp or TDM fault; closed-loop woofer temperature max 134.3 C, the thermal limit adjust held at its cap and the limiter at -3.33 dB"
+      }
+    ],
+    "AID37": [
+      {
+        "date": "2026-11-25",
+        "board": "j713",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s (-8 dBFS pink noise), built-in mic capture, supervisor kill -9 at 270 s; speakerguardd-v2 1.0.0alpha.2-9 (80b02063) on linux-aurora 7.3.0.aurora1-41 (macOS 26B131 AID37 tuning)",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j713 ladder 2026-11-25 19:35 EST: 39,275 records, lost=0, health_or=0x0, 0 amp/TDM faults (0,0,0 across all 4 sn012776 amps); woofer coil max 102.15 / 100.51 C (1.669 / 1.595 W), tweeter coil max 133.28 / 133.42 C (0.407 / 0.400 W), LSM2 limiter held -1.09 dB equilibrium at ~132.5 C; mic capture -31.5 / -33.1 dBFS; kill -9 withdrew protection at once (1 start refused), restored saved thermal state, and re-granted lease in 1.415 s"
+      }
+    ],
+    "AID44": [
+      {
+        "date": "2026-11-07",
+        "board": "j700",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s, mic capture, supervisor kill -9 at 150 s; v2 e1a9518 (lsm2) on the fleet18 kernel",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "lab row 2026-11-07 15:15 (neo ladder): health 0x0, 0 lost frames, 0 amp or TDM fault; coil model max 51.7 / 52.2 C against the 135 C limit, model power max 0.285 W; lease granted again 0.818 s after the kill"
+      }
+    ],
+    "AID48": [
+      {
+        "date": "2026-11-27",
+        "board": "j873g",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s (-8 dBFS RMS stereo pink noise) through sgv2#voicing-1ch -> sgv2#1ch (atsp), supervisor kill -9 at 300.2 s; speakerguardd v2 5bd2d652 on 7.3.0-aurora-j873-speaker+ (linux#3434 18a0e3bcd3f7) and Aura 1.0.0b17-gc83bcb7f (aura#548), AID48 tuning from macOS 27.2 26B123",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "j873g ladder 2026-11-27 21:29 CET: 39,990 engine records (512-frame quantum), lost=0, health_or=0x0, 0 amp/TDM faults (Amp Fault Status 0,0,0 before/during/after); open-loop coil model climbed from 50.00 C to 114.99 C max (magnet max 84.52 C, modeled power max 3.402 W, gain 0.00 dB), cooling smoothly after stop; kill -9 at 300.2 s immediately withdrew protection and dropped Speaker Volume to 0, supervisor offered saved thermal state (pre-kill 106.45 C -> post-kill 105.63 C) and re-granted in 0.488 s (0 starts refused), idle released cleanly to muted floor; 0 kernel audio/DART errors, 0 failed units"
+      }
+    ]
+  },
   "denied_boards": [],
   "board_overrides": {}
 }

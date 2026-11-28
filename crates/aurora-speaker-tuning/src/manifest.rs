@@ -113,6 +113,22 @@ pub struct Manifest {
     pub mask_lattice: Option<Record>,
     pub param_fill: Option<Record>,
     pub param_fill_unit_versions: Vec<u32>,
+    /// The BuzzKill detector's quadrature matrix the installer extracted
+    /// from the Mac's AudioDSP ([`crate::buzzmatrix`]); `None` when the
+    /// installer could not read it or the bundle predates it.
+    pub buzzkill_quadrature: Option<Record>,
+}
+
+/// The installer's `buzzkill_quadrature` record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuzzkillJson {
+    path: String,
+    bytes: u64,
+    sha256: String,
+    version: u32,
+    format: String,
+    sections: u32,
 }
 
 /// The installer's `lsm2_mask_lattice` record.
@@ -181,6 +197,9 @@ struct InstallerJson {
     lsm2_mask_lattice: Option<LatticeJson>,
     #[serde(default)]
     lsm2_param_fill: Option<FillJson>,
+    /// Optional: only present when the installer read it.
+    #[serde(default)]
+    buzzkill_quadrature: Option<BuzzkillJson>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +219,7 @@ impl Manifest {
             .chain(self.shared.iter())
             .chain(self.mask_lattice.iter())
             .chain(self.param_fill.iter())
+            .chain(self.buzzkill_quadrature.iter())
     }
 
     /// Parses `manifest.json` (installer).
@@ -315,6 +335,36 @@ impl Manifest {
                 (Some(Record { path: f.path, bytes: f.bytes, sha256: f.sha256 }), f.unit_versions)
             }
         };
+        let buzzkill_quadrature = match j.buzzkill_quadrature {
+            None => None,
+            Some(q) => {
+                use crate::buzzmatrix;
+                if q.path != buzzmatrix::NAME
+                    || q.bytes != buzzmatrix::SIZE as u64
+                    || q.version != buzzmatrix::VERSION
+                    || q.format != buzzmatrix::FORMAT
+                    || q.sections as usize != buzzmatrix::SECTIONS
+                {
+                    return Err(Error::format(
+                        NAME,
+                        format!(
+                            "buzzkill_quadrature is {:?}, {} bytes, version {}, format {:?}, {} sections; expected {:?}, {}, {}, {:?}, {}",
+                            q.path,
+                            q.bytes,
+                            q.version,
+                            q.format,
+                            q.sections,
+                            buzzmatrix::NAME,
+                            buzzmatrix::SIZE,
+                            buzzmatrix::VERSION,
+                            buzzmatrix::FORMAT,
+                            buzzmatrix::SECTIONS
+                        ),
+                    ));
+                }
+                Some(Record { path: q.path, bytes: q.bytes, sha256: q.sha256 })
+            }
+        };
         let prefix = format!("{}/", j.aid);
         let folder = j.files.iter().filter(|r| r.path.starts_with(&prefix)).count() as u64;
         if j.source_file_count == 0 || j.source_file_count != folder {
@@ -339,6 +389,7 @@ impl Manifest {
             mask_lattice,
             param_fill,
             param_fill_unit_versions,
+            buzzkill_quadrature,
         };
         m.check(NAME)?;
         Ok(m)
@@ -373,6 +424,7 @@ impl Manifest {
             mask_lattice: None,
             param_fill: None,
             param_fill_unit_versions: Vec::new(),
+            buzzkill_quadrature: None,
         };
         m.check(COLLECTOR_NAME)?;
         Ok(m)

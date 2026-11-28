@@ -37,7 +37,7 @@
 //!   to release, 31.0 ms to the floor, on 0d7ee6c). An XRUN is now held
 //!   for the sink's recovery, up to the heartbeat bound (see `observe`).
 //! - With nothing playing (no grant, no demand) for half a second it goes
-//!   idle (see `pace`): the pollers read every 100 ms and the loop ticks
+//!   idle (see `pace`): the pollers read every second and the loop ticks
 //!   every 250 ms or when the helper renames a new report into place, and
 //!   the loop drops its frequency floor. A demand wakes everything to full
 //!   rate before it can lead to a grant.
@@ -73,11 +73,14 @@ mod linux {
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
         speaker_pcm_problem, EngineState, EngineView, Observer, PcmInfo, PcmState, PcmView, SessionReport, SessionView,
     };
-    use sgv2_supervisor::pace::{self, Change, Pace};
+    use sgv2_supervisor::pace::{self, Change, Pace, ReadyNote, Spell};
     use sgv2_supervisor::selfcheck;
     use sgv2_supervisor::supervise::{Event, Expect, Fatal, Supervisor};
 
     const TICK_NS: u64 = 10_000_000;
+    // The idle tick refreshes the engine page's Amps::Held word; keep it
+    // within half of AMPS_STALE_NS so pre-roll never sees an expired word.
+    const _: () = assert!(pace::IDLE_TICK_NS * 2 <= sgv2_lv2::page::AMPS_STALE_NS);
     /// How long the speaker PCM runs before the plugin lets a wake's held
     /// frames out: two quanta, about the lead macOS gives its speaker engine
     /// before a client's first frame (1172 frames at 48 kHz,
@@ -400,23 +403,265 @@ mod linux {
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
     }
 
-    /// A watch on the helper's directory: a new report (renamed into place)
-    /// wakes the idle loop at once. None where it cannot be watched; the
-    /// loop then keeps its 10 ms tick while idle.
-    fn watch_reports(dir: &Path) -> Option<i32> {
-        use std::os::unix::ffi::OsStrExt;
-        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-        // SAFETY: plain syscalls on a descriptor we own.
-        unsafe {
-            let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
-            if fd < 0 {
-                return None;
+    const WATCH_RETRY_NS: u64 = 1_000_000_000;
+
+    fn libc_inotify_add_watch(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+        // SAFETY: plain inotify syscall on a descriptor and NUL-terminated path we own.
+        unsafe { libc::inotify_add_watch(fd, path, mask) }
+    }
+
+    /// A watch on the helper's directory and its ancestors up to the
+    /// supervisor's own runtime root (so system directories like `/run` are
+    /// never watched under SELinux): a new report renamed into place wakes the
+    /// idle loop at once. Ancestors above the runtime root still have their
+    /// `(dev, ino)` identity checked on every tick. If any watched or checked
+    /// directory is removed, moved, or the queue overflows, the watch drops to
+    /// inactive so the loop keeps its 10 ms tick until `rearm()` binds the
+    /// replacement directory. Failed rearm attempts back off to at most once
+    /// per second (`WATCH_RETRY_NS`).
+    struct ReportWatch {
+        dir: PathBuf,
+        stop_at: PathBuf,
+        fd: Option<i32>,
+        watched: Vec<(PathBuf, (u64, u64))>,
+        checked: Vec<(PathBuf, (u64, u64))>,
+        retry_after_ns: u64,
+        add_watch: fn(i32, *const libc::c_char, u32) -> i32,
+    }
+
+    fn dir_identity(dir: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(dir).ok()?;
+        (!m.file_type().is_symlink() && m.is_dir()).then(|| (m.dev(), m.ino()))
+    }
+
+    /// Adjust the next tick's deadline after leaving slow idle (e.g. watch
+    /// loss on an unscheduled wake), after re-arming a previously lost watch
+    /// (to catch reports written before the new watch bound), or on leaving
+    /// idle for a demand.
+    fn adjust_deadline(mut deadline: u64, now: u64, slow: bool, rearmed: bool, woke: bool) -> u64 {
+        if !slow && deadline > now.saturating_add(TICK_NS) {
+            deadline = now.saturating_add(TICK_NS);
+        }
+        if rearmed {
+            deadline = now;
+        }
+        if woke {
+            deadline = now.saturating_add(pace::WAKE_TICK_NS);
+        }
+        deadline
+    }
+
+    /// Drain an inotify fd; true if any watched directory moved, was deleted,
+    /// was ignored, or the queue overflowed.
+    fn drain_inotify_invalidated(fd: i32) -> bool {
+        let mut buf = [0u8; 4096];
+        let mut invalidated = false;
+        let hdr = core::mem::size_of::<libc::inotify_event>();
+        loop {
+            // SAFETY: reading into our own buffer from a non-blocking inotify fd.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
             }
-            if libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE) < 0 {
-                libc::close(fd);
-                return None;
+            let mut off = 0usize;
+            let end = n as usize;
+            while off + hdr <= end {
+                // SAFETY: `off + hdr <= end`, unaligned read of POD struct.
+                let ev = unsafe { core::ptr::read_unaligned(buf.as_ptr().add(off).cast::<libc::inotify_event>()) };
+                if ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_IGNORED | libc::IN_Q_OVERFLOW) != 0 {
+                    invalidated = true;
+                }
+                let step = hdr.saturating_add(ev.len as usize);
+                if step == 0 || off + step > end {
+                    break;
+                }
+                off += step;
             }
-            Some(fd)
+        }
+        invalidated
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WatchState {
+        Down,
+        Retained,
+        Rebuilt,
+    }
+
+    impl ReportWatch {
+        fn new(dir: PathBuf, stop_at: PathBuf) -> Self {
+            Self::with_add_watch(dir, stop_at, libc_inotify_add_watch, now_ns())
+        }
+
+        fn with_add_watch(
+            dir: PathBuf,
+            stop_at: PathBuf,
+            add_watch: fn(i32, *const libc::c_char, u32) -> i32,
+            now: u64,
+        ) -> Self {
+            let mut w =
+                Self { dir, stop_at, fd: None, watched: Vec::new(), checked: Vec::new(), retry_after_ns: 0, add_watch };
+            let _ = w.rearm(now);
+            w
+        }
+
+        fn fd(&self) -> Option<i32> {
+            self.fd
+        }
+
+        fn close(&mut self) {
+            if let Some(fd) = self.fd.take() {
+                // SAFETY: closing our own inotify fd.
+                unsafe { libc::close(fd) };
+            }
+            self.watched.clear();
+            self.checked.clear();
+        }
+
+        fn valid(&self) -> bool {
+            self.fd.is_some()
+                && !self.watched.is_empty()
+                && self.checked.iter().all(|(d, id)| dir_identity(d) == Some(*id))
+        }
+
+        fn rearm(&mut self, now: u64) -> WatchState {
+            use std::os::unix::ffi::OsStrExt;
+            if self.valid() {
+                self.retry_after_ns = 0;
+                return WatchState::Retained;
+            }
+            self.close();
+            if now < self.retry_after_ns {
+                return WatchState::Down;
+            }
+            let fail = |w: &mut Self| -> WatchState {
+                w.retry_after_ns = now.saturating_add(WATCH_RETRY_NS);
+                WatchState::Down
+            };
+            if !self.dir.is_absolute()
+                || !self.stop_at.is_absolute()
+                || self.stop_at == Path::new("/")
+                || !self.dir.starts_with(&self.stop_at)
+                || self.dir.components().any(|c| matches!(c, std::path::Component::ParentDir))
+                || self.stop_at.components().any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return fail(self);
+            }
+            let mut watched = Vec::new();
+            let mut seen_watched = Vec::new();
+            let mut checked = Vec::new();
+            let mut seen_checked = Vec::new();
+            let mut past_stop = false;
+            for anc in self.dir.ancestors() {
+                if anc.as_os_str().is_empty() || anc == Path::new("/") {
+                    break;
+                }
+                let Some(id) = dir_identity(anc) else { return fail(self) };
+                if !seen_checked.contains(&id) {
+                    seen_checked.push(id);
+                    checked.push((anc.to_path_buf(), id));
+                }
+                if !past_stop {
+                    if !seen_watched.contains(&id) {
+                        seen_watched.push(id);
+                        watched.push((anc.to_path_buf(), id));
+                    }
+                    if anc == self.stop_at {
+                        past_stop = true;
+                    }
+                }
+            }
+            if !past_stop || watched.is_empty() {
+                return fail(self);
+            }
+            // SAFETY: plain inotify syscalls on descriptors we own.
+            unsafe {
+                let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+                if fd < 0 {
+                    return fail(self);
+                }
+                let leaf_mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+                let anc_mask = libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
+                for (i, (dir, id)) in watched.iter().enumerate() {
+                    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+                        libc::close(fd);
+                        return fail(self);
+                    };
+                    let mask = if i == 0 { leaf_mask } else { anc_mask };
+                    if (self.add_watch)(fd, path.as_ptr(), mask) < 0 || dir_identity(dir) != Some(*id) {
+                        libc::close(fd);
+                        return fail(self);
+                    }
+                }
+                if !checked.iter().all(|(d, id)| dir_identity(d) == Some(*id)) {
+                    libc::close(fd);
+                    return fail(self);
+                }
+                self.fd = Some(fd);
+                self.watched = watched;
+                self.checked = checked;
+                self.retry_after_ns = 0;
+                WatchState::Rebuilt
+            }
+        }
+
+        fn drain(&mut self) {
+            let Some(fd) = self.fd else { return };
+            if drain_inotify_invalidated(fd) || !self.valid() {
+                self.close();
+            }
+        }
+
+        /// Wait until `deadline`, `wake` eventfd, or a report event; drops and
+        /// invalidates the watch if the helper directory or an ancestor went
+        /// away so the caller immediately falls back to the 10 ms tick.
+        fn wait_until(&mut self, deadline: u64, wake: i32) -> bool {
+            let Some(rfd) = self.fd else {
+                return wait_until(deadline, &[wake]);
+            };
+            let mut pfds = [
+                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: rfd, events: libc::POLLIN, revents: 0 },
+            ];
+            loop {
+                let now = now_ns();
+                if now >= deadline {
+                    return false;
+                }
+                let left = deadline - now;
+                let ts =
+                    libc::timespec { tv_sec: (left / 1_000_000_000) as i64, tv_nsec: (left % 1_000_000_000) as i64 };
+                // SAFETY: two live pollfds and a valid timeout.
+                let r = unsafe { libc::ppoll(pfds.as_mut_ptr(), 2, &ts, core::ptr::null()) };
+                if r > 0 {
+                    let mut woke = false;
+                    if pfds[0].revents & libc::POLLIN != 0 {
+                        drain(wake);
+                        woke = true;
+                    }
+                    if pfds[1].revents != 0 {
+                        if pfds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+                            || drain_inotify_invalidated(rfd)
+                            || !self.valid()
+                        {
+                            self.close();
+                        }
+                        woke = true;
+                    }
+                    pfds[0].revents = 0;
+                    pfds[1].revents = 0;
+                    if woke {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for ReportWatch {
+        fn drop(&mut self) {
+            self.close();
         }
     }
 
@@ -451,16 +696,50 @@ mod linux {
             let v = self.verdict.load(Ordering::Acquire);
             v == verdict_word(pid, start, true) && now.saturating_sub(at) <= HELPER_CHECK_MAX_NS
         }
+
+        /// Whether `helper` is missing or was already checked dead within
+        /// `SESSION_STALE_NS`.
+        fn vouched_dead(&self, helper: Option<(u32, u64)>, now: u64) -> bool {
+            let Some((pid, start)) = helper else { return true };
+            let at = self.checked_ns.load(Ordering::Acquire);
+            let v = self.verdict.load(Ordering::Acquire);
+            v == verdict_word(pid, start, false) && now.saturating_sub(at) <= sgv2_supervisor::observe::SESSION_STALE_NS
+        }
+    }
+
+    /// Whether an idle tick's raw session report carries a fresh demand that
+    /// should wake the pollers from their idle pace so the next active tick
+    /// can vouch for the writer at full rate. Never grants on its own.
+    fn wake_for_demand(r: &SessionReport, live: &HelperLive, now: u64) -> bool {
+        r.present
+            && r.demand
+            && r.mono_ns <= now.saturating_add(sgv2_supervisor::observe::SESSION_SKEW_NS)
+            && now.saturating_sub(r.mono_ns) <= sgv2_supervisor::observe::SESSION_STALE_NS
+            && !live.vouched_dead(r.helper, now)
     }
 
     /// The helper's report and its writer's liveness. The report is read on
     /// the RT path (a tmpfs file, never blocking); the writer is checked
     /// against /proc by the reader thread.
-    struct Session(std::ffi::CString, Arc<HelperLive>);
+    struct Session {
+        path: std::ffi::CString,
+        live: Arc<HelperLive>,
+        last_raw: SessionReport,
+    }
+    impl Session {
+        fn new(path: std::ffi::CString, live: Arc<HelperLive>) -> Self {
+            Self { path, live, last_raw: SessionReport::default() }
+        }
+
+        fn wake_demand(&self, now: u64) -> bool {
+            wake_for_demand(&self.last_raw, &self.live, now)
+        }
+    }
     impl SessionView for Session {
         fn read(&mut self) -> SessionReport {
-            let mut r = read_report(&self.0);
-            r.helper_alive = self.1.vouches(r.helper, now_ns());
+            let mut r = read_report(&self.path);
+            self.last_raw = r;
+            r.helper_alive = self.live.vouches(r.helper, now_ns());
             r
         }
     }
@@ -1083,8 +1362,8 @@ mod linux {
                 return EX_UNAVAILABLE;
             }
         };
-        let reports = watch_reports(&helper);
-        if reports.is_none() {
+        let mut reports = ReportWatch::new(helper.clone(), run_dir.to_path_buf());
+        if reports.fd().is_none() {
             eprintln!("cannot watch {}: the loop keeps its 10 ms tick while idle", helper.display());
         }
         // before SCHED_FIFO: the reader runs at normal priority
@@ -1114,16 +1393,17 @@ mod linux {
         }
         let mut engine = Page(page);
         let mut pcm_view = PcmLatest(snapshot);
-        let mut session = Session(session_path, live);
+        let mut session = Session::new(session_path, live);
         let mut observer = Observer::new(engine_crc, header.sample_rate, TICK_NS);
         observer.expect_wiring(bind.wiring);
-        let mut sup = Supervisor::new(Expect::new(machine, full_scales, &info.id));
+        let mut sup =
+            Supervisor::new(Expect::new(machine, full_scales, &info.id).with_volume_cap_cdb(bind.volume_cap_cdb));
         let mut deadline = now_ns();
         let mut ticks = 0u64;
         let mut last_problem: Option<String> = None;
         let mut last_wiring: Option<Option<u64>> = None;
-        // every check holds and nothing plays: reported once per idle spell
-        let mut idle_ready = false;
+        // "protection ready", once per spell (see `pace::ReadyNote`)
+        let mut ready_note = ReadyNote::default();
         // when the speaker PCM was first seen running under this grant, and
         // whether the amps play (told to the plugin every tick)
         let mut running_since: Option<u64> = None;
@@ -1197,10 +1477,15 @@ mod linux {
             // which records any failure as its problem
             let card_ok = sup.problem().is_none() && sup.latched_fault().is_none();
             let ready = card_ok && !demand_seen && Observation { route_ok: true, amps_ok: true, ..obs }.clean();
-            if ready && !idle_ready && !matches!(event, Ok(Event::Idle)) {
+            let spell = match event {
+                Ok(Event::Idle) => Spell::GivenBack,
+                Ok(Event::Granted | Event::Released { .. } | Event::HardFault(_) | Event::Lapsed) => Spell::New,
+                _ if demand_seen || sup.problem() != last_problem.as_deref() => Spell::New,
+                _ => Spell::Same,
+            };
+            if ready_note.tick(ready, spell) {
                 eprintln!("protection ready: every check holds, granted while a stream plays");
             }
-            idle_ready = ready;
             match event {
                 Ok(Event::Idle) => {
                     regrant.released(now_ns(), false);
@@ -1316,7 +1601,9 @@ mod linux {
             // schedutil then raises the cluster to its top step on every
             // tick, for nothing to do. With a stream it keeps the default.
             let mut woke = false;
-            match pace.after_tick(now_ns(), sup.granted() || demand_seen) {
+            let now = now_ns();
+            let wake_demand = pace.idle() && session.wake_demand(now);
+            match pace.after_tick(now, sup.granted() || demand_seen || wake_demand) {
                 Change::Idle => {
                     poll_pace.set_idle(true);
                     set_util_min(0);
@@ -1332,11 +1619,14 @@ mod linux {
             // Idle, the protect stage stops with the last stream, so there is
             // no heartbeat to prove; that every other check holds is said once.
             let idle_ok = card_ok && obs.plugin_ok && obs.links_ok && obs.carrier_ok;
-            if pace.idle() && idle_ok && !idle_ready && !idle_ready_said {
+            if pace.idle() && idle_ok && !ready && !idle_ready_said {
                 eprintln!("protection ready: every check holds; the protect stage idles until a stream starts");
                 idle_ready_said = true;
             }
-            let slow = pace.idle() && reports.is_some();
+            let watch_state = reports.rearm(now_ns());
+            let watch_live = watch_state != WatchState::Down;
+            let rearmed = watch_state == WatchState::Rebuilt;
+            let slow = pace.idle() && watch_live;
             let tick_ns = if slow { pace::IDLE_TICK_NS } else { TICK_NS };
             if scheduled {
                 if slow || ticks % 20 == 0 {
@@ -1351,19 +1641,14 @@ mod linux {
                     deadline = now;
                 }
             }
-            if woke {
-                // the woken pollers read now; tick once they have
-                deadline = now_ns() + pace::WAKE_TICK_NS;
-            }
+            deadline = adjust_deadline(deadline, now_ns(), slow, rearmed, woke);
             // an extra tick when the PCM reader (or, idle, a new report)
             // wakes us; the deadlines are unchanged
-            scheduled = match reports {
-                Some(r) if slow => !wait_until(deadline, &[wake, r]),
-                Some(r) => {
-                    drain(r);
-                    !wait_until(deadline, &[wake])
-                }
-                None => !wait_until(deadline, &[wake]),
+            scheduled = if slow {
+                !reports.wait_until(deadline, wake)
+            } else {
+                reports.drain();
+                !wait_until(deadline, &[wake])
             };
         }
     }
@@ -1436,6 +1721,176 @@ mod linux {
             live.publish(77, 1234, true, 3_000);
             live.verdict.store(verdict_word(77, 1234, true), Ordering::Release);
             assert!(live.vouches(Some((77, 1234)), 3_000));
+        }
+
+        #[test]
+        fn idle_demand_wakes_pollers_even_after_idle_helper_verdict_ages_out() {
+            let live = HelperLive::default();
+            let now = 5_000_000_000u64;
+            let mut r = SessionReport {
+                present: true,
+                links_ok: true,
+                carrier_ok: true,
+                mono_ns: now - 1_000_000,
+                helper: Some((77, 1234)),
+                helper_alive: false,
+                wiring: None,
+                demand: true,
+            };
+            // Idle checker last ran 900 ms ago (> HELPER_CHECK_MAX_NS): vouches()
+            // is false, yet a fresh play=1 report must wake the pollers.
+            live.publish(77, 1234, true, now - 900_000_000);
+            assert!(!live.vouches(r.helper, now));
+            assert!(wake_for_demand(&r, &live, now));
+            // play=0, stale mono_ns, future mono_ns, or missing helper never wake.
+            r.demand = false;
+            assert!(!wake_for_demand(&r, &live, now));
+            r.demand = true;
+            r.mono_ns = now - sgv2_supervisor::observe::SESSION_STALE_NS - 1;
+            assert!(!wake_for_demand(&r, &live, now));
+            r.mono_ns = now + sgv2_supervisor::observe::SESSION_SKEW_NS + 1;
+            assert!(!wake_for_demand(&r, &live, now));
+            r.mono_ns = now - 1_000_000;
+            r.helper = None;
+            assert!(!wake_for_demand(&r, &live, now));
+            // A helper already checked dead does not keep waking the pollers.
+            r.helper = Some((77, 1234));
+            live.publish(77, 1234, false, now - 10_000_000);
+            assert!(!wake_for_demand(&r, &live, now));
+            // A new helper pid/start does wake the pollers to check it.
+            r.helper = Some((78, 5678));
+            assert!(wake_for_demand(&r, &live, now));
+        }
+
+        #[test]
+        fn report_watch_invalidates_on_dir_replace_and_rearms() {
+            let base = std::env::temp_dir().join(format!("sgv2-repwatch-{}", std::process::id()));
+            let uid_dir = base.join("1000");
+            let helper = uid_dir.join("helper");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&helper).unwrap();
+            let mut t = 10_000_000_000u64;
+            let mut w = ReportWatch::with_add_watch(helper.clone(), base.clone(), libc_inotify_add_watch, t);
+            assert!(w.fd().is_some());
+            assert_eq!(w.rearm(t), WatchState::Retained);
+            // Same-tick directory replacement (without an intervening drain)
+            // must report WatchState::Rebuilt immediately so the loop rereads.
+            let old = uid_dir.join("helper.old");
+            std::fs::rename(&helper, &old).unwrap();
+            std::fs::create_dir_all(&helper).unwrap();
+            assert_eq!(w.rearm(t), WatchState::Rebuilt);
+            assert_eq!(w.rearm(t), WatchState::Retained);
+            // Removing the helper directory invalidates the watch so the loop
+            // drops back to the 10 ms tick until it exists again.
+            std::fs::remove_dir_all(&helper).unwrap();
+            w.drain();
+            assert!(w.fd().is_none());
+            assert_eq!(w.rearm(t), WatchState::Down);
+            // Recreating the directory stays backed off until WATCH_RETRY_NS
+            // has elapsed, then re-arms and wakes wait_until on rename.
+            std::fs::create_dir_all(&helper).unwrap();
+            assert_eq!(w.rearm(t + 10_000_000), WatchState::Down);
+            t += WATCH_RETRY_NS;
+            assert_eq!(w.rearm(t), WatchState::Rebuilt);
+            assert!(w.fd().is_some());
+            let tmp = helper.join(".session.tmp");
+            std::fs::write(&tmp, b"play=1\n").unwrap();
+            std::fs::rename(&tmp, helper.join("session")).unwrap();
+            let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            assert!(wake >= 0);
+            assert!(w.wait_until(now_ns() + 200_000_000, wake));
+            unsafe { libc::close(wake) };
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn report_watch_stops_at_runtime_root_and_backs_off_on_failure() {
+            use std::sync::Mutex;
+            static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+            static FAIL_WATCH: AtomicBool = AtomicBool::new(false);
+
+            fn spy_add_watch(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+                // SAFETY: `path` is a valid NUL-terminated string from `ReportWatch`.
+                let cstr = unsafe { std::ffi::CStr::from_ptr(path) };
+                let p = PathBuf::from(cstr.to_string_lossy().into_owned());
+                RECORDED.lock().unwrap().push(p);
+                if FAIL_WATCH.load(Ordering::Acquire) {
+                    return -1;
+                }
+                libc_inotify_add_watch(fd, path, mask)
+            }
+
+            let base = std::env::temp_dir().join(format!("sgv2-repwatch-stop-{}", std::process::id()));
+            let uid_dir = base.join("1000");
+            let helper = uid_dir.join("helper");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&helper).unwrap();
+
+            // 1. Ancestor walk stops at `stop_at` (`base`) and never watches
+            // system parents like `/tmp` or `/run`.
+            RECORDED.lock().unwrap().clear();
+            FAIL_WATCH.store(false, Ordering::Release);
+            let t0 = 20_000_000_000u64;
+            let w = ReportWatch::with_add_watch(helper.clone(), base.clone(), spy_add_watch, t0);
+            assert!(w.fd().is_some());
+            assert_eq!(*RECORDED.lock().unwrap(), vec![helper.clone(), uid_dir.clone(), base.clone()]);
+            drop(w);
+
+            // 2. When `inotify_add_watch` fails on an ancestor (e.g. SELinux
+            // denial on the last ancestor after earlier watches succeeded),
+            // partial watches are closed, the watch stays Down, and retries
+            // happen at most once per WATCH_RETRY_NS.
+            fn spy_fail_last_ancestor(fd: i32, path: *const libc::c_char, mask: u32) -> i32 {
+                // SAFETY: `path` is a valid NUL-terminated string from `ReportWatch`.
+                let cstr = unsafe { std::ffi::CStr::from_ptr(path) };
+                let p = PathBuf::from(cstr.to_string_lossy().into_owned());
+                RECORDED.lock().unwrap().push(p.clone());
+                if FAIL_WATCH.load(Ordering::Acquire)
+                    && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sgv2-repwatch-stop-"))
+                {
+                    return -1;
+                }
+                libc_inotify_add_watch(fd, path, mask)
+            }
+
+            RECORDED.lock().unwrap().clear();
+            FAIL_WATCH.store(true, Ordering::Release);
+            let mut w = ReportWatch::with_add_watch(helper.clone(), base.clone(), spy_fail_last_ancestor, t0);
+            assert!(w.fd().is_none());
+            // All three watches (helper, uid_dir, base) were attempted before
+            // failing on `base` and closing the fd.
+            assert_eq!(RECORDED.lock().unwrap().len(), 3);
+            // 99 ticks inside the 1 s backoff window make zero extra syscalls.
+            for step in 1..100u64 {
+                assert_eq!(w.rearm(t0 + step * TICK_NS), WatchState::Down);
+            }
+            assert_eq!(RECORDED.lock().unwrap().len(), 3);
+            // At t0 + WATCH_RETRY_NS, one retry runs and backs off again.
+            assert_eq!(w.rearm(t0 + WATCH_RETRY_NS), WatchState::Down);
+            assert_eq!(RECORDED.lock().unwrap().len(), 6);
+            assert_eq!(w.rearm(t0 + WATCH_RETRY_NS + TICK_NS), WatchState::Down);
+            assert_eq!(RECORDED.lock().unwrap().len(), 6);
+            // Once the failure clears, the next due retry succeeds.
+            FAIL_WATCH.store(false, Ordering::Release);
+            assert_eq!(w.rearm(t0 + 2 * WATCH_RETRY_NS), WatchState::Rebuilt);
+            assert!(w.fd().is_some());
+            drop(w);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn watch_loss_clamps_slow_deadline_and_rearm_rereads_immediately() {
+            let now = 10_000_000_000u64;
+            let far = now + 900_000_000;
+            // Watch lost while asleep on a 1 s deadline: clamp to TICK_NS (10 ms).
+            assert_eq!(adjust_deadline(far, now, false, false, false), now + TICK_NS);
+            // Still slow with a live watch: keep the 1 s deadline unchanged.
+            assert_eq!(adjust_deadline(far, now, true, false, false), far);
+            // Watch re-armed after being down: tick immediately to reread any
+            // report renamed before the new watch bound.
+            assert_eq!(adjust_deadline(far, now, true, true, false), now);
+            // Waking for demand always schedules WAKE_TICK_NS (2 ms).
+            assert_eq!(adjust_deadline(far, now, false, true, true), now + pace::WAKE_TICK_NS);
         }
     }
 }

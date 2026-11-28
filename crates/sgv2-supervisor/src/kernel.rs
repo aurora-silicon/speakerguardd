@@ -91,13 +91,24 @@ impl KernelError {
 
 /// One amp's level control, read back: its raw value and, from the
 /// control's dB TLV, the level in hundredths of a dB (`None`: no dB scale,
-/// or muted).
+/// or muted), the level at the control's maximum and the size of one
+/// control step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AmpLevel {
     /// The amp's control prefix, for example "Left Woofer 1".
     pub amp: String,
     pub value: i64,
     pub centi_db: Option<i32>,
+    /// One control step in hundredths of a dB, from the same TLV (`None`:
+    /// no fixed-step dB scale). The operating-point match is held to half
+    /// of it, so the tolerance is the card's own, not an assumed step.
+    pub step_centi_db: Option<i32>,
+    /// The level at the control's current maximum, hundredths of a dB on
+    /// the same TLV (`None`: no dB scale there). Under a grant this is the
+    /// highest volume the kernel lets the amp reach: macaudio limits every
+    /// amp volume to 0 dB, or, on a machine whose speaker only a lease may
+    /// lift (spk_fixed_ceiling, the J873g), to that machine's ceiling.
+    pub max_centi_db: Option<i32>,
 }
 
 /// One amp's fault report.
@@ -163,6 +174,13 @@ pub struct Recorder {
     pub volume: Option<(String, Level, Level)>,
     /// Analog gain per amp, as (value, centi-dB).
     pub gain: Option<(i64, i32)>,
+    /// The dB step every level control's TLV states, centi-dB.
+    pub step_centi_db: Option<i32>,
+    /// The dB at the volume control's maximum while held, when it is not
+    /// the held level's own (`None`, the default: the kernel holds a grant
+    /// at its limit, so the held level is the maximum). While released the
+    /// maximum is the released level, the kernel's floor.
+    pub ceiling: Option<Option<i32>>,
     pub route: Option<String>,
 }
 
@@ -179,6 +197,8 @@ impl Recorder {
             amps,
             volume: Some(("Speaker Volume".into(), (201, Some(0)), (0, None))),
             gain: Some((15, 1850)),
+            // the tas2764 and macaudio TLVs: 0.5 dB a step
+            step_centi_db: Some(50),
             route: Some("Secondary".into()),
             ..Default::default()
         }
@@ -204,15 +224,27 @@ impl Kernel for Recorder {
     }
     fn levels(&mut self, suffix: &str) -> Result<Vec<AmpLevel>, KernelError> {
         let level = if suffix == GAIN_CONTROL_SUFFIX {
-            self.gain.map(|(v, d)| (v, Some(d)))
+            self.gain.map(|(v, d)| (v, Some(d), Some(d)))
         } else {
             match &self.volume {
-                Some((s, on, off)) if s == suffix => Some(if self.held { *on } else { *off }),
+                Some((s, on, _)) if s == suffix && self.held => Some((on.0, on.1, self.ceiling.unwrap_or(on.1))),
+                Some((s, _, off)) if s == suffix => Some((off.0, off.1, off.1)),
                 _ => None,
             }
         };
         Ok(level
-            .map(|(value, centi_db)| self.amps.iter().map(|a| AmpLevel { amp: a.clone(), value, centi_db }).collect())
+            .map(|(value, centi_db, max_centi_db)| {
+                self.amps
+                    .iter()
+                    .map(|a| AmpLevel {
+                        amp: a.clone(),
+                        value,
+                        centi_db,
+                        step_centi_db: self.step_centi_db,
+                        max_centi_db,
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
@@ -236,6 +268,16 @@ pub fn db_scale_centi(tlv: &[u32], value: i64, min_value: i64) -> Option<i32> {
         return None;
     }
     i32::try_from(steps).ok()?.checked_mul(step)?.checked_add(min)
+}
+
+/// One control step, hundredths of a dB, of a `SNDRV_CTL_TLVT_DB_SCALE` TLV.
+/// `None` for any other TLV (no fixed step) or a 0 dB step.
+pub fn db_scale_step(tlv: &[u32]) -> Option<i32> {
+    const DB_SCALE: u32 = 1;
+    if tlv.len() < 4 || tlv[0] != DB_SCALE || tlv[1] < 8 {
+        return None;
+    }
+    Some((tlv[3] & 0xffff) as i32).filter(|s| *s > 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -634,10 +676,14 @@ mod alsa {
                 if info.kind != ELEM_TYPE_INTEGER {
                     continue;
                 }
-                let min = info.value[0] as i64;
+                let (min, max) = (info.value[0] as i64, info.value[1] as i64);
                 let value = self.read(id)?.value[0];
-                let centi_db = self.tlv(id.numid).and_then(|t| db_scale_centi(&t, value, min));
-                out.push(AmpLevel { amp: amp.trim_end().to_owned(), value, centi_db });
+                let tlv = self.tlv(id.numid);
+                let centi_db = tlv.as_deref().and_then(|t| db_scale_centi(t, value, min));
+                let step_centi_db = tlv.as_deref().and_then(db_scale_step);
+                // the maximum as the driver limits it now (snd_soc_limit_volume)
+                let max_centi_db = tlv.as_deref().and_then(|t| db_scale_centi(t, max, min));
+                out.push(AmpLevel { amp: amp.trim_end().to_owned(), value, centi_db, step_centi_db, max_centi_db });
             }
             Ok(out)
         }
@@ -752,6 +798,15 @@ mod tests {
         assert_eq!(db_scale_centi(&dvc, 0, 0), None);
         assert_eq!(db_scale_centi(&[3, 8, 0, 0], 1, 0), None);
         assert_eq!(db_scale_centi(&gain, -1, 0), None);
+        // the step of both, and of the J700's "Speaker Playback Volume"
+        // (-63.5 dB + 0.5 dB a step, mute), as each Mac's kernel reports them
+        assert_eq!(db_scale_step(&gain), Some(50));
+        assert_eq!(db_scale_step(&dvc), Some(50));
+        assert_eq!(db_scale_step(&[1, 8, 0xffff_e732, 0x0001_0032]), Some(50));
+        // no fixed step: another TLV type, a 0 dB step, a short TLV
+        assert_eq!(db_scale_step(&[3, 8, 0, 0]), None);
+        assert_eq!(db_scale_step(&[1, 8, 1100, 0x1_0000]), None);
+        assert_eq!(db_scale_step(&[1, 4, 1100]), None);
     }
 
     #[cfg(target_os = "linux")]
