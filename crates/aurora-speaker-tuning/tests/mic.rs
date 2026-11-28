@@ -355,6 +355,24 @@ fn an_older_beam_preset_without_the_later_controls_is_the_fixed_beam() {
 }
 
 #[test]
+fn automatic_selection_without_the_later_controls_refuses() {
+    // the defaults are characterised for the fixed-beam state only
+    for drop in [42u32, 43] {
+        let mut st = auto_beam_state(&[]);
+        st.sections[0].params.retain(|(id, _)| *id != drop);
+        let mut f = Fixture::new();
+        f.effects[3] = unit_effect("Beam", "bmfd", &st, false, None);
+        let c =
+            mic::compile(&f.tree(&format!("mic-beam-auto-no{drop}")), &partial(), &mut Diagnostics::default()).unwrap();
+        assert!(
+            c.refused() && c.report.refusals.iter().any(|r| r.contains(&format!("control {drop} missing"))),
+            "{drop}: {:?}",
+            c.report.refusals
+        );
+    }
+}
+
+#[test]
 fn a_beam_preset_missing_another_control_refuses() {
     let mut f = Fixture::new();
     f.effects[3] = unit_effect("Beam", "bmfd", &beam_state_without(&[21]), false, None);
