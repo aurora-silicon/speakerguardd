@@ -1,16 +1,28 @@
 # aurora-speaker-upgrade
 
-Moves an existing install's speakers from the legacy protection
-(speakersafetyd, speakerguardd 0.1) to speakerguardd v2 with the Mac's own
-tuning, and back. It ships **disabled**. Turning it on for users waits for
-the maintainers.
+Puts an existing install's speakers on speakerguardd v2 with the Mac's own
+tuning. speakerguardd v2 is the only speaker protection: this tool never
+starts, enables or hands the speakers to an older daemon (speakersafetyd,
+speakerguardd 0.1), and never writes the kernel's interface back to the
+volume lock ("Speaker Volume Unlock"). Where v2 does not run, no speaker
+daemon runs and the kernel's own limit holds the speakers.
 
 ```sh
 sudo aurora-speaker-upgrade            # collect, compile, self-check, switch (idempotent)
 sudo aurora-speaker-upgrade status
 sudo aurora-speaker-upgrade --check [--json F]   # dry run: collect, compile, self-check in /run; nothing stored or switched
-sudo aurora-speaker-upgrade --revert   # back to the legacy protection (--purge drops the bundle)
 ```
+
+On a dual kernel `--check` lends the speakers to the silent switch test
+for a few seconds; an older speaker daemon still running there is stopped
+and stays stopped.
+
+`--revert` and `--purge` are gone: there is no older protection to go back
+to. Both are refused (exit 1) with that reason and change nothing, so an old
+script fails loudly instead of silently doing something else. To stop v2 by
+hand, stop its unit (`systemctl stop speakerguardd`, `speakerguardd-v2` in
+the distributions): the kernel's own limit then holds the speakers. The next
+boot starts it again wherever the gate qualifies the board.
 
 ## What it does
 
@@ -71,12 +83,19 @@ sudo aurora-speaker-upgrade --revert   # back to the legacy protection (--purge 
    own `ExecStartPre=speakerguardd-gate interface` applies it before every
    start (a refused switch fails the start). On kernels with only the v2 interface
    (fleet kernels), the switch only restarts the v2 supervisor. On kernels
-   with only the legacy interface, the tool refuses the switch. If v2 does
-   not take the speakers within 30 s, the tool goes back to the legacy
-   protection. The legacy stack always stays installed.
+   without the v2 interface, the tool refuses the switch. Any older
+   speaker daemon still running on a dual kernel is stopped before the
+   switch and never started again.
+5. **A switch that does not go through** (a refusal, or v2 not taking the
+   speakers within 30 s) removes the setting and provisioning's pointer to
+   the bundle and stops v2; the seat user's session comes back on the
+   distribution's graph. No speaker daemon takes over: the kernel returns
+   to its volume lock by itself 30 s after the last lease closes, at its
+   own limit. On a fleet kernel v2 restarts as it ran before (the
+   installer's bundle, where that qualifies), or nothing runs.
 
-Exit codes: 0 done (or nothing to do), 1 refused (the legacy protection
-keeps the speakers), 2 not now (retry), 3 internal error (nothing switched).
+Exit codes: 0 done (or nothing to do), 1 refused (nothing switched; no older
+daemon starts), 2 not now (retry), 3 internal error (nothing switched).
 
 At boot (`aurora-speaker-upgrade.service`, `run --at-boot`), a refusal is
 recorded in `/var/lib/aurora-speaker-upgrade/refused.json` and not tried
@@ -91,8 +110,8 @@ by the tuning's speaker identity (`AID<n>`), the rows where sound was played
 through v2's protection on that speaker and measured with V/I sense and the
 Mac's own microphone. A speaker counts once its rows cover every item of
 `playback_covers` (a loud step and a thermal ramp). Without that,
-`run --at-boot` leaves the speakers as they are (the legacy protection, or
-what the installer set up), collects nothing and records no refusal; a
+`run --at-boot` leaves the speakers as they are (what the installer set
+up, or the kernel's own limit), collects nothing and records no refusal; a
 silent self-check pass alone is not playback evidence. `run` by hand is not
 limited by the record (v2's provisioning still refuses a protection type
 the gate data holds for playback rows, LSID's static release), and `status`

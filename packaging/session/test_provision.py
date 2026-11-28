@@ -1353,7 +1353,7 @@ class Umask(Base):
 
 
 class Deactivate(Base):
-    def test_revert_removes_the_v2_graph(self):
+    def test_deactivate_removes_the_v2_graph(self):
         os.makedirs(os.path.join(self.p.graph, "pipewire"), exist_ok=True)
         f = os.path.join(self.p.graph, "pipewire", "sgv2-j316.conf")
         prov.write_atomic(f, "context.modules = []\n")
@@ -1366,7 +1366,7 @@ class Deactivate(Base):
         self.assertFalse(os.path.exists(f))
         self.assertFalse(any(os.path.exists(r) for r in raw))
         self.assertFalse(os.path.exists(os.path.join(self.p.graph, "speakerguardd-owns-speakers")))
-        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "legacy")
+        self.assertEqual(prov.read_kv(self.p.graph_state)["result"], "off")
 
 
 class Gate(Base):
@@ -1376,15 +1376,14 @@ class Gate(Base):
             json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, card))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
-        # the gate runs as root on a Mac (ExecCondition=+...); no waits here
-        self.patch(gate, "privileged", lambda: True)
-        self.patch(gate, "STABLE_WAIT_S", 0)
         a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd,
                                   setting=os.path.join(self.t, "upgrade-interface"))
-        v2, legacy, why = gate.decide(a)
+        v2, why = gate.decide(a)
         self.why = why
-        self.assertFalse(v2 and legacy, why)
-        return v2, legacy
+        if not v2:
+            # whenever v2 does not run, nothing runs: never an older daemon
+            self.assertIn(gate.FLOOR, why)
+        return v2
 
     def checked(self, result="pass", **kw):
         sc = load("sc", "speakerguardd-selfcheck")
@@ -1398,37 +1397,36 @@ class Gate(Base):
     def test_first_boot_prepares_but_only_a_current_check_admits_v2(self):
         self.board("j999")
         self.ctl({"board": "j999"})
-        self.assertEqual(self.decide(cmd="prepare"), (True, False))
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(cmd="prepare"), True)
+        self.assertEqual(self.decide(), False)
         self.assertEqual(self.run_(), 0)
         with open(os.path.join(os.path.dirname(self.cli), "calls")) as f:
             self.assertIn("--voicing-pre", f.read())
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
         self.checked()
-        self.assertEqual(self.decide(), (True, False))
-        self.assertEqual(self.decide("legacy"), (False, True))
-        self.assertEqual(self.decide(None), (False, True))
+        self.assertEqual(self.decide(), True)
+        self.assertEqual(self.decide("legacy"), False)
+        self.assertEqual(self.decide(None), False)
         self.checked(result="fail")
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
         self.checked(kernel="another-kernel")
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
         self.checked(board="another-board")
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
         self.checked()
         with open(self.p.params, "ab") as f:
             f.write(b"new-blob")
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
 
-    def test_unreadable_controls_on_a_registered_card_start_neither(self):
+    def test_unreadable_controls_on_a_registered_card_start_nothing(self):
         # the speaker card is there but its controls could not be read in
-        # the wait: no answer, so neither stack starts (never the older
-        # daemons beside v2); no speaker card at all keeps today's answer
+        # the wait: no answer, so nothing starts; nor without a speaker card
         self.board("j999")
         self.ctl({"board": "j999"})
-        for cmd in ("v2", "legacy", "prepare"):
-            self.assertEqual(self.decide(None, cmd=cmd, card="AppleX"), (False, False), cmd)
+        for cmd in ("v2", "prepare"):
+            self.assertEqual(self.decide(None, cmd=cmd, card="AppleX"), False, cmd)
             self.assertIn("could not be read", self.why)
-        self.assertEqual(self.decide(None), (False, True))
+        self.assertEqual(self.decide(None), False)
 
     def test_has_control_tells_a_missing_control_from_a_failed_open(self):
         # only "the card opened and has no such control" is a "no": amixer
@@ -1475,24 +1473,24 @@ class Gate(Base):
         self.assertEqual(self.run_(), 0)
         self.checked()
         setting = os.path.join(self.t, "upgrade-interface")
-        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual"), False)
         with open(setting, "w") as f:
             f.write("legacy\n")
-        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual"), False)
         with open(setting, "w") as f:
             f.write("v2\n")
-        self.assertEqual(self.decide("dual"), (True, False))
-        # a failing proof on a dual kernel keeps the older daemons, never the floor
+        self.assertEqual(self.decide("dual"), True)
+        # a failing proof on a dual kernel starts nothing (the volume lock holds)
         self.checked(result="fail")
-        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual"), False)
         # the v2-only kernel is unchanged
-        self.assertEqual(self.decide("v2"), (False, False))
+        self.assertEqual(self.decide("v2"), False)
         os.unlink(setting)
 
     def test_dual_kernel_switched_mac_waits_for_its_switch_test(self):
-        """A switched Mac on a kernel its switch test has not run on: neither
-        daemon (no older daemon holding the volume lock the test takes); a
-        failed test sends it back to the older daemons."""
+        """A switched Mac on a kernel its switch test has not run on: no
+        supervisor until the test passed (prepare still runs it); a failed
+        test leaves it at the volume lock, with no daemon."""
         setting = os.path.join(self.t, "upgrade-interface")
         self.board("j999")
         self.ctl({"board": "j999"})
@@ -1500,30 +1498,30 @@ class Gate(Base):
         with open(setting, "w") as f:
             f.write("v2\n")
         self.checked(kernel="another-kernel")
-        self.assertEqual(self.decide("dual"), (False, False))
-        self.assertEqual(self.decide("dual", cmd="prepare"), (True, False))
+        self.assertEqual(self.decide("dual"), False)
+        self.assertEqual(self.decide("dual", cmd="prepare"), True)
         self.checked(result="fail")
-        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual"), False)
         self.checked()
-        self.assertEqual(self.decide("dual"), (True, False))
+        self.assertEqual(self.decide("dual"), True)
         os.unlink(setting)
         self.checked(kernel="another-kernel")
-        self.assertEqual(self.decide("dual"), (False, True))
+        self.assertEqual(self.decide("dual"), False)
 
-    def test_dual_kernel_refused_board_keeps_the_older_daemons(self):
+    def test_dual_kernel_refused_board_starts_nothing(self):
         with open(os.path.join(self.t, "upgrade-interface"), "w") as f:
             f.write("v2\n")
         self.board("j999")
         self.ctl({"board": "j999", "refusals": [{"code": "synthetic-refusal"}]})
         self.assertEqual(self.run_(), 1)
-        self.assertEqual(self.decide("dual"), (False, True))
-        self.assertEqual(self.decide("v2"), (False, False))
+        self.assertEqual(self.decide("dual"), False)
+        self.assertEqual(self.decide("v2"), False)
 
-    def test_switched_mac_never_gets_legacy_on_a_transient_answer(self):
-        """RC8 E2E B1: as speakersafetyd's DynamicUser the gate could not read
-        the root-only store and started legacy on a switched Mac. A switched
-        Mac on a dual kernel starts the older daemons only on a stable,
-        definite refusal; an unreadable setting starts nothing."""
+    def test_switched_mac_gets_nothing_on_a_transient_answer(self):
+        """RC8 E2E B1 started speakersafetyd on a switched Mac on a transient
+        answer. There is no older daemon to start now: a switched Mac whose
+        store cannot be read gets no supervisor and no fallback, and an
+        unreadable setting starts nothing."""
         setting = os.path.join(self.t, "upgrade-interface")
         self.board("j999")
         self.ctl({"board": "j999"})
@@ -1531,33 +1529,49 @@ class Gate(Base):
         self.checked()
         with open(setting, "w") as f:
             f.write("v2\n")
-        self.assertEqual(self.decide("dual", cmd="legacy"), (True, False))
-        calls = []
+        self.assertEqual(self.decide("dual"), True)
         real = gate.tuning_units
-
-        def flaky(cli, conf=None):
-            calls.append(1)
-            if len(calls) == 1:
-                raise PermissionError(13, "Permission denied", "/var/lib/aurora-speaker-upgrade/bundle")
-            return real(cli, conf)
-        self.patch(gate, "tuning_units", flaky)
-        self.assertEqual(self.decide("dual", cmd="legacy"), (True, False))
-        self.assertEqual(len(calls), 2, "asked again")
 
         def broken(cli, conf=None):
             raise PermissionError(13, "Permission denied", "/var/lib/aurora-speaker-upgrade/bundle")
         self.patch(gate, "tuning_units", broken)
-        self.assertEqual(self.decide("dual", cmd="legacy"), (False, False))
-        self.assertIn("not starting the older daemons", self.why)
-        # not root: an unreadable store is not an answer
+        self.assertEqual(self.decide("dual"), False)
+        self.assertIn("unqualified", self.why)
         self.patch(gate, "tuning_units", real)
-        self.patch(gate, "privileged", lambda: False)
         os.chmod(setting, 0)
         try:
             if os.geteuid() != 0:
                 self.assertEqual(gate.upgrade_setting(setting), "unreadable")
+                self.assertEqual(self.decide("dual"), False)
+                self.assertIn("cannot read the upgrade's setting", self.why)
         finally:
             os.chmod(setting, 0o600)
+
+    def test_legacy_never_starts_an_older_daemon(self):
+        """`legacy` (a leftover legacy-gate.conf drop-in on speakersafetyd's
+        or speakerguardd 0.1's unit) always answers no, on every kernel and
+        even where v2 itself is not qualified; `explain` names no fallback."""
+        self.board("j999")
+        self.ctl({"board": "j999"})
+        g = os.path.join(self.t, "gate.json")
+        with open(g, "w") as f:
+            json.dump(GATE, f)
+        for iface in ("legacy", "dual", "v2", None):
+            self.patch(gate, "kernel_interface", lambda wait, i=iface, **kw: (i, "AppleX" if i else None))
+            for argv in (["legacy"], ["v2"]):
+                self.patch(gate.sys, "argv", ["speakerguardd-gate", *argv, "--gate", g, "--dt", self.dt,
+                                              "--tuning-cli", self.cli, "--wait", "0", "--state", self.p.state,
+                                              "--setting", os.path.join(self.t, "upgrade-interface")])
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(gate.main(), 1, (iface, argv))
+                if argv == ["legacy"]:
+                    self.assertIn("the older daemons never start", err.getvalue())
+            self.patch(gate.sys, "argv", ["speakerguardd-gate", "explain", "--gate", g, "--dt", self.dt,
+                                          "--tuning-cli", self.cli, "--wait", "0", "--state", self.p.state])
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gate.main(), 0)
+            self.assertTrue(out.getvalue().startswith("v2=0: "), out.getvalue())
+            self.assertNotIn("legacy=", out.getvalue())
 
     def test_interface_switches_only_dual_and_upgraded(self):
         sets = []
@@ -1608,7 +1622,7 @@ class Gate(Base):
             self.assertEqual(pcm.call_count, 1)
             self.assertEqual(sc.cmd_run(args), 0)  # exact binding: no new probe
             self.assertEqual(pcm.call_count, 1)
-            self.assertEqual(self.decide(gate_data=gen.load_gate()), (True, False))
+            self.assertEqual(self.decide(gate_data=gen.load_gate()), True)
             self.assertEqual(sc.cmd_generate(args), 0)
             with open(os.path.join(args.pipewire_dir, "sgv2-j999.conf")) as f:
                 self.assertIn("sgv2#voicing", f.read())
@@ -1652,18 +1666,18 @@ class Gate(Base):
             # Kernel and blob changes re-run the silent check. Until it
             # passes again, the stale graph record cannot admit the board.
             self.checked(kernel="old-kernel")
-            self.assertEqual(self.decide(), (False, False))
+            self.assertEqual(self.decide(), False)
             self.assertEqual(sc.cmd_run(args), 0)
             self.assertEqual(pcm.call_count, 2)
             with open(self.p.params, "ab") as f:
                 f.write(b"changed-blob")
-            self.assertEqual(self.decide(), (False, False))
+            self.assertEqual(self.decide(), False)
             with self.assertRaises(wiring.Refused):
                 sc.cmd_generate(args)
             self.assertEqual(sc.cmd_run(args), 0)
             self.assertEqual(pcm.call_count, 3)
             # A self-check alone cannot approve an uncompiled replacement.
-            self.assertEqual(self.decide(), (False, False))
+            self.assertEqual(self.decide(), False)
 
     def test_a_deferred_run_names_what_the_next_pass_must_bind(self):
         """`run --defer` on a sense board writes the record version and every
@@ -1718,13 +1732,13 @@ class Gate(Base):
             with self.subTest(change=change):
                 self.ctl({"board": "j999", **change})
                 self.assertEqual(self.run_(), 1)
-                self.assertEqual(self.decide(), (False, False))
+                self.assertEqual(self.decide(), False)
         self.ctl({"board": "j999"})
         self.assertEqual(self.run_(), 0)
         self.checked()
-        self.assertEqual(self.decide(), (True, False))
+        self.assertEqual(self.decide(), True)
         self.ctl({"board": "j999", "refusals": [{"code": "new-refusal"}]})
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
 
     def test_foreign_and_unbound_provenance_stays_muted(self):
         self.board("j999")
@@ -1732,27 +1746,27 @@ class Gate(Base):
             with self.subTest(change=change):
                 self.ctl({"board": "j999", **change})
                 self.assertEqual(self.run_(), 1)
-                self.assertEqual(self.decide(), (False, False))
+                self.assertEqual(self.decide(), False)
 
     def test_deny_wins_and_allow_cannot_bypass_proofs_or_parity(self):
         self.assertEqual(self.run_(), 0)
         allow = dict(GATE, board_overrides={"j316s": "allow"})
-        self.assertEqual(self.decide(gate_data=allow), (False, False))
+        self.assertEqual(self.decide(gate_data=allow), False)
         self.checked()
-        self.assertEqual(self.decide(gate_data=allow), (True, False))
-        self.assertEqual(self.decide(gate_data=dict(allow, denied_boards=["j316s"])), (False, False))
-        self.assertEqual(self.decide(gate_data=dict(GATE, board_overrides={"j316s": "deny"})), (False, False))
-        self.assertEqual(self.decide(gate_data=dict(allow, units_at_parity=[])), (False, False))
+        self.assertEqual(self.decide(gate_data=allow), True)
+        self.assertEqual(self.decide(gate_data=dict(allow, denied_boards=["j316s"])), False)
+        self.assertEqual(self.decide(gate_data=dict(GATE, board_overrides={"j316s": "deny"})), False)
+        self.assertEqual(self.decide(gate_data=dict(allow, units_at_parity=[])), False)
         # Old policy switches and the old hand-written allow file do not
         # bypass qualification even if a distribution accidentally keeps them.
         self.checked(result="fail")
         old = dict(GATE, require_qualified_board=False, qualified={"spp3": ["j316s"]})
-        self.assertEqual(self.decide(gate_data=old), (False, False))
+        self.assertEqual(self.decide(gate_data=old), False)
 
     def test_corrupt_or_disagreeing_qualification_records_stay_muted(self):
         self.assertEqual(self.run_(), 0)
         self.checked()
-        self.assertEqual(self.decide(), (True, False))
+        self.assertEqual(self.decide(), True)
         allow = dict(GATE, board_overrides={"j316s": "allow"})
         for change in ({"provenance": "foreign"}, {"compile_refusals": 1}, {"version": 1}):
             with self.subTest(change=change):
@@ -1763,24 +1777,24 @@ class Gate(Base):
                 bind = prov.read_kv(self.p.bind)
                 bind.update({k: str(v) for k, v in change.items()})
                 prov.write_atomic(self.p.bind, "".join(f"{k}={v}\n" for k, v in bind.items()))
-                self.assertEqual(self.decide(gate_data=allow), (False, False))
+                self.assertEqual(self.decide(gate_data=allow), False)
         self.assertEqual(self.run_(), 0)
         prov.write_atomic(self.p.selfcheck_json, "{}")
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
         self.checked()
         os.unlink(self.p.bind)
-        self.assertEqual(self.decide(), (False, False))
+        self.assertEqual(self.decide(), False)
 
     def test_lsid_requires_its_own_build_parity(self):
         policy = dict(GATE, units_at_parity=["spp3", "atsp", "lsm2"])
         for board in ("k114", "k116"):
             self.board(board)
             self.ctl({"board": board, "unit": "lsm2", "lsid": True})
-            self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
-            self.assertEqual(self.decide(gate_data=policy), (False, False))
+            self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), False)
+            self.assertEqual(self.decide(gate_data=policy), False)
         # An allow for a board can never promote LSID itself.
         policy["board_overrides"] = {"k116": "allow"}
-        self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), (False, False))
+        self.assertEqual(self.decide(gate_data=policy, cmd="prepare"), False)
 
     def test_lsid_qualifies_only_when_the_compiler_releases_it(self):
         policy = dict(GATE, units_at_parity=["spp3", "atsp", "lsm2", "lsid"])
@@ -1793,7 +1807,7 @@ class Gate(Base):
                 self.assertEqual(self.run_(), 0 if ok else 1)
                 if ok:
                     self.checked()
-                self.assertEqual(self.decide(gate_data=policy), (ok, False))
+                self.assertEqual(self.decide(gate_data=policy), ok)
 
     def test_lsid_static_release_needs_playback_rows_for_its_speaker(self):
         import gen
@@ -1807,14 +1821,14 @@ class Gate(Base):
                 self.board("j713")
                 self.ctl({"board": "j713", "unit": "lsm2", "lsid": lsid, "aid": aid, "warnings": [released] if lsid else []})
                 # The gate does not even start provisioning for it (no failed unit).
-                self.assertEqual(self.decide(gate_data=gen.load_gate(), cmd="prepare"), (ok, False))
+                self.assertEqual(self.decide(gate_data=gen.load_gate(), cmd="prepare"), ok)
                 self.assertEqual(self.run_(), 0 if ok else 1)
                 if ok:
                     self.checked()
                 else:
                     self.assertIn(f"lsid on {aid}: no protected playback row", " ".join(self.record()["reasons"]))
                     self.assertFalse(os.path.exists(self.p.params))
-                self.assertEqual(self.decide(gate_data=gen.load_gate()), (ok, False))
+                self.assertEqual(self.decide(gate_data=gen.load_gate()), ok)
 
     def test_playback_rows_need_every_cover_with_evidence(self):
         import gen
@@ -1852,7 +1866,7 @@ class Gate(Base):
                 self.ctl({"board": board, "unit": kind})
                 self.assertEqual(self.run_(), 0)
                 self.checked()
-                self.assertEqual(self.decide(gate_data=gen.load_gate()), (True, False))
+                self.assertEqual(self.decide(gate_data=gen.load_gate()), True)
 
     def test_the_bundle_provisioning_compiles_names_the_units(self):
         with open(os.path.join(self.t, "provision.conf"), "w") as f:
@@ -2301,7 +2315,15 @@ class Units(unittest.TestCase):
                 if l.startswith(("ExecStart=", "ExecStartPost=", "ExecStop=", "ExecStopPost=", "ExecCondition=")):
                     self.assertTrue(l.split("=", 1)[1].startswith("/usr/libexec/speakerguardd/"), l)
         self.assertIn("Before=pipewire.service wireplumber.service", self.unit("speakerguardd-graph.service"))
-        self.assertIn("ExecCondition=+/usr/libexec/speakerguardd/speakerguardd-gate legacy", self.unit("legacy-gate.conf"))
+        # No unit or drop-in of this tree starts, enables or gates an older
+        # speaker daemon: there is no fallback to speakersafetyd or 0.1.
+        units = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "systemd")
+        self.assertFalse(os.path.exists(os.path.join(units, "legacy-gate.conf")))
+        for name in os.listdir(units):
+            with open(os.path.join(units, name)) as f:
+                text = f.read()
+            self.assertNotIn("speakersafetyd", text, name)
+            self.assertNotIn("speakerguardd-gate legacy", text, name)
         for u in (sup, chk, prv, swt):
             self.assertFalse([l for l in u if l.startswith(("OnFailure=", "OnSuccess="))])
         # A unit the gate skips must not fail first on the configuration that

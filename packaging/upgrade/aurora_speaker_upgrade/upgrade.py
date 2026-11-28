@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The Aurora Silicon Contributors
-"""aurora-speaker-upgrade: move this Mac's speakers from the legacy
-protection (speakersafetyd, speakerguardd 0.1) to speakerguardd v2, with
-this Mac's own tuning, and back.
+"""aurora-speaker-upgrade: put this Mac's speakers on speakerguardd v2,
+with this Mac's own tuning.
 
     aurora-speaker-upgrade [run] [--ipsw URL] [--no-switch]
-    aurora-speaker-upgrade --revert [--purge]
     aurora-speaker-upgrade --check [--json FILE]                (dry run: /run only, nothing stored or switched)
     aurora-speaker-upgrade status
     aurora-speaker-upgrade collect --out DIR                   (no switch; for checks)
@@ -22,13 +20,18 @@ this Mac's own tuning, and back.
    packaged or sent anywhere.
 3. speakerguardd v2 compiles it and its self-check proves it, silently.
 4. Only on a pass, the kernel's speaker protection interface switches to v2.
-   The legacy stack stays installed; any failure leaves (or puts) it in
-   charge, and `--revert` goes back to it.
+   Any failure switches nothing and starts no older speaker daemon.
+
+speakerguardd v2 is the only speaker protection. This tool never starts,
+enables or hands the speakers to an older daemon (speakersafetyd,
+speakerguardd 0.1), and never writes the kernel's interface back to the
+volume lock ("Speaker Volume Unlock"). `--revert` (and `--purge`) are gone:
+there is nothing to go back to. They are refused with that reason, and
+nothing changes.
 """
 import argparse
 import contextlib
 import fcntl
-import glob
 import hashlib
 import json
 import logging
@@ -55,14 +58,9 @@ V2_CONF = "/etc/speakerguardd/speakerguardd.conf"
 STATE_V2 = "/var/lib/speakerguardd"
 LIBEXEC = ("/usr/libexec/speakerguardd-v2", "/usr/libexec/speakerguardd")
 INTERFACE_CTL = "Speaker Protection Interface"
-IF_V2, IF_LEGACY = "Speaker Protection", "Speaker Volume Unlock"
+IF_V2, IF_UNLOCK = "Speaker Protection", "Speaker Volume Unlock"
 V2_UNITS = ("speakerguardd-v2.service", "speakerguardd.service")
 GRANT_WAIT_S = 30
-# After a revert restarts the seat user's PipeWire, the older daemon starts
-# once the speaker card's PCMs have kept their state this long
-# (at most PCM_SETTLE_S).
-PCM_SETTLE_S = 10
-PCM_QUIET_S = 1.5
 # The seat user's audio session stops before the kernel's speaker interface
 # switches and starts after it (speakerguardd-provision session-stop,
 # session-start). A session left running across the switch keeps starting
@@ -85,10 +83,16 @@ GATE = "/usr/share/speakerguardd/gate.json"
 MARK = "# aurora-speaker-upgrade: the bundle collected for this Mac"
 
 EXIT_OK, EXIT_REFUSED, EXIT_RETRY, EXIT_ERROR = 0, 1, 2, 3
+# What a refusal leaves: never an older speaker daemon.
+NO_SWITCH = ("nothing switched; no older speaker daemon is started (where speakerguardd v2 does not run, the kernel's "
+             "own limit holds the speakers)")
+REVERT_GONE = ("--revert was removed: speakerguardd v2 is the only speaker protection, so there is no older one to go "
+               "back to. Nothing changed. To stop v2 now: systemctl stop speakerguardd-v2 (speakerguardd upstream); "
+               "the kernel's own limit then holds the speakers")
 
 
 class Refused(Exception):
-    """Stay on (or go back to) the legacy stack."""
+    """No switch; no older speaker daemon is started."""
 
 
 class Retry(Exception):
@@ -383,9 +387,9 @@ def selfcheck(a, mode=None):
         sys.stderr.write(r.stderr[-3000:])
         if r.returncode != 0:
             raise Refused(f"the silent hardware self-check failed on this kernel (exit {r.returncode}): "
-                          "the legacy protection keeps the speakers")
+                          f"{NO_SWITCH}")
         # The boot did not prepare v2 on a Mac that was not switched yet (the
-        # gate kept the older daemons), and a revert removed the graph:
+        # gate started nothing), and a refusal may have removed the graph:
         # generate it from the record just made and bring the session onto
         # it (as speakerguardd-selfcheck.service's ExecStartPost does at
         # boot), so verify's graph step sees it. The session stopped before
@@ -406,7 +410,7 @@ def selfcheck(a, mode=None):
         return
     if code == 2:
         raise Retry("the self-check cannot run now (a session holds the speakers, or no card): try again later")
-    raise Refused(f"the speaker self-check refused this Mac (exit {code}): the legacy protection keeps the speakers")
+    raise Refused(f"the speaker self-check refused this Mac (exit {code}): {NO_SWITCH}")
 
 
 # --- the kernel interlock (SGUP-KI) -------------------------------------------
@@ -428,13 +432,13 @@ def interface_mode():
         if _has(card, IF_V2):
             return "v2-only", card
     for card in cards:
-        if _has(card, IF_LEGACY):
+        if _has(card, IF_UNLOCK):
             return "legacy-only", card
     return "none", None
 
 
 def interface_get(card):
-    """The kernel's current speaker protection interface (IF_V2, IF_LEGACY)
+    """The kernel's current speaker protection interface (IF_V2, IF_UNLOCK)
     on a dual kernel, or None when it cannot be read."""
     r = run(["amixer", "-c", card, "cget", f"name={INTERFACE_CTL}"])
     items = dict(re.findall(r"Item #(\d+) '([^']*)'", r.stdout))
@@ -481,7 +485,11 @@ def v2_unit():
     return V2_UNITS[0]
 
 
-def legacy_units():
+def older_units():
+    """The older speaker daemons' units, where a distribution still has them
+    (speakersafetyd, speakerguardd 0.1). Only ever stopped, never started:
+    on a dual kernel one of them may hold the volume lock and the sense PCM
+    the switch needs."""
     v2 = v2_unit()
     return [u for u in ("speakersafetyd.service", "speakerguardd.service") if u != v2]
 
@@ -529,7 +537,7 @@ def session_stop():
     the speaker interface switches. A unit that will not stop even after
     SIGKILL refuses the switch."""
     if _session("session-stop", SESSION_STOP_LIMIT_S) is False:
-        raise Refused("the seat user's audio session did not stop: the legacy protection keeps the speakers")
+        raise Refused(f"the seat user's audio session did not stop: {NO_SWITCH}")
 
 
 def session_start():
@@ -539,68 +547,10 @@ def session_start():
     _session("session-start", SESSION_START_LIMIT_S)
 
 
-def legacy_wanted():
-    """The older daemons the packaged udev rules start for this Mac's
-    speaker sense PCMs (SYSTEMD_WANTS), exactly as a boot would: speakersafetyd
-    on most Macs, speakerguardd 0.1 where its own rules ask for it (the
-    J700). Never a unit nothing asks for."""
-    want = []
-    for dev in sorted(glob.glob("/dev/snd/pcmC*D*c")):
-        r = run(["udevadm", "info", "--query=property", dev])
-        for line in r.stdout.splitlines():
-            if line.startswith("SYSTEMD_WANTS="):
-                for u in line.split("=", 1)[1].split():
-                    u = u if u.endswith(".service") else u + ".service"
-                    if u in legacy_units() and u not in want:
-                        want.append(u)
-    return want
-
-
-def pcm_states(card):
-    """The state of each substream of the speaker card, playback and
-    capture (the sense PCM), from /proc/asound (closed, SETUP, PREPARED,
-    RUNNING, ...)."""
-    out = {}
-    for f in sorted(glob.glob(f"/proc/asound/{card}/pcm*[pc]/sub*/status")):
-        t = read_text(f) or ""
-        m = re.search(r"(?m)^state:\s*(\S+)", t)
-        out[f] = m.group(1) if m else t.strip()
-    return out
-
-
-def pcm_settle(card, wait=PCM_SETTLE_S, quiet=PCM_QUIET_S):
-    """Waits until the speaker card's PCMs keep their state for
-    `quiet` seconds, at most `wait`. False on a timeout; the caller goes on."""
-    end = time.monotonic() + wait
-    last, since = None, time.monotonic()
-    while True:
-        cur, now = pcm_states(card), time.monotonic()
-        if cur != last:
-            last, since = cur, now
-        elif now - since >= quiet:
-            return True
-        if now >= end:
-            return False
-        time.sleep(0.1)
-
-
-def legacy_start():
-    """Puts the legacy daemon back, the one the packaged udev rules start
-    for the speaker sense PCM; nothing else (on a Mac that is not a J700,
-    speakerguardd 0.1 is installed but not wanted, and fails 78/CONFIG)."""
-    run(["udevadm", "trigger", "--subsystem-match=sound", "--action=change"])
-    run(["udevadm", "settle", "--timeout=10"])
-    units = legacy_wanted()
-    if not units and systemctl("cat", "speakersafetyd.service").returncode == 0:
-        # rules without SYSTEMD_WANTS on the PCM: the distributions' default
-        units = ["speakersafetyd.service"]
-    for u in units:
-        systemctl("reset-failed", u)
-        systemctl("start", "--no-block", u)
-
-
-def legacy_stop():
-    for u in legacy_units():
+def older_stop():
+    """Stops any older speaker daemon that still runs; nothing starts one
+    again."""
+    for u in older_units():
         systemctl("stop", u)
 
 
@@ -637,9 +587,8 @@ def cmd_check(a):
     """A dry run: collect, compile and self-check this Mac's tuning in the
     /run scratch only. Nothing is stored and no configuration is written.
     On a dual kernel, where no hardware record of this kernel exists before
-    a switch, the silent switch test runs into the private root: the older
-    daemon is paused and the interface lent to the test for a few seconds,
-    then both are put back. When speakerguardd v2 already owns the speakers
+    a switch, the silent switch test runs into the private root, with the
+    interface lent to it for a few seconds (check_hardware). When speakerguardd v2 already owns the speakers
     in this boot, the test does not run and the check cannot run (2): a dry
     run never takes the speakers from v2. Exit codes are the self-check's: 0 pass,
     1 refused, 2 cannot run, 3 error."""
@@ -708,9 +657,8 @@ def cmd_check(a):
         if mode == "dual" and "--switch-interface" in h.stdout + h.stderr:
             # No hardware record of this kernel exists before a switch: make
             # one in the private root, the way 'run' does. The silent switch
-            # test needs the speakers for a few seconds: the older daemon is
-            # paused and the interface lent to the test, then both are put
-            # back; nothing is stored outside /run.
+            # test needs the speakers for a few seconds (the interface is lent
+            # to it); nothing is stored outside /run.
             res, detail = check_hardware(sc_tool, card, params, state, conf)
             step("hardware switch test", res, detail)
             if res != "pass":
@@ -749,12 +697,14 @@ def cmd_check(a):
 
 def check_hardware(sc_tool, card, params, state, conf):
     """--check on a dual kernel: the silent switch test into the private
-    state, with the speakers lent to it and given back. ('pass'|'refused'|
-    'cannot-run', detail)."""
-    before = interface_get(card) or IF_LEGACY
-    paused = [u for u in legacy_units() if systemctl("is-active", "-q", u).returncode == 0]
-    for u in paused:
-        systemctl("stop", u)
+    state, with the speakers lent to it. An older speaker daemon that still
+    runs is stopped and stays stopped. The interface goes back to v2's lease
+    only when that is where the test found it; from the volume lock the
+    kernel returns by itself 30 s after the test's lease closes (this tool
+    never writes "Speaker Volume Unlock"). ('pass'|'refused'|'cannot-run',
+    detail)."""
+    before = interface_get(card)
+    older_stop()
     stopped = False
     try:
         session_stop()
@@ -762,14 +712,11 @@ def check_hardware(sc_tool, card, params, state, conf):
         r = run([sc_tool, "run", "--switch-interface", "--force", "--params", params, "--state", state,
                  "--", *v2_tuning_args(conf)])
     finally:
-        # Back to the interface it found, not always the legacy one.
-        with contextlib.suppress(Refused):
-            interface_set(card, before)
+        if before == IF_V2:
+            with contextlib.suppress(Refused):
+                interface_set(card, IF_V2)
         if stopped:
             session_start()
-        for u in paused:
-            systemctl("reset-failed", u)
-            systemctl("start", "--no-block", u)
     if r.returncode == 0:
         return "pass", "silent switch test passed on this kernel (private record)"
     tail = r.stderr.strip()[-800:]
@@ -814,8 +761,8 @@ def _cmd_run(a):
             say("switched on record, but speakerguardd v2 does not hold the speakers in this boot: switching again")
     if getattr(a, "at_boot", False) and not switched_here and not playback_proof(identity.acoustic):
         # The boot unit moves a speaker only once protected playback on it
-        # is on record; until then the speakers stay as they are (the legacy
-        # protection, or what the installer set up) and nothing is collected.
+        # is on record; until then the speakers stay as they are (what the
+        # installer set up, or the kernel's own limit) and nothing is collected.
         say(f"AID{identity.acoustic}: no protected playback row (loud step, thermal ramp) is on record "
             "for this speaker yet, so the boot unit leaves the speakers as they are "
             "('aurora-speaker-upgrade run' switches by hand)")
@@ -830,31 +777,32 @@ def _cmd_run(a):
     state.update(prov, digest=digest(b), collected=time.strftime("%Y-%m-%dT%H:%M:%S%z"), switched=False)
     store.save(state)
     if a.no_switch:
-        say("collected; --no-switch: the legacy protection keeps the speakers")
+        say("collected; --no-switch: nothing switched")
         return EXIT_OK
     if mode == "legacy-only":
-        raise Refused("this kernel has only the legacy speaker interface, so no switch is possible: the "
-                      "legacy protection keeps the speakers (the bundle is stored; run again on a newer kernel)")
+        raise Refused("this kernel has no v2 speaker interface, so no switch is possible: no speaker daemon runs "
+                      "and the kernel's own limit holds the speakers (the bundle is stored; run again on a newer kernel)")
     write_file(PROVISION_CONF, provision_conf_with(read_text(PROVISION_CONF), store.bundle))
     since = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         if mode == "dual":
-            legacy_stop()
+            older_stop()
         provision(store, a)
         if mode == "dual":
             # No session may run across the switch: it would keep starting
             # the speaker PCM the lease refuses. It starts again on v2's
             # graph once the self-check made it (selfcheck), or on the
-            # distribution's on a rollback (back_to_legacy).
+            # distribution's when the switch does not go through (back_to_floor).
             session_stop()
             # The self-check takes a v2 lease itself: v2 must own the
-            # interface while it runs; the kernel falls back to legacy (from
-            # the floor) 30 s after the last owner closes, and speakerguardd's
-            # ExecStartPre switches it again when the supervisor starts.
+            # interface while it runs; the kernel falls back to its volume
+            # lock (from the floor) 30 s after the last owner closes, and
+            # speakerguardd's ExecStartPre switches it again when the
+            # supervisor starts.
             interface_set(card, IF_V2)
         selfcheck(a, mode)
     except (Refused, Retry):
-        back_to_legacy(store, state, mode, card)
+        back_to_floor(store, state, mode, card)
         raise
     write_file(store.interface, "v2\n", 0o600)
     state["switched"] = True
@@ -863,11 +811,10 @@ def _cmd_run(a):
     systemctl("reset-failed", v2_unit())
     r = systemctl("restart", v2_unit())
     if r.returncode != 0 or not wait_v2_granted(since):
-        back_to_legacy(store, state, mode, card)
-        raise Refused("speakerguardd v2 did not take the speakers within "
-                      f"{GRANT_WAIT_S} s: back on the legacy protection")
+        back_to_floor(store, state, mode, card)
+        raise Refused(f"speakerguardd v2 did not take the speakers within {GRANT_WAIT_S} s: {NO_SWITCH}")
     say(f"done: speakerguardd v2 owns the speakers ({prov.get('aid')}, macOS {prov.get('macos_build')}, "
-        f"{prov.get('source')}); the legacy stack stays installed (aurora-speaker-upgrade --revert)")
+        f"{prov.get('source')})")
     return EXIT_OK
 
 
@@ -891,8 +838,8 @@ def refusal_key(identity):
 
 def cmd_run(a):
     """run, plus the boot unit's refusal record: a Mac the self-check (or the
-    collection) refused is not tried again at every boot, which would stop
-    and restart the legacy protection each time for the same answer (a new
+    collection) refused is not tried again at every boot, which would fetch,
+    compile and self-check again each time for the same answer (a new
     pin of restore images counts as new data). The record lives in the
     store and is keyed by refusal_key(); `run` by hand
     always tries again."""
@@ -908,7 +855,7 @@ def cmd_run(a):
             old = {}
         if old.get("key") == key:
             say(f"refused before for this kernel and this speakerguardd ({old.get('when')}): {old.get('reason')}; "
-                "the legacy protection keeps the speakers (run 'aurora-speaker-upgrade run' to try again)")
+                "nothing switched (run 'aurora-speaker-upgrade run' to try again)")
             return EXIT_OK
     try:
         code = _cmd_run(a)
@@ -935,7 +882,12 @@ def v2_owns_speakers(mode, card):
     return mode != "dual" or interface_get(card) == IF_V2
 
 
-def back_to_legacy(store, state, mode, card):
+def back_to_floor(store, state, mode, card):
+    """A switch that did not go through: the setting and provisioning's
+    pointer to the bundle go, and on a dual kernel v2 lets the speakers go.
+    No speaker daemon takes over and the interface is not written: the
+    kernel returns to its volume lock by itself 30 s after the last lease
+    closes, at its own limit."""
     with contextlib.suppress(FileNotFoundError):
         os.unlink(store.interface)
     before = state.get("provision_conf_before")
@@ -948,51 +900,20 @@ def back_to_legacy(store, state, mode, card):
     store.save(state)
     if mode == "dual":
         # The session first (it would keep starting the speaker PCM once v2
-        # releases it), then v2, then the interface; the session starts
-        # again on the distribution's graph. After a session_stop on the
-        # way up this stops nothing and starts what ran before.
+        # releases it), then v2; the session starts again on the
+        # distribution's graph. After a session_stop on the way up this
+        # stops nothing and starts what ran before.
         with contextlib.suppress(Refused):
             session_stop()
         systemctl("stop", v2_unit())
-        with contextlib.suppress(Refused):
-            interface_set(card, IF_LEGACY)
         graph_deactivate()
         session_start()
-        # speakersafetyd reads the sense PCM's rate range and then opens it
-        # at the lowest rate; when the restarted session's WirePlumber opened
-        # the speaker PCM at 48 kHz in between, the open failed on the I2S
-        # rate symmetry (EINVAL) and the daemon panicked and restarted. Wait
-        # for the session to finish opening the speaker first; its ALSA
-        # monitor can also hold the sense PCM for a moment while it starts
-        # (EBUSY), so every PCM of the card counts. (Starting the
-        # daemon before the restart does not work: v2's graph still holds
-        # the sense PCM, EBUSY.)
-        if card:
-            pcm_settle(card)
-        legacy_start()
     else:
-        # A fleet kernel (v2 interface only): the stack that ran before
-        # (speakerguardd v2 with the installer's bundle, or nothing) again.
+        # A fleet kernel (v2 interface only): speakerguardd v2 as it ran
+        # before (with the installer's bundle, where that qualifies), or
+        # nothing.
         if starts_at_boot(v2_unit()):
             systemctl("restart", v2_unit())
-
-
-def cmd_revert(a):
-    store = Store(a.store)
-    state = store.state()
-    if not state and not os.path.exists(store.root):
-        say("nothing to revert: this Mac was never upgraded")
-        return EXIT_OK
-    mode, card = interface_mode()
-    back_to_legacy(store, state, mode, card)
-    if a.purge:
-        collect.rmtree(store.root)
-        say(f"reverted; {store.root} removed")
-    else:
-        state.pop("provision_conf_before", None)
-        store.save(state)
-        say("reverted: the legacy protection owns the speakers (the collected bundle is kept; --purge removes it)")
-    return EXIT_OK
 
 
 def cmd_status(a):
@@ -1048,11 +969,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="aurora-speaker-upgrade", description=__doc__.split("\n\n")[0])
     ap.add_argument("cmd", nargs="?", default="run",
                     choices=["run", "check", "collect", "status", "interface-apply", "revert"])
-    ap.add_argument("--revert", action="store_true", help="go back to the legacy protection")
+    # Gone (no older protection to go back to); refused with the reason.
+    ap.add_argument("--revert", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--check", action="store_true",
                     help="dry run: collect, compile and self-check in /run only; nothing stored or switched")
     ap.add_argument("--json", help="--check: write the result here")
-    ap.add_argument("--purge", action="store_true", help="with --revert: remove the stored bundle")
+    ap.add_argument("--purge", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--ipsw", help="read the pinned restore image from this address (a mirror); "
                     "its build must still be a pinned one")
     ap.add_argument("--no-switch", action="store_true", help="collect and store only")
@@ -1071,8 +993,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING,
                         format="aurora-speaker-upgrade: %(message)s")
-    if a.revert:
-        a.cmd = "revert"
+    if a.revert or a.purge or a.cmd == "revert":
+        say(f"REFUSED: {REVERT_GONE}")
+        return EXIT_REFUSED
     if a.check:
         a.cmd = "check"
     a.installer_dirs = a.installer_dirs or list(collect.INSTALLER_BUNDLES)
@@ -1085,7 +1008,7 @@ def main(argv=None):
         ap.error("collect needs --out")
     os.umask(0o077)
     cmds = {"run": cmd_run, "check": cmd_check, "collect": cmd_collect, "status": cmd_status,
-            "interface-apply": cmd_interface_apply, "revert": cmd_revert}
+            "interface-apply": cmd_interface_apply}
     try:
         if a.cmd in ("status", "interface-apply"):
             # Never behind the lock: status only reads, and interface-apply

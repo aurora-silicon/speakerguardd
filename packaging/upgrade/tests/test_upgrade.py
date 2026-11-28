@@ -255,7 +255,7 @@ class BuzzUnit(unittest.TestCase):
 
 
 class DualKernelRun(unittest.TestCase):
-    """cmd_run on a dual kernel (linux 98cb6a86+): legacy stops, the tuning
+    """cmd_run on a dual kernel (linux 98cb6a86+): any older daemon stops, the tuning
     compiles, the interface goes to the lease right before the self-check
     (which makes this kernel's hardware record with --switch-interface, then
     verifies), and only then the setting is written and v2 restarted."""
@@ -274,7 +274,10 @@ class DualKernelRun(unittest.TestCase):
         self.assertEqual(names.count("session_stop"), 1)
         self.assertEqual(names.count("session_start"), 1)
 
-    def test_rollback_starts_the_session_on_the_legacy_graph(self):
+    def test_refusal_leaves_the_speakers_at_the_floor(self):
+        """A refused switch stops v2 and brings the session back on the
+        distribution's graph; it never writes the volume lock back and never
+        starts an older daemon."""
         calls, rc, iface = self.dual_run(verify_rc=1)
         self.assertEqual(rc, "refused")
         self.assertIsNone(iface)
@@ -282,11 +285,17 @@ class DualKernelRun(unittest.TestCase):
         i = names.index
         last = len(names) - 1 - names[::-1].index("session_start")
         self.assertLess(i("session_stop"), i("iface"))
-        legacy = calls.index(("iface", "Speaker Volume Unlock"))
-        self.assertLess(legacy, last)
+        self.assertLess(calls.index(("systemctl", "stop", "speakerguardd-v2.service")), last)
         self.assertLess(names.index("speakerguardd-provision deactivate"), last)
-        self.assertLess(last, i("legacy_start"))
+        self.assertNotIn(("iface", "Speaker Volume Unlock"), calls)
         self.assertNotIn(("systemctl", "restart", "speakerguardd-v2.service"), calls)
+        self.assert_no_older_start(calls)
+
+    def assert_no_older_start(self, calls):
+        for c in calls:
+            if c[0] == "systemctl" and c[1] in ("start", "restart", "enable", "unmask", "reset-failed"):
+                self.assertNotIn("speakersafetyd", " ".join(c), c)
+                self.assertNotEqual(c[-1], "speakerguardd.service", c)
 
     def test_session_that_will_not_stop_refuses_before_the_switch(self):
         calls, rc, iface = self.dual_run(session_stop_ok=False)
@@ -294,8 +303,8 @@ class DualKernelRun(unittest.TestCase):
         names = self.names(calls)
         self.assertNotIn(("iface", "Speaker Protection"), calls)
         self.assertNotIn("speakerguardd-selfcheck run", names)
-        self.assertIn("legacy_start", names)
         self.assertIn("session_start", names)
+        self.assert_no_older_start(calls)
 
     def test_session_stop_timeout_is_a_refusal(self):
         import subprocess
@@ -362,9 +371,7 @@ class DualKernelRun(unittest.TestCase):
                 es.enter_context(mock.patch.object(up, "V2_CONF", conf))
                 es.enter_context(mock.patch.object(up, "tool", lambda name: "/x/" + name))
                 es.enter_context(mock.patch.object(up, "run", run))
-                es.enter_context(mock.patch.object(up, "legacy_stop", lambda: calls.append(("legacy_stop",))))
-                es.enter_context(mock.patch.object(up, "legacy_start", lambda: calls.append(("legacy_start",))))
-                es.enter_context(mock.patch.object(up, "pcm_settle", lambda card: True))
+                es.enter_context(mock.patch.object(up, "older_stop", lambda: calls.append(("older_stop",))))
                 es.enter_context(mock.patch.object(up, "session_stop", stop))
                 es.enter_context(mock.patch.object(up, "session_start", lambda: calls.append(("session_start",))))
                 es.enter_context(mock.patch.object(up, "interface_set", lambda card, v: calls.append(("iface", v))))
@@ -383,7 +390,7 @@ class DualKernelRun(unittest.TestCase):
         calls, rc, _ = self.dual_run()
         names = self.names(calls)
         i = names.index
-        self.assertLess(i("legacy_stop"), i("speakerguardd-provision run"))
+        self.assertLess(i("older_stop"), i("speakerguardd-provision run"))
         self.assertLess(i("speakerguardd-provision run"), i("iface"))
         self.assertLess(i("iface"), i("speakerguardd-selfcheck run"))
         self.assertLess(i("speakerguardd-selfcheck run"), i("speakerguardd-selfcheck verify"))
@@ -521,37 +528,12 @@ class ConfigDirPermissions(unittest.TestCase):
             os.umask(old)
 
 
-class LegacyStart(unittest.TestCase):
-    """RC8 E2E B2: a revert starts the older daemon the packaged udev rules
-    want for the sense PCM, never every installed one (speakerguardd 0.1
-    on an M2 exits 78/CONFIG)."""
+class NoOlderDaemon(unittest.TestCase):
+    """speakerguardd v2 is the only speaker protection: when a switch does
+    not go through, nothing starts an older daemon (speakersafetyd,
+    speakerguardd 0.1) and the volume lock is never written back."""
 
-    def test_only_the_wanted_unit(self):
-        import types
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
-        props = {"/dev/snd/pcmC0D2c": "DEVNAME=/dev/snd/pcmC0D2c\nSYSTEMD_WANTS=speakersafetyd.service\n",
-                 "/dev/snd/pcmC1D0c": "DEVNAME=/dev/snd/pcmC1D0c\n"}
-        calls = []
-
-        def run(argv, **kw):
-            out = props.get(argv[-1], "") if argv[:2] == ["udevadm", "info"] else ""
-            return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
-        with mock.patch.object(up, "run", run), mock.patch.object(up.glob, "glob", lambda p: sorted(props)), \
-                mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
-                mock.patch.object(up, "systemctl", lambda *a: calls.append(a) or types.SimpleNamespace(returncode=0)):
-            self.assertEqual(up.legacy_wanted(), ["speakersafetyd.service"])
-            up.legacy_start()
-        started = [a[-1] for a in calls if a[0] == "start"]
-        self.assertEqual(started, ["speakersafetyd.service"])
-
-
-class RevertSettle(unittest.TestCase):
-    """A same-boot revert on a dual kernel restarts the seat user's
-    PipeWire, waits until the speaker PCMs keep their state, and only then
-    starts the older daemon, so the two never configure the I2S at once."""
-
-    def test_order(self):
+    def floor(self, mode, at_boot):
         import types
         from unittest import mock
         from aurora_speaker_upgrade import upgrade as up
@@ -562,55 +544,48 @@ class RevertSettle(unittest.TestCase):
                 mock.patch.object(up, "graph_deactivate", lambda: order.append(("graph_deactivate",))), \
                 mock.patch.object(up, "session_stop", lambda: order.append(("session_stop",))), \
                 mock.patch.object(up, "session_start", lambda: order.append(("session_start",))), \
-                mock.patch.object(up, "pcm_settle", lambda card: order.append(("settle", card)) or True), \
-                mock.patch.object(up, "legacy_start", lambda: order.append(("legacy_start",))), \
+                mock.patch.object(up, "starts_at_boot", lambda u: at_boot), \
                 mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"), \
                 mock.patch.object(up, "PROVISION_CONF", "/nonexistent/sgb6-provision.conf"):
-            up.back_to_legacy(store, {}, "dual", "AppleJ316")
-        names = [o[0] for o in order]
-        self.assertEqual(names[0], "session_stop")
-        self.assertEqual(order[1], ("systemctl", "stop", "speakerguardd-v2.service"))
-        self.assertEqual(names[-5:], ["interface", "graph_deactivate", "session_start", "settle", "legacy_start"])
-        self.assertIn(("settle", "AppleJ316"), order)
+            up.back_to_floor(store, {}, mode, "AppleJ316")
+        return order
 
-    def test_settle_waits_for_a_steady_state(self):
+    def test_dual_kernel(self):
+        order = self.floor("dual", True)
+        self.assertEqual(order, [("session_stop",), ("systemctl", "stop", "speakerguardd-v2.service"),
+                                 ("graph_deactivate",), ("session_start",)])
+
+    def test_v2_only_kernel(self):
+        # v2 as it ran before (the installer's bundle), never anything else
+        self.assertEqual(self.floor("v2-only", True), [("systemctl", "restart", "speakerguardd-v2.service")])
+        self.assertEqual(self.floor("v2-only", False), [])
+
+    def test_no_code_path_starts_an_older_daemon(self):
+        from aurora_speaker_upgrade import upgrade as up
+        for gone in ("legacy_start", "legacy_wanted", "back_to_legacy", "cmd_revert", "pcm_settle"):
+            self.assertFalse(hasattr(up, gone), gone)
+        with open(up.__file__) as f:
+            src = f.read()
+        self.assertNotIn("interface_set(card, IF_UNLOCK)", src)
+        self.assertNotRegex(src, r'systemctl\("(start|enable|unmask)"[^)]*(speakersafetyd|older)')
+
+    def test_older_stop_only_stops(self):
+        import types
         from unittest import mock
         from aurora_speaker_upgrade import upgrade as up
-        now = [0.0]
-        seq = iter(["closed"] * 3 + ["SETUP", "PREPARED"] + ["RUNNING"] * 100)
-        with mock.patch.object(up, "pcm_states", lambda card: {"p1": next(seq)}), \
-                mock.patch.object(up.time, "monotonic", lambda: now[0]), \
-                mock.patch.object(up.time, "sleep", lambda t: now.__setitem__(0, now[0] + t)):
-            self.assertTrue(up.pcm_settle("AppleJ316", wait=10, quiet=1.5))
-            self.assertGreaterEqual(now[0], 0.4 + 1.5 - 1e-9)
-        flip = iter(["closed", "RUNNING"] * 200)
-        now[0] = 0.0
-        with mock.patch.object(up, "pcm_states", lambda card: {"p1": next(flip)}), \
-                mock.patch.object(up.time, "monotonic", lambda: now[0]), \
-                mock.patch.object(up.time, "sleep", lambda t: now.__setitem__(0, now[0] + t)):
-            self.assertFalse(up.pcm_settle("AppleJ316", wait=2, quiet=1.5))
-
-    def test_pcm_states_reads_proc(self):
-        import tempfile
-        from unittest import mock
-        from aurora_speaker_upgrade import upgrade as up
-        with tempfile.TemporaryDirectory() as d:
-            os.makedirs(f"{d}/pcm1p/sub0")
-            open(f"{d}/pcm1p/sub0/status", "w").write("state: RUNNING\nowner_pid   : 42\n")
-            os.makedirs(f"{d}/pcm0p/sub0")
-            open(f"{d}/pcm0p/sub0/status", "w").write("closed\n")
-            os.makedirs(f"{d}/pcm2c/sub0")
-            open(f"{d}/pcm2c/sub0/status", "w").write("state: SETUP\n")
-            real = up.glob.glob
-            with mock.patch.object(up.glob, "glob", lambda p: real(p.replace("/proc/asound/AppleJ316", d))):
-                self.assertEqual(sorted(up.pcm_states("AppleJ316").values()), ["RUNNING", "SETUP", "closed"])
+        calls = []
+        with mock.patch.object(up, "systemctl", lambda *a: calls.append(a) or types.SimpleNamespace(returncode=0)), \
+                mock.patch.object(up, "v2_unit", return_value="speakerguardd-v2.service"):
+            up.older_stop()
+        self.assertEqual(calls, [("stop", "speakersafetyd.service"), ("stop", "speakerguardd.service")])
 
 
 class CheckKeepsTheInterface(unittest.TestCase):
     """--check is a dry run: on a Mac whose speakers v2 already owns it never
-    lends them to the switch test (that left the kernel on the legacy
-    interface, lease 0 and the speakers at the floor until a reboot), and
-    otherwise the switch test hands back the interface it found."""
+    lends them to the switch test (that left the kernel on the volume lock,
+    lease 0 and the speakers at the floor until a reboot). Otherwise the
+    switch test gives v2's lease back where it found it, and never writes
+    the volume lock: from there the kernel returns by itself."""
 
     def amixer(self, value):
         import types
@@ -623,25 +598,31 @@ class CheckKeepsTheInterface(unittest.TestCase):
     def test_interface_get(self):
         from unittest import mock
         from aurora_speaker_upgrade import upgrade as up
-        for v, want in (("1", up.IF_V2), ("0", up.IF_LEGACY)):
+        for v, want in (("1", up.IF_V2), ("0", up.IF_UNLOCK)):
             with mock.patch.object(up, "run", lambda argv, **kw: self.amixer(v)):
                 self.assertEqual(up.interface_get("AppleJ616"), want)
 
-    def test_switch_test_hands_back_what_it_found(self):
+    def test_switch_test_hands_back_only_the_lease(self):
         import types
         from unittest import mock
         from aurora_speaker_upgrade import upgrade as up
-        sets = []
-        for found in (up.IF_V2, up.IF_LEGACY):
+        sets, ctl = [], []
+        for found, want in ((up.IF_V2, [up.IF_V2]), (up.IF_UNLOCK, []), (None, [])):
             sets.clear()
+            ctl.clear()
             with mock.patch.object(up, "interface_get", return_value=found), \
                     mock.patch.object(up, "interface_set", lambda c, v: sets.append(v)), \
-                    mock.patch.object(up, "legacy_units", return_value=[]), \
+                    mock.patch.object(up, "older_units", return_value=["speakersafetyd.service"]), \
+                    mock.patch.object(up, "systemctl", lambda *a: ctl.append(a) or types.SimpleNamespace(returncode=0)), \
+                    mock.patch.object(up, "session_stop", lambda: None), \
+                    mock.patch.object(up, "session_start", lambda: None), \
                     mock.patch.object(up, "v2_tuning_args", return_value=[]), \
                     mock.patch.object(up, "run", lambda argv, **kw: types.SimpleNamespace(returncode=2, stdout="", stderr="pcm1p stayed in use for 15 s")):
                 res, _ = up.check_hardware("/x/selfcheck", "AppleJ616", "/p", "/s", "/c")
             self.assertEqual(res, "cannot-run")
-            self.assertEqual(sets, [found])
+            self.assertEqual(sets, want, found)
+            # an older daemon that still ran is stopped, and stays stopped
+            self.assertEqual(ctl, [("stop", "speakersafetyd.service")])
 
     def test_check_does_not_take_the_speakers_from_v2(self):
         import types, tempfile
@@ -845,9 +826,9 @@ class NoConfirmation(unittest.TestCase):
         import io
         from aurora_speaker_upgrade import upgrade as up
         self.up, self.io = up, io
-        self.saved = (up.cmd_run, up.cmd_check, up.cmd_status, up.cmd_revert, up.locked, os.geteuid, sys.stdin)
+        self.saved = (up.cmd_run, up.cmd_check, up.cmd_status, up.locked, os.geteuid, sys.stdin)
         self.ran = []
-        for name in ("run", "check", "status", "revert"):
+        for name in ("run", "check", "status"):
             setattr(up, f"cmd_{name}", (lambda n: lambda a: self.ran.append(n) or up.EXIT_OK)(name))
         import contextlib
         up.locked = contextlib.nullcontext
@@ -856,7 +837,7 @@ class NoConfirmation(unittest.TestCase):
 
     def tearDown(self):
         up = self.up
-        up.cmd_run, up.cmd_check, up.cmd_status, up.cmd_revert, up.locked, os.geteuid, sys.stdin = self.saved
+        up.cmd_run, up.cmd_check, up.cmd_status, up.locked, os.geteuid, sys.stdin = self.saved
 
     def main(self, *argv):
         import contextlib
@@ -874,8 +855,20 @@ class NoConfirmation(unittest.TestCase):
             self.assertNotIn("PREVIEW", err.upper(), argv)
 
     def test_other_commands_unchanged(self):
-        for argv, name in ((["--check"], "check"), (["status"], "status"), (["--revert"], "revert"),
-                           (["run", "--no-switch"], "run")):
+        for argv, name in ((["--check"], "check"), (["status"], "status"), (["run", "--no-switch"], "run")):
             self.ran.clear()
             rc, _ = self.main(*argv)
             self.assertEqual((rc, self.ran), (self.up.EXIT_OK, [name]), argv)
+
+    def test_revert_is_refused_and_changes_nothing(self):
+        """--revert / --purge went with the older protection: old scripts get
+        a clear refusal (exit 1) and nothing runs, root or not."""
+        for argv in (["--revert"], ["--revert", "--purge"], ["--purge"], ["revert"]):
+            for euid in (0, 1000):
+                os.geteuid = lambda e=euid: e
+                self.ran.clear()
+                rc, err = self.main(*argv)
+                self.assertEqual((rc, self.ran), (self.up.EXIT_REFUSED, []), argv)
+                self.assertIn("--revert was removed", err)
+                self.assertIn("no older one to go back to", err)
+                self.assertIn("Nothing changed", err)
