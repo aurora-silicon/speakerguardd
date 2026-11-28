@@ -773,15 +773,13 @@ fn a_low_frequency_blend_after_two_beamformers_compiles_and_runs() {
     f.files.push(("mic_das.plist".into(), beam_file(2, &[1.0, 0.0])));
     f.beam = beam_file(2, &[1.0, 1.0]);
     let b = f.tree("mic-lwbo");
-    // not yet measured against the unit: refused by default, partial on request
-    let d = mic::compile(&b, &mic::Options::default(), &mut Diagnostics::default()).unwrap();
-    assert!(d.refused() && d.report.refusals.iter().any(|r| r.contains("aufx/lwbo")), "{:?}", d.report.refusals);
-    let opts = partial();
+    // measured against the unit: a default compile carries it, whole
+    let opts = mic::Options::default();
     let c = mic::compile(&b, &opts, &mut Diagnostics::default()).unwrap();
     assert!(!c.refused(), "{:?}", c.report.refusals);
-    assert!(c.report.partial);
+    assert!(!c.report.partial);
     let st: Vec<(&str, &Status)> = c.report.stages.iter().map(|s| (s.name.as_str(), &s.status)).collect();
-    assert!(st.contains(&("Das", &Status::Exact)) && st.contains(&("Lw", &Status::Uncharacterised)), "{st:?}");
+    assert!(st.contains(&("Das", &Status::Exact)) && st.contains(&("Lw", &Status::Approximate)), "{st:?}");
     let p = c.params.unwrap();
     assert_eq!(p.refs.len(), 1);
     assert!(matches!(p.freq[0], sgv2_core::mic::FreqStage::LowBand { compare: 0, blend: 0, .. }));
