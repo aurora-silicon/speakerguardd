@@ -1,6 +1,6 @@
 {
  "format": 2,
- "law": "3512579c5fb39c3bb6da6ac1120d1b9d31cbf4a147f158432c729f16e41cf003",
+ "law": "e36e5f87f5b6bff7ee4ceb7023b485056bdee2446c46b78cf9c5471620619fed",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0,
@@ -10,7 +10,7 @@
   {
    "build": "25C56",
    "reference": "macOS 26.2 25C56 Audio Units (its AudioDSP.component, read from the 25C56 restore image, rendered on a 25G83 host)",
-   "rev": "9e429d55e56f01032f0db1ab3b79b92e99757657",
+   "rev": "f85c1b454383ac9df245bfd0bdb06a3dd3292e97",
    "spread": {
     "sha256": "d3a03e7913ea3ebee9dc0ba386586e6ecbc995d43d5710ac269166dcc0d76e80",
     "chaotic_max_dbfs": -60.0,
@@ -1998,7 +1998,7 @@
   {
    "build": "25G72",
    "reference": "macOS 25G72 Audio Units (its AudioDSP.component, read from the 25G72 restore image, rendered on a 25G83 host)",
-   "rev": "9e429d55e56f01032f0db1ab3b79b92e99757657",
+   "rev": "f85c1b454383ac9df245bfd0bdb06a3dd3292e97",
    "spread": null,
    "sliders": [
     0.7,
@@ -4308,7 +4308,7 @@
   {
    "build": "25G83",
    "reference": "macOS 26.6.2 25G83 Audio Units",
-   "rev": "9e429d55e56f01032f0db1ab3b79b92e99757657",
+   "rev": "f85c1b454383ac9df245bfd0bdb06a3dd3292e97",
    "spread": {
     "sha256": "2706dbe150842b24d175e20acbac8cd837bc698d02a49537ba05b61d0bcb6db6",
     "chaotic_max_dbfs": -60.0,
@@ -6920,7 +6920,7 @@
   {
    "build": "26A428",
    "reference": "macOS 27.0 26A428 Audio Units",
-   "rev": "9e429d55e56f01032f0db1ab3b79b92e99757657",
+   "rev": "f85c1b454383ac9df245bfd0bdb06a3dd3292e97",
    "spread": null,
    "sliders": [],
    "slider_spread": {},
