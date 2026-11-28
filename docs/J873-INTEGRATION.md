@@ -30,13 +30,14 @@ reaches the AP. The device tree omits `"sense"` from `aop_audio` `dma-names`
 - **Linux:** `apple,t8152-aop-audio` 3-channel binding, `macaudio` DT-driven
   AOP sense derivation and `macaudio_j873_cfg` enablement behind
   `"Speaker Protection"` (aurora-silicon/linux#3434).
-- **macOS parity attestation for 26B123:** The J873g `26B123` AID48 bundle's
-  voicing key (`463b0cb03eb03b1c378da4bd4e82f036a7c50a4a6c1dafb1b07c071afb33b7b4`,
-  law `5740f31784993ecbe6e1236cb26341430ca0c64e66fb596847ee5e0a9b28d3b0`) matches
-  the passing `26A428` AID48 entry in `packaging/session/parity.json`
-  (`+0.143 / -0.011 dB` across 36 cells). Formal `voicing-check --attestations`
-  sign-off on `26B123` requires running `tools/diffrig/aidgate/attest-build.sh`
-  on a macOS 26B123 host so `parity.json` carries a `26B123` release block.
+- **macOS parity attestation for 26B123/26B131:** Landed in
+  aurora-silicon/speakerguardd#286 (`packaging/session/parity.json` `26B123`
+  and `26B131` blocks). The J873g `AID48` voicing key
+  (`463b0cb03eb03b1c378da4bd4e82f036a7c50a4a6c1dafb1b07c071afb33b7b4`, law
+  `5740f31784993ecbe6e1236cb26341430ca0c64e66fb596847ee5e0a9b28d3b0`) passes
+  `aurora-speaker-tuning voicing-check --attestations` (`compiler-gaps: none`,
+  worst louder `+0.143 dB` / quieter `-0.011 dB` at full volume; `+0.173 /
+  -0.011 dB` across sliders `0.7 / 0.46 / 0.25`).
 
 ## Fixture
 

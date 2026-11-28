@@ -4,7 +4,7 @@ manual step, before the self-check and the supervisor start.
 
     speakerguardd-provision run      [--bundle SRC] [--force]   (root, speakerguardd-provision.service)
     speakerguardd-provision activate [--graph-unit UNIT]        (root, after the self-check passed)
-    speakerguardd-provision deactivate [--graph-unit UNIT]      (root, the older daemons take the speakers back)
+    speakerguardd-provision deactivate [--graph-unit UNIT]      (root, v2 lets the speakers go in this boot)
     speakerguardd-provision seat     --unit UNIT                (root, when seat0 changes hands)
     speakerguardd-provision graph-user                          (the user's speakerguardd-graph.service)
                                                                 (waits while the switch test is pending)
@@ -44,6 +44,23 @@ manual step, before the self-check and the supervisor start.
 4. **Write** /etc/speakerguardd/speakerguardd.conf for the units: the
    machine, the seat user's name and uid, the supervisor's arguments (the
    speaker card, its speaker PCM, the uid, the blob) and the self-check's.
+
+5. **The built-in microphone**, after the speakers and apart from them
+   (mic_step; a Mac without a microphone array has no such step): the same
+   bundle's microphone chain is compiled with `aurora-speaker-tuning
+   mic-compile` into /var/lib/speakerguardd/mic.bin, bound to the board,
+   the unit, the bundle's digest, the compiler and the blob version the
+   plugin takes (/var/lib/speakerguardd/mic.bind). Only when the compiler
+   carried the whole design and the packaged plugin runs the blob is it
+   published (/run/speakerguardd/mic.bin) and the microphone graph written
+   (/run/speakerguardd-graph/mic): the processed "Built-in Microphone"
+   source, the raw array below it, and no WirePlumber node on the array's
+   PCM, so the distribution's own microphone filter is not created beside
+   it. Anything else removes the blob and those files, the distribution's
+   microphone graph stays as it is, and the journal says why
+   (/var/lib/speakerguardd/mic.json: pass, absent or refused). Nothing of
+   this changes the speakers' blob, records, configuration or this
+   program's exit status.
 
 Any failure fails closed: the blob and the configuration are removed (so
 neither an older blob nor an older seat user can be used), the self-check
@@ -143,6 +160,16 @@ class Paths:
         # The seat user's audio session units stopped for an interface switch
         # (session-stop), for session-start
         self.session_stopped = os.path.join(self.graph, "session.stopped")
+        # The built-in microphone (mic_step): its blob, binding and record
+        # beside the speakers', never in them
+        self.mic = os.path.join(self.state, "mic.bin")
+        self.mic_bind = os.path.join(self.state, "mic.bind")
+        self.mic_report = os.path.join(self.state, "mic.json")
+        self.mic_published = os.path.join(self.run_dir, "mic.bin")
+        # Its graph, apart from the speaker graph (clear_graph, graph_digest
+        # and the sleep hook never see it)
+        self.mic_graph = os.path.join(self.graph, "mic")
+        self.mic_state = os.path.join(self.mic_graph, "state")
         self.sleep = r("/run/speakerguardd-sleep")
         self.hold = os.path.join(self.sleep, "hold")
         self.proc_asound = r("/proc/asound")
@@ -519,6 +546,17 @@ def is_generated(path):
 
 
 def cmd_run(args, p):
+    """`run`: the speakers (run_speakers), then the built-in microphone
+    (mic_step). The exit status is the speakers' alone."""
+    code = run_speakers(args, p)
+    try:
+        mic_step(args, p)
+    except Exception as e:  # noqa: BLE001 - the microphone never changes the speakers' result
+        log(f"microphone: internal error: {type(e).__name__}: {e}")
+    return code
+
+
+def run_speakers(args, p):
     live = not p.root
     rec = {"version": VERSION, "result": "fail", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "reasons": [],
            "board": "-", "unit": unit_id(args.dt), "kernel": os.uname().release, "bundle_digest": "-", "macos_build": "-", "aid": "-",
@@ -600,6 +638,255 @@ def cmd_run(args, p):
     log(f"provisioned {rec['board']}: blob {rec['params_sha256'][:12]} ({'compiled' if rec['compiled'] else 'bound'}), "
         f"seat user {rec['seat_user']} ({rec['seat_how']}), {p.conf}")
     return 0
+
+
+# ------------------------------------------------------------------ microphone
+
+MIC_VERSION = 1
+# What the microphone blob is bound to, like BIND_KEYS for the speakers':
+# the board, the unit, the bundle, the compiler and the blob version the
+# packaged plugin takes. A change in any of them compiles again.
+MIC_BIND_KEYS = ["version", "board", "unit", "bundle_digest", "macos_build", "compiler", "source", "blob_version", "mic_sha256"]
+
+
+class Absent(Exception):
+    """This Mac has no built-in microphone to provision."""
+
+
+def compile_mic(cli, source, out):
+    """`aurora-speaker-tuning mic-compile`, never with --allow-partial: a
+    design with a stage the compiler cannot carry is refused, not shipped as
+    identity. Returns the compiler's summary line."""
+    unlink(out)
+    r = subprocess.run([cli, "mic-compile", *source, "-o", out], capture_output=True, text=True, timeout=300)
+    lines = r.stderr.strip().splitlines()
+    if r.returncode != 0 or not os.path.exists(out):
+        why = [l for l in lines if l.startswith(("refused", "error", "fatal"))] or lines[-5:]
+        raise Failed("the tuning bundle's microphone chain does not compile for this Mac:\n" + "\n".join(why))
+    return lines[-1] if lines else ""
+
+
+def read_mic_blob(path, board, desc):
+    """(sha256, header) of a microphone blob this Mac's plugin variant
+    takes; Failed with the reasons otherwise."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(wiring.MIC_BLOB_MAX + 1)
+        h = wiring.mic_blob_header(data)
+    except (OSError, wiring.Refused) as e:
+        raise Failed(f"the microphone blob {path}: {e}") from None
+    errs = wiring.mic_blob_errors(h, board, desc)
+    if errs:
+        raise Failed(f"the microphone blob {path}: " + "; ".join(errs))
+    return hashlib.sha256(data).hexdigest(), h
+
+
+def mic_check(blob, args):
+    """speakerguardd-selfcheck's microphone verdict for `blob` (the header
+    again, and one silent block through the packaged plugin), as a dict."""
+    cmd = [sys.executable, "-I", os.path.join(HERE, "speakerguardd-selfcheck"), "mic", "--blob", blob, "--dt", args.dt, "--json", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        return {"result": "refused", "detail": f"the microphone check did not answer ({e})"}
+
+
+def find_mic_pcm(desc, wait, proc):
+    """The array's capture PCM on the running card, waiting up to `wait`
+    seconds for the card as find_card does for the speakers'."""
+    deadline = time.monotonic() + wait
+    while True:
+        dev = wiring.live_mic_pcm(desc, proc)
+        if dev is not None:
+            return dev
+        if time.monotonic() >= deadline:
+            raise Absent(f"no microphone capture PCM on card {desc['card']} after {wait:.0f} s")
+        time.sleep(0.025)
+
+
+def mic_files(p, key):
+    import gen
+
+    return (os.path.join(p.mic_graph, "pipewire", gen.MIC_PIPEWIRE.format(key)),
+            os.path.join(p.mic_graph, "wireplumber", gen.MIC_WIREPLUMBER.format(key)))
+
+
+def mic_clear(p):
+    """No microphone of ours: no blob (at rest or published) and no graph
+    files, so a session links nothing and the distribution's own microphone
+    graph is the one in use."""
+    left = []
+    for f in [p.mic, p.mic + ".new", p.mic_published, *glob.glob(os.path.join(p.mic_graph, "*", "*.conf"))]:
+        try:
+            unlink(f)
+        except OSError as e:
+            left.append(f"removing {f}: {e}")
+    return left
+
+
+def mic_ready(p, uid):
+    """{(kind, name): path} of the microphone graph's two files when this
+    boot's microphone is provisioned for user `uid` and whole: the state
+    says pass for that user, both files are there, and the published blob is
+    the one the state names. Otherwise {}: a session links both files or
+    neither, never one (WirePlumber's rule alone would leave no microphone,
+    the PipeWire file alone two)."""
+    st = read_kv(p.mic_state)
+    if st.get("result") != "pass" or st.get("uid") != str(uid):
+        return {}
+    want = {}
+    for kind in ("pipewire", "wireplumber"):
+        name = st.get(kind, "")
+        path = os.path.join(p.mic_graph, kind, name)
+        if not name or os.path.basename(name) != name or not os.path.isfile(path):
+            return {}
+        want[(kind, name)] = path
+    try:
+        if sha256_file(p.mic_published) != st.get("sha256"):
+            return {}
+    except OSError:
+        return {}
+    return want
+
+
+def mic_step(args, p):
+    """The built-in microphone, after the speakers and apart from them:
+
+    1. the device tree's microphone array (wiring.read_mic_dt); a Mac
+       without one (Mac mini, Mac Studio) ends here, with nothing written;
+    2. compile the same bundle's microphone chain for this board into
+       mic.bin beside the speaker blob, bound like it (MIC_BIND_KEYS); the
+       compiler refuses a design it cannot carry whole;
+    3. the blob's header is this board's, at the array's rate and
+       microphone count, complete, and of the version the plugin takes;
+    4. the packaged plugin runs it (speakerguardd-selfcheck mic: health 0);
+    5. publish the blob for the plugin (/run/speakerguardd/mic.bin) and
+       write the microphone graph's two files and their state for the seat
+       user's session (graph-user links them).
+
+    Anything else removes the blob and the files, so the session keeps the
+    distribution's microphone graph, and says why. Nothing here touches the
+    speakers' blob, records, configuration or exit status."""
+    import gen
+
+    live = not p.root
+    mic = wiring.read_mic_dt(args.dt)
+    prev = read_kv(p.mic_state)
+    if mic is None:
+        # No array: no step. Only what an earlier image of this disk in
+        # another Mac could have left is removed.
+        if os.path.exists(p.mic) or os.path.exists(p.mic_bind) or prev:
+            mic_clear(p)
+            for f in (p.mic_bind, p.mic_report, p.mic_state):
+                unlink(f)
+        return None
+    rec = {"version": MIC_VERSION, "result": "refused", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "reasons": [],
+           "board": "-", "unit": unit_id(args.dt), "bundle_digest": "-", "macos_build": "-", "compiler": "-", "source": "-",
+           "blob_version": wiring.MIC_BLOB_VERSION, "mic_sha256": "-", "compiled": False, "card": "-", "seat_user": "-"}
+    state = None
+    try:
+        desc = wiring.describe_mic(mic)
+        ensure_dir(p.state, 0o755, live)
+        override = read_kv(p.override)
+        rec["board"] = board_of(args.dt)
+        src, sargs = source_args(args, override)
+        cli = tuning_cli(args)
+        ident = identify(cli, sargs)
+        if (ident.get("kind") != "Installer" or ident.get("board") != rec["board"] or ident.get("unit_bound") is not True
+                or rec["unit"] in ("-", "malformed") or ident.get("unit_id") != rec["unit"] or not ident.get("macos_build")):
+            raise Failed("tuning provenance must name this board and this Mac's unit, extracted from its own macOS")
+        rec.update(bundle_digest=ident["digest"], macos_build=ident["macos_build"], source=ident.get("source", src),
+                   compiler=f"{ident.get('reader')}:{sha256_file(cli)[:16]}")
+        desc = dict(desc, dev=find_mic_pcm(desc, args.card_wait, p.proc_asound))
+        rec.update(card=desc["card"], dev=desc["dev"], channels=desc["channels"], rate=desc["rate"])
+        old = read_kv(p.mic_bind)
+        why = "forced" if args.force else None
+        if why is None:
+            try:
+                rec["mic_sha256"], header = read_mic_blob(p.mic, rec["board"], desc)
+                stale = [k for k in MIC_BIND_KEYS if str(rec[k]) != old.get(k)]
+                if stale or old.get("result") != "pass":
+                    why = f"changed: {', '.join(stale) or 'result'}"
+            except Failed as e:
+                why = "no blob" if not os.path.exists(p.mic) else str(e)
+        if why is not None:
+            log(f"microphone: compiling for {rec['board']} from macOS {rec['macos_build']} ({why})")
+            log("microphone: " + compile_mic(cli, sargs, p.mic + ".new"))
+            sha, header = read_mic_blob(p.mic + ".new", rec["board"], desc)
+            os.chmod(p.mic + ".new", 0o600)
+            os.rename(p.mic + ".new", p.mic)
+            rec.update(mic_sha256=sha, compiled=True)
+        # Compiled from this Mac's own Apple tuning: root only at rest.
+        os.chmod(p.mic, 0o600)
+        rec["latency"] = header["latency"]
+        user, how = resolve_seat_user(p, override, etc=args.etc)
+        pw = pwd.getpwnam(user)
+        rec["seat_user"] = user
+        verdict = mic_check(p.mic, args)
+        if verdict.get("result") != "pass" or verdict.get("blob_sha256") != rec["mic_sha256"]:
+            raise Failed(f"the packaged plugin does not run the microphone blob: {verdict.get('detail', verdict)}")
+        with open(p.mic, "rb") as f:
+            data = f.read()
+        if hashlib.sha256(data).hexdigest() != rec["mic_sha256"]:
+            raise Failed("the microphone blob changed while it was checked")
+        ensure_dir(p.run_dir, 0o755, live)
+        source = f"the device tree of {rec['board']}"
+        pw_file, wp_file = mic_files(p, desc["key"])
+        for d in (p.graph, p.mic_graph, os.path.dirname(pw_file), os.path.dirname(wp_file)):
+            os.makedirs(d, mode=0o755, exist_ok=True)
+            os.chmod(d, 0o755)  # the seat user's session reads it, whatever the caller's umask
+        # The state last: a session links the files only once all of them
+        # and the published blob are whole (mic_ready).
+        unlink(p.mic_state)
+        for f in glob.glob(os.path.join(p.mic_graph, "*", "*.conf")):
+            if f not in (pw_file, wp_file):
+                unlink(f)
+        write_atomic(p.mic_published, data)
+        write_atomic(pw_file, gen.mic_pipewire_conf(desc, source))
+        write_atomic(wp_file, gen.mic_wireplumber_conf(desc, source))
+        state = (f"result=pass\nuser={user}\nuid={pw.pw_uid}\nsha256={rec['mic_sha256']}\n"
+                 f"pipewire={os.path.basename(pw_file)}\nwireplumber={os.path.basename(wp_file)}\n")
+        write_atomic(p.mic_state, state)
+        rec["result"] = "pass"
+    except Absent as e:
+        rec["result"] = "absent"
+        rec["reasons"].append(str(e))
+    except (Failed, wiring.Refused) as e:
+        rec["reasons"].append(str(e))
+    except Exception as e:  # noqa: BLE001 - every failure is a refusing record
+        rec["reasons"].append(f"internal error: {type(e).__name__}: {e}")
+    if rec["result"] != "pass":
+        rec["result"] = "absent" if rec["result"] == "absent" else "refused"
+        rec["reasons"] += mic_clear(p)
+        rec["mic_sha256"] = "-"
+        try:
+            if os.path.isdir(p.mic_graph):
+                write_atomic(p.mic_state, f"result={rec['result']}\n")
+        except OSError as e:
+            rec["reasons"].append(f"writing {p.mic_state}: {e}")
+    try:
+        os.makedirs(p.state, exist_ok=True)
+        write_atomic(p.mic_report, json.dumps(rec, indent=1) + "\n", mode=0o600)
+        write_atomic(p.mic_bind, "".join(f"{k}={rec[k]}\n" for k in ["result", *MIC_BIND_KEYS]), mode=0o600)
+    except OSError as e:
+        log(f"microphone: writing the record: {e}")
+    if rec["result"] == "pass":
+        log(f"microphone: provisioned {rec['board']}: blob {rec['mic_sha256'][:12]} ({'compiled' if rec['compiled'] else 'bound'}), "
+            f"card {rec['card']}, seat user {rec['seat_user']}; \"Built-in Microphone\" is speakerguardd's at the next session start")
+    else:
+        log(f"microphone: {rec['result']} on {rec['board']}; the distribution's microphone graph stays in use "
+            "(the speakers are not affected):")
+        for r in rec["reasons"]:
+            for i, line in enumerate(r.splitlines()):
+                log(("  - " if i == 0 else "    ") + line)
+    # A session that linked the microphone graph and is still running would
+    # be left with half of it once the files are gone (WirePlumber alone
+    # restarting would bring the distribution's graph back beside ours):
+    # restart it on what is there now, as for a changed speaker graph.
+    if live and prev.get("result") == "pass" and rec["result"] != "pass" and prev.get("user"):
+        refresh_session(p, prev["user"], time.monotonic_ns() // 1000, args.graph_unit)
+    return rec
 
 
 def card_layout(idx, proc="/proc/asound"):
@@ -962,14 +1249,15 @@ def cmd_activate(args, p):
 
 
 def cmd_deactivate(args, p):
-    """The older daemons take the speakers back in this boot (aurora-speaker-
-    upgrade --revert on a dual kernel): remove v2's graph and bring the seat
-    user's running session back onto the distribution's own speaker graph
-    now, instead of at the next boot."""
+    """v2 lets the speakers go in this boot (aurora-speaker-upgrade, when a
+    switch on a dual kernel did not go through): remove v2's graph and bring
+    the seat user's running session back onto the distribution's own speaker
+    graph now, instead of at the next boot. No speaker daemon takes over:
+    the kernel's own limit holds the speakers."""
     import gen
 
     conf = read_kv(p.conf)
-    clear_graph(p, result="legacy")
+    clear_graph(p, result="off")
     # The raw-PCM rules and the UCM marker hide the distribution's own
     # speaker device; they go too (provisioning writes them again).
     for f in glob.glob(os.path.join(p.raw, "*.conf")) + [os.path.join(p.graph, gen.UCM_MARKER)]:
@@ -1045,8 +1333,13 @@ def cmd_graph_user(args, p):
         for d in ("pipewire", "wireplumber"):
             for f in sorted(glob.glob(os.path.join(p.graph, d, "*.conf"))):
                 want[(d, os.path.basename(f))] = f
+    # The built-in microphone's graph, whatever the speakers' state: both of
+    # its files for the user it is provisioned for, or neither
+    mic = mic_ready(p, os.getuid())
+    keep = {**want, **mic}
     prefixes = tuple({os.path.join(p.graph, ""), os.path.join(os.path.realpath(p.graph), "")})
-    for d, cdir in user_conf_dirs().items():
+    dirs = user_conf_dirs()
+    for d, cdir in dirs.items():
         try:
             names = os.listdir(cdir)
         except OSError:
@@ -1056,7 +1349,7 @@ def cmd_graph_user(args, p):
             if not os.path.islink(path):
                 continue
             target = os.readlink(path)
-            if target.startswith(prefixes) and want.get((d, n)) != target:
+            if target.startswith(prefixes) and keep.get((d, n)) != target:
                 unlink(path)
                 log(f"removed {path}")
         for (dd, n), target in want.items():
@@ -1071,9 +1364,51 @@ def cmd_graph_user(args, p):
             os.makedirs(cdir, exist_ok=True)
             os.symlink(target, path)
             log(f"linked {path}")
+    if mic and not link_pair(mic, dirs):
+        mic = {}
     if not seat:
         log(f"{not_seat_reason(conf, st)}: no speaker graph here")
+    if not mic and os.path.exists(p.mic_state):
+        log("no speakerguardd microphone graph for this session: the distribution's microphone graph is in use")
     return 0
+
+
+def link_pair(pair, dirs):
+    """Link the microphone graph's two files, both or neither. A file of the
+    user's at either name, or a link that cannot be made, leaves neither of
+    ours linked (a WirePlumber rule alone would leave no microphone, the
+    PipeWire file alone two). Only our own links are ever removed; the
+    user's files and every other link stay as they are. True when both are
+    linked."""
+    plan = []
+    for (d, n), target in sorted(pair.items()):
+        if d not in dirs:
+            return unlink_pair(pair, dirs, f"no {d} configuration directory")
+        path = os.path.join(dirs[d], n)
+        if os.path.islink(path) and os.readlink(path) == target:
+            continue
+        if os.path.lexists(path):
+            return unlink_pair(pair, dirs, f"{path} exists and is not speakerguardd's")
+        plan.append((path, target))
+    for path, target in plan:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.symlink(target, path)
+        except OSError as e:
+            return unlink_pair(pair, dirs, f"cannot link {path} ({e})")
+        log(f"linked {path}")
+    return True
+
+
+def unlink_pair(pair, dirs, why):
+    """Remove whichever of the microphone graph's links is ours; False."""
+    for (d, n), target in pair.items():
+        path = os.path.join(dirs.get(d, ""), n)
+        if d in dirs and os.path.islink(path) and os.readlink(path) == target:
+            unlink(path)
+            log(f"removed {path}")
+    log(f"{why}: no speakerguardd microphone graph for this session (both files or neither)")
+    return False
 
 
 def not_seat_reason(conf, st):
@@ -1294,7 +1629,7 @@ def cmd_session_start(args, p):
 
 
 def cmd_status(args, p):
-    for path in (p.report, p.selfcheck_json):
+    for path in (p.report, p.selfcheck_json, p.mic_report):
         try:
             with open(path) as f:
                 print(f"{path}:\n{f.read()}")

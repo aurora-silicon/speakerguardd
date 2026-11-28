@@ -71,6 +71,17 @@
    }
   ]
  },
+ "mic": {
+  "node": "soc/aop@24ac00000/audio",
+  "compatible": [
+   "apple,t8103-aop-audio",
+   "apple,aop-audio"
+  ],
+  "dma_names": [
+   "dma"
+  ],
+  "chassis": "J313"
+ },
  "tuning": {
   "tuning": {
    "aid": "-",

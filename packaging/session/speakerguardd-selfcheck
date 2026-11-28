@@ -7,6 +7,8 @@ speakerguardd may grant.
     speakerguardd-selfcheck check    --params BLOB
     speakerguardd-selfcheck verify   --params BLOB [--json FILE] [--attestations FILE] [-- TUNING-SOURCE...]
     speakerguardd-selfcheck generate --pipewire-dir D --wireplumber-dir D
+    speakerguardd-selfcheck mic      [--blob BLOB] [--json FILE|-]   (the built-in microphone's verdict, apart
+                                                                      from the speakers': see mic_verdict)
 
 It runs as root, before the supervisor, while the kernel holds the speakers
 at its floor, in two units:
@@ -80,7 +82,7 @@ before it switches a Mac to v2. It changes nothing, plays only zero samples,
 and stops at the first failing step:
 
 0. **kernel**: the v2 interface, alone or beside the volume lock (the dual
-   kernel's "Speaker Protection Interface"); a legacy-only kernel cannot run.
+   kernel's "Speaker Protection Interface"); a kernel without it cannot run.
 1. **hardware** (steps 1-3 above): a passing record bound to this board,
    kernel and blob. Without one (never run, or stale) it cannot run (2).
 2. **voicing** (`aurora-speaker-tuning voicing-check`): the Mac's own chain
@@ -104,9 +106,9 @@ and stops at the first failing step:
    one more that wakes the path) must leave their xrun counts unchanged.
    Without a running v2 graph only the generated config is checked.
 
-Exit codes: 0 pass (the switch may proceed), 1 refused (stay on the legacy
-stack; reason on stderr), 2 cannot run (retry later; do not switch), 3
-internal error (treat as refused). `--json FILE`: {"result", "board",
+Exit codes: 0 pass (the switch may proceed), 1 refused (no switch: the
+speakers stay at the kernel's own limit; reason on stderr), 2 cannot run
+(retry later; do not switch), 3 internal error (treat as refused). `--json FILE`: {"result", "board",
 "kernel", "params_sha256", "wiring_hash", "steps": [{"name", "result",
 "detail"}]}.
 """
@@ -305,7 +307,7 @@ def lease_interface(card, switch=False):
         if not (switch or wiring.upgraded()):
             raise wiring.Refused(
                 f"this kernel serves both speaker interfaces and {wiring.IF_UNLOCK!r} is in charge: this Mac was not "
-                "switched to speakerguardd v2 (aurora-speaker-upgrade), so the older daemons own the speakers")
+                "switched to speakerguardd v2 (aurora-speaker-upgrade), so the kernel's volume lock holds the speakers")
         wiring.interface_lease(card)
         log(f"{wiring.INTERFACE_CONTROL!r} = {wiring.IF_LEASE!r} (the volume lock's floor first)")
     return "dual"
@@ -1282,6 +1284,96 @@ def cmd_check(args):
     return 0
 
 
+# ------------------------------------------------------------------ microphone
+
+MIC_BLOB = os.path.join(STATE, "mic.bin")
+MIC_PROBE_S = 30
+
+
+def mic_probe(blob, mics, rate, lv2_dirs=SYSTEM_LV2):
+    """(health, latency) of the packaged plugin's microphone variant on
+    `blob` (wiring.mic_plugin_health), from a process of its own: the probe
+    loads the plugin's native code, and whatever that does must not end a
+    speaker check. Refuses when the probe gives no answer."""
+    cmd = [sys.executable, "-I", os.path.join(HERE, os.path.basename(__file__)), "mic-probe", "--blob", blob,
+           "--mics", str(mics), "--rate", str(rate), "--lv2-dir", ":".join(lv2_dirs)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=MIC_PROBE_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise wiring.Refused(f"the plugin probe did not run ({e})") from None
+    m = re.fullmatch(r"health=(-?\d+) latency=(-?\d+)", r.stdout.strip())
+    if r.returncode != 0 or not m:
+        raise wiring.Refused(f"the plugin probe failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def cmd_mic_probe(args):
+    try:
+        health, latency = wiring.mic_plugin_health(wiring.mic_plugin_lib(args.lv2_dir.split(":")), args.blob,
+                                                   args.mics, args.rate)
+    except wiring.Refused as e:
+        log(f"mic-probe: {e}")
+        return EXIT_REFUSED
+    print(f"health={health} latency={latency}")
+    return 0
+
+
+def mic_verdict(blob, dt="/proc/device-tree"):
+    """The built-in microphone's verdict, apart from the speakers':
+
+    - absent: this Mac has no microphone array, or no microphone blob is
+      provisioned (the distribution's own microphone graph is in use);
+    - pass: the blob is this board's, complete, of the version, rate and
+      microphone count the packaged plugin's variant for this Mac's array
+      takes, and that plugin runs it (health 0);
+    - refused: anything else, with the reasons.
+
+    Read-only: the blob's header and one silent block through the plugin;
+    the microphone itself is never opened."""
+    out = {"result": "refused", "board": "-", "detail": "", "blob_sha256": "-"}
+    try:
+        mic = wiring.read_mic_dt(dt)
+        if mic is None:
+            return dict(out, result="absent", detail="this Mac has no built-in microphone array")
+        desc = wiring.describe_mic(mic)
+        out["board"] = wiring.board_of(wiring._strs(wiring._read(os.path.join(dt, "compatible"))))
+        out.update(card=desc["card"], channels=desc["channels"], rate=desc["rate"])
+        try:
+            with open(blob, "rb") as f:
+                data = f.read(wiring.MIC_BLOB_MAX + 1)
+        except FileNotFoundError:
+            return dict(out, result="absent", detail=f"no microphone blob is provisioned ({blob})")
+        out["blob_sha256"] = hashlib.sha256(data).hexdigest()
+        h = wiring.mic_blob_header(data)
+        out.update(version=h["version"], mics=h["mics"], latency=h["latency"])
+        errs = wiring.mic_blob_errors(h, out["board"], desc)
+        if errs:
+            return dict(out, detail="; ".join(errs))
+        health, latency = mic_probe(blob, desc["channels"], desc["rate"])
+        out["health"] = health
+        if health != 0:
+            return dict(out, detail=f"the packaged plugin refuses the blob (health {health})")
+        if latency != h["latency"]:
+            return dict(out, detail=f"the plugin reports {latency} frames of latency, the blob {h['latency']}")
+        return dict(out, result="pass",
+                    detail=f"{h['mics']} microphones at {h['rate']} Hz, blob version {h['version']}, plugin health 0")
+    except (wiring.Refused, OSError) as e:
+        return dict(out, detail=str(e))
+    except Exception as e:  # noqa: BLE001 - the verdict is a report, never an error of the caller
+        return dict(out, detail=f"internal error: {type(e).__name__}: {e}")
+
+
+def cmd_mic(args):
+    """`mic`: the microphone verdict alone (exit 0 pass or absent, 1 refused)."""
+    v = mic_verdict(args.blob or MIC_BLOB, args.dt)
+    if args.json == "-":
+        print(json.dumps(v, indent=1))
+    elif args.json:
+        write_atomic(args.json, json.dumps(v, indent=1) + "\n")
+    log(f"mic: {v['result']}: {v['detail']}")
+    return EXIT_REFUSED if v["result"] == "refused" else EXIT_PASS
+
+
 # ------------------------------------------------------------------ verify
 
 EXIT_PASS, EXIT_REFUSED, EXIT_CANNOT, EXIT_ERROR = 0, 1, 2, 3
@@ -1328,7 +1420,7 @@ def verify_kernel(args):
     volume lock behind "Speaker Protection Interface")."""
     iface, card = kernel_interface()
     if iface in (None, "legacy"):
-        raise Cannot(f"this kernel has no v2 speaker interface ({card or 'no speaker card'}): the legacy protection keeps the speakers")
+        raise Cannot(f"this kernel has no v2 speaker interface ({card or 'no speaker card'}): the kernel's own limit holds the speakers")
     return f"{card}: " + ("both interfaces (Speaker Protection Interface)" if iface == "dual" else "v2 interface only")
 
 
@@ -1549,11 +1641,15 @@ def cmd_verify(args):
     except Exception as e:  # noqa: BLE001 - an internal error refuses
         out["steps"].append({"name": "internal", "result": "error", "detail": f"{type(e).__name__}: {e}"})
         out["result"], code = "error", EXIT_ERROR
+    # The built-in microphone's verdict, reported beside the speakers': it
+    # is not a step, and changes neither the result nor the exit code.
+    out["mic"] = mic_verdict(os.path.join(args.state, "mic.bin"))
     if args.json:
         write_atomic(args.json, json.dumps(out, indent=1) + "\n")
     for st in out["steps"]:
         log(f"verify {st['name']}: {st['result']}: {st['detail']}")
     log(f"verify: {out['result']} ({out['board']}, {out['kernel']})")
+    log(f"verify mic (apart from the result above): {out['mic']['result']}: {out['mic']['detail']}")
     return code
 
 
@@ -1604,7 +1700,7 @@ def cmd_generate(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="speakerguardd-selfcheck")
-    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify"])
+    ap.add_argument("cmd", choices=["run", "pending", "check", "generate", "verify", "mic", "mic-probe"])
     ap.add_argument("--params")
     ap.add_argument("--state", default=STATE)
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
@@ -1624,14 +1720,21 @@ def main():
     ap.add_argument("--conf", default=None,
                     help="verify: the units' environment file (default /etc/speakerguardd/speakerguardd.conf; "
                          "aurora-speaker-upgrade --check passes its private root's)")
+    ap.add_argument("--blob", help="mic: the microphone blob (default the provisioned one)")
+    ap.add_argument("--dt", default="/proc/device-tree", help="mic: the device tree")
+    ap.add_argument("--mics", type=int, help="mic-probe: the plugin variant's microphone count")
+    ap.add_argument("--rate", type=int, help="mic-probe: the sample rate")
+    ap.add_argument("--lv2-dir", default=":".join(SYSTEM_LV2), help="mic-probe: the LV2 directories to load the plugin from")
     ap.add_argument("tuning", nargs="*", help="after --: the tuning source, as aurora-speaker-tuning takes it")
     args = ap.parse_args()
     if args.cmd in ("run", "check", "verify") and not args.params:
         ap.error("--params is required")
     if args.cmd == "generate" and not (args.pipewire_dir and args.wireplumber_dir):
         ap.error("--pipewire-dir and --wireplumber-dir are required")
+    if args.cmd == "mic-probe" and not (args.blob and args.mics and args.rate):
+        ap.error("--blob, --mics and --rate are required")
     return {"run": cmd_run, "pending": cmd_pending, "check": cmd_check, "generate": cmd_generate,
-            "verify": cmd_verify}[args.cmd](args)
+            "verify": cmd_verify, "mic": cmd_mic, "mic-probe": cmd_mic_probe}[args.cmd](args)
 
 
 if __name__ == "__main__":

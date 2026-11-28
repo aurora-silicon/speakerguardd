@@ -1393,6 +1393,73 @@ class Describe(unittest.TestCase):
             self.assertIn(f'hw:CARD={c["card"]},DEV=1', gen.pipewire_conf(m, c, w))
 
 
+class Microphones(unittest.TestCase):
+    """The built-in microphone graph's shipped files, from the fixtures'
+    microphone nodes (wiring.read_mic_dt of each board's device tree)."""
+
+    def with_mic(self):
+        return [m for m in gen.machines() if gen.mic_machine(m) is not None]
+
+    def test_shipped_files_are_the_fixtures_with_an_array(self):
+        pkg = os.path.dirname(os.path.dirname(os.path.abspath(gen.__file__)))
+        have = sorted(f[len("sgv2-mic-"):-len(".conf")] for f in os.listdir(os.path.join(pkg, "pipewire")) if f.startswith("sgv2-mic-"))
+        rules = sorted(f[len("61-sgv2-mic-"):-len(".conf")] for f in os.listdir(os.path.join(pkg, "wireplumber")) if f.startswith("61-sgv2-mic-"))
+        self.assertEqual(have, self.with_mic())
+        self.assertEqual(rules, self.with_mic())
+        self.assertTrue(have)
+        # a desktop Mac has no array, and every fixture says which it is
+        self.assertTrue(set(gen.machines()) - set(have))
+        for m in gen.machines():
+            self.assertIn("mic", gen.fixture(m), m)
+
+    def test_the_graph_is_the_arrays(self):
+        for m in self.with_mic():
+            d = gen.mic_machine(m)
+            fx = gen.fixture(m)["mic"]
+            t = wiring.mic_transport(fx)
+            self.assertIn(t["dma"], fx["dma_names"])
+            self.assertEqual((d["key"], d["card"], d["dev"]), (m, f"Apple{fx['chassis']}{t['card']}", t["dev"]))
+            pw, wp = gen.mic_pipewire_conf(d), gen.mic_wireplumber_conf(d)
+            for text in (pw, wp):
+                self.assertEqual(text.count("{"), text.count("}"))
+                self.assertEqual(text.count("["), text.count("]"))
+            # sgv2's own node on the PCM, by the name no other rule matches
+            self.assertIn(f'api.alsa.path          = "hw:CARD={d["card"]},DEV={d["dev"]}"', pw)
+            self.assertNotIn(f'"hw:{d["card"]},{d["dev"]}"', pw)
+            self.assertIn(f'sgv2#mic-{d["channels"]}ch"', pw)
+            self.assertEqual(pw.count('"mic:in_'), d["channels"])
+            self.assertEqual(pw.count(f"audio.rate         = {d['rate']}"), 2)
+            # exactly one source is called the built-in microphone, above the raw array
+            self.assertEqual(pw.count('node.description   = "Built-in Microphone"'), 1)
+            self.assertEqual(pw.count('media.class        = "Audio/Source"') + pw.count('media.class            = "Audio/Source"'), 2)
+            self.assertIn(f"priority.session       = {gen.MIC_RAW_PRIORITY}", pw)
+            self.assertIn(f"priority.session   = {gen.MIC_PRIORITY}", pw)
+            self.assertLess(gen.MIC_RAW_PRIORITY, gen.MIC_PRIORITY)
+            self.assertIn(f'target.object      = "{gen.mic_names(m)["raw"]}"', pw)
+            # WirePlumber's own node on that PCM is the one switched off
+            self.assertIn(f'{{ api.alsa.path = "hw:{d["card"]},{d["dev"]}" }}', wp)
+            self.assertIn(f'{{ alsa.id = "{d["card"]}", alsa.device = {d["dev"]} }}', wp)
+            self.assertIn("node.disabled = true", wp)
+            self.assertNotIn("software-dsp", wp.split("monitor.alsa.rules")[1])
+
+    def test_no_array_without_its_stream_or_its_card_name(self):
+        fx = gen.fixture(self.with_mic()[0])["mic"]
+        self.assertEqual(wiring.describe_mic(fx)["channels"], wiring.mic_transport(fx)["channels"])
+        with self.assertRaises(wiring.Refused):
+            wiring.describe_mic(dict(fx, chassis=None))
+        with self.assertRaises(wiring.Refused):
+            wiring.describe_mic(dict(fx, chassis="J3/16"))
+        with self.assertRaises(wiring.Refused):
+            wiring.describe_mic(dict(fx, compatible=["apple,other-audio"]))
+
+    def test_the_speaker_wiring_does_not_read_the_microphone_node(self):
+        for m in gen.machines():
+            fx = gen.fixture(m)
+            c, w = gen.machine(m)
+            fx2 = dict(fx, mic=None)
+            self.assertEqual(wiring.derive(fx2["hw"], fx2["tuning"])["hash"], w[2])
+
+
 class PcmWidths(unittest.TestCase):
     """A transport whose PCMs are wider than the link's amps: the T6040
     speaker service has six playback and twelve sense channels on every

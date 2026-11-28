@@ -1098,5 +1098,152 @@ class Report(unittest.TestCase):
         self.assertFalse(sgs.write_report("/nonexistent-dir/session", True, True))
 
 
+class IdleWatch(unittest.TestCase):
+    def test_hold_watch_wakes_on_created_dir_hold_file_and_helper_restart(self):
+        import select
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            sleep_hold = os.path.join(d, "speakerguardd-sleep", "hold")
+            selfcheck = os.path.join(d, "speakerguardd-selfcheck", "active")
+            helper_dir = os.path.join(d, "helper")
+            os.mkdir(helper_dir, 0o750)
+            report = os.path.join(helper_dir, "session")
+            w = sgs.HoldWatch((sleep_hold, selfcheck), report)
+            self.addCleanup(w.close)
+            if not w.active:
+                self.skipTest("inotify unavailable")
+            # Unrelated file in parent dir does not trigger a hit.
+            with open(os.path.join(d, "unrelated"), "w") as f:
+                f.write("x")
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertFalse(w.drain())
+            # Creating the sleep directory and hold file wakes immediately.
+            os.mkdir(os.path.dirname(sleep_hold))
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+            # A subsequent hold write inside the now-watched dir wakes too.
+            with open(sleep_hold, "w") as f:
+                f.write("since_ns=1\n")
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+            # Writing our own report inside helper_dir must NOT count as a
+            # supervisor-restart hit (fchmod on .session.<pid> has a child name).
+            self.assertTrue(sgs.write_report(report, True, True))
+            r, _, _ = select.select([w.fd], [], [], 0.05)
+            if r:
+                self.assertFalse(w.drain())
+            # Supervisor restart (chmod on helper_dir) or deleted report DOES wake.
+            os.chmod(helper_dir, 0o750)
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+            os.unlink(report)
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+            # Renaming the idle report away must also wake the watch.
+            self.assertTrue(sgs.write_report(report, True, True))
+            r, _, _ = select.select([w.fd], [], [], 0.05)
+            if r:
+                w.drain()
+            os.rename(report, report + ".old")
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+
+    def test_hold_watch_degrades_when_target_dir_watch_fails_or_replaces(self):
+        import select
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            sleep_dir = os.path.join(d, "speakerguardd-sleep")
+            os.mkdir(sleep_dir)
+            sleep_hold = os.path.join(sleep_dir, "hold")
+            selfcheck = os.path.join(d, "speakerguardd-selfcheck", "active")
+            helper_dir = os.path.join(d, "rt", "1000", "helper")
+            os.makedirs(helper_dir)
+            report = os.path.join(helper_dir, "session")
+            w = sgs.HoldWatch((sleep_hold, selfcheck), report)
+            self.addCleanup(w.close)
+            if not w.active:
+                self.skipTest("inotify unavailable")
+            # Replacing an ancestor above helper_dir wakes and rebinds.
+            rt_dir = os.path.join(d, "rt")
+            rt_old = os.path.join(d, "rt.old")
+            os.rename(rt_dir, rt_old)
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+            os.makedirs(helper_dir)
+            w.sync()
+            self.assertTrue(w.active)
+            # If watching an existing target dir fails, active must be False so
+            # the helper falls back to the 250 ms cadence.
+            w._drop(sleep_dir)
+            orig_add = w._libc.inotify_add_watch
+            try:
+                w._libc.inotify_add_watch = lambda fd, path, mask: -1 if path == os.fsencode(sleep_dir) else orig_add(fd, path, mask)
+                w.sync()
+                self.assertFalse(w.active)
+            finally:
+                w._libc.inotify_add_watch = orig_add
+            w.sync()
+            self.assertTrue(w.active)
+            # Queue overflow must rebuild the inotify fd from scratch so
+            # lost kernel watches are re-established.
+            old_fd = w.fd
+            os.close(old_fd)
+            rfd, wfd = os.pipe()
+            os.set_blocking(rfd, False)
+            w.fd = rfd
+            try:
+                os.write(wfd, sgs._IN_EVENT_HDR.pack(-1, sgs._IN_Q_OVERFLOW, 0, 0))
+                self.assertTrue(w.drain())
+            finally:
+                os.close(wfd)
+            self.assertIsNotNone(w.fd)
+            self.assertTrue(w.active)
+            # Writing sleep_hold now wakes the rebuilt inotify fd (the old pipe
+            # fd could never observe filesystem events).
+            with open(sleep_hold, "w") as f:
+                f.write("since_ns=2\n")
+            r, _, _ = select.select([w.fd], [], [], 0.2)
+            self.assertEqual(r, [w.fd])
+            self.assertTrue(w.drain())
+            # A symlinked hold directory cannot be treated as absent: active
+            # must drop to False so the 250 ms fallback stays in effect.
+            real_sleep = os.path.join(d, "real-sleep")
+            os.rename(sleep_dir, real_sleep)
+            os.symlink(real_sleep, sleep_dir)
+            w.sync()
+            self.assertFalse(w.active)
+
+    def test_quiet_requires_no_hold_no_pending_and_settled_voicing_volume(self):
+        g, _, s = build("j616", linked=False)
+        self.assertTrue(s.is_quiet(g, False, False, False, False, hold_active=False))
+        self.assertFalse(s.is_quiet(g, False, False, False, False, hold_active=True))
+        s.vs_id, s.vs_settled = 42, False
+        self.assertFalse(s.is_quiet(g, False, False, False, False, hold_active=False))
+        s.vs_settled = True
+        self.assertTrue(s.is_quiet(g, False, False, False, False, hold_active=False))
+        s.pending[("x", 1)] = object()
+        self.assertFalse(s.is_quiet(g, False, False, False, False, hold_active=False))
+        s.pending.clear()
+        s.unlink_sent[99] = 1.0
+        self.assertFalse(s.is_quiet(g, False, False, False, False, hold_active=False))
+
+    def test_report_needed_skips_unchanged_settled_idle_reports(self):
+        key = (True, True, "0123456789abcdef", False, False)
+        self.assertTrue(sgs.report_needed(False, key, key, True))
+        self.assertFalse(sgs.report_needed(True, key, key, True))
+        self.assertTrue(sgs.report_needed(True, key, key, False))
+        self.assertTrue(sgs.report_needed(True, (False, True, "0123456789abcdef", False, False), key, True))
+        self.assertTrue(sgs.report_needed(True, key, key, True, force=True))
+
+
 if __name__ == "__main__":
     unittest.main()
