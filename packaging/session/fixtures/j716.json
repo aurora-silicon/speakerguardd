@@ -1,0 +1,293 @@
+{
+ "note": "MacBook Pro 16-inch (M5 Max, J716c): the sound node of arch/arm64/boot/dts/apple/t6050-j716c.dts (public); the T6050 AOP audio component is the one back-end, the six SN012776 amps sit on i2c1 (left) and i2c3 (right) with V below I on each amp's TX slots, and the CS42L84 jack is on i2c2. Tuning lanes: the structure of the graph's input lanes only (AID41: woofers on unit channels 0, 1, 2, 3, tweeters on 4, 5), with generic box names and no tuning values. The hardware half is wiring.py's reading of the compiled t6050-j716c.dtb.",
+ "hw": {
+  "board": "j716c",
+  "compatible": [
+   "apple,j716c",
+   "apple,t6050",
+   "apple,arm-platform"
+  ],
+  "sound": "sound",
+  "sound_compatible": [
+   "apple,j716-macaudio",
+   "apple,macaudio"
+  ],
+  "model": "MacBook Pro J716",
+  "links": [
+   {
+    "name": "Headphone Jack",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6050-aop-audio"
+     ]
+    ],
+    "cpu_dma_names": [
+     [
+      "cout",
+      "cin",
+      "spkr",
+      "sense",
+      "hpai"
+     ]
+    ],
+    "cpu_nodes": [
+     "soc@200000000/aop@290c00000/audio"
+    ],
+    "codecs": [
+     {
+      "node": "soc@200000000/i2c@505018000/codec@4b",
+      "prefix": "Jack",
+      "compatible": [
+       "cirrus,cs42l84"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Speaker",
+    "cpus": 1,
+    "cpu_compatible": [
+     [
+      "apple,t6050-aop-audio"
+     ]
+    ],
+    "cpu_dma_names": [
+     [
+      "cout",
+      "cin",
+      "spkr",
+      "sense",
+      "hpai"
+     ]
+    ],
+    "cpu_nodes": [
+     "soc@200000000/aop@290c00000/audio"
+    ],
+    "codecs": [
+     {
+      "node": "soc@200000000/i2c@505014000/codec@38",
+      "prefix": "Left Woofer 1",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 0,
+      "imon": 2
+     },
+     {
+      "node": "soc@200000000/i2c@50501c000/codec@3b",
+      "prefix": "Right Woofer 1",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 4,
+      "imon": 6
+     },
+     {
+      "node": "soc@200000000/i2c@505014000/codec@39",
+      "prefix": "Left Woofer 2",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 8,
+      "imon": 10
+     },
+     {
+      "node": "soc@200000000/i2c@50501c000/codec@3c",
+      "prefix": "Right Woofer 2",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 12,
+      "imon": 14
+     },
+     {
+      "node": "soc@200000000/i2c@505014000/codec@3a",
+      "prefix": "Left Tweeter",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 16,
+      "imon": 18
+     },
+     {
+      "node": "soc@200000000/i2c@50501c000/codec@3d",
+      "prefix": "Right Tweeter",
+      "compatible": [
+       "ti,sn012776",
+       "ti,tas2764"
+      ],
+      "vmon": 20,
+      "imon": 22
+     }
+    ]
+   }
+  ]
+ },
+ "tuning": {
+  "tuning": {
+   "aid": "-",
+   "selection": {
+    "sample_rate": 48000,
+    "substitutions": {
+     "fs": "48000"
+    }
+   },
+   "protection": {
+    "kind": "spp3",
+    "lanes": [
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverLF",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "Out",
+        "input": 0,
+        "channel": 0
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverLF",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "Out",
+        "input": 1,
+        "channel": 1
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverLF",
+        "input": 2,
+        "channel": 2
+       },
+       {
+        "join": "Out",
+        "input": 2,
+        "channel": 2
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverLF",
+        "input": 3,
+        "channel": 3
+       },
+       {
+        "join": "Out",
+        "input": 3,
+        "channel": 3
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 0
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 0,
+        "channel": 0
+       },
+       {
+        "join": "XoverHF",
+        "input": 4,
+        "channel": 4
+       },
+       {
+        "join": "Out",
+        "input": 4,
+        "channel": 4
+       }
+      ]
+     },
+     {
+      "origin": {
+       "node": "in",
+       "port": 0,
+       "channel": 1
+      },
+      "hops": [
+       {
+        "join": "Split",
+        "input": 1,
+        "channel": 1
+       },
+       {
+        "join": "XoverHF",
+        "input": 5,
+        "channel": 5
+       },
+       {
+        "join": "Out",
+        "input": 5,
+        "channel": 5
+       }
+      ]
+     }
+    ],
+    "strip_properties": []
+   }
+  }
+ }
+}

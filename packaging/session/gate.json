@@ -92,6 +92,18 @@
         "evidence": "j713 ladder 2026-11-25 19:35 EST: 39,275 records, lost=0, health_or=0x0, 0 amp/TDM faults (0,0,0 across all 4 sn012776 amps); woofer coil max 102.15 / 100.51 C (1.669 / 1.595 W), tweeter coil max 133.28 / 133.42 C (0.407 / 0.400 W), LSM2 limiter held -1.09 dB equilibrium at ~132.5 C; mic capture -31.5 / -33.1 dBFS; kill -9 withdrew protection at once (1 start refused), restored saved thermal state, and re-granted lease in 1.415 s"
       }
     ],
+    "AID41": [
+      {
+        "date": "2026-11-24",
+        "board": "j716c",
+        "what": "slider 0.3 / 0.6 / 1.0 ladder for 60 / 60 / 300 s (-6 dBFS pink noise), 3-ch AppleJ716HPAI mic capture, supervisor kill -9 at +150 s of the 1.0 hold; v2 on 7.3.0-ewb298+ (main d420ae2bd61a + t8152_aop_audio SenseRing c3feb10d6265 + J716c speakers df9f3c9377f6)",
+        "covers": [
+          "loud-step",
+          "thermal-ramp"
+        ],
+        "evidence": "lab row 2026-11-24 (j716c ladder, 7.3.0-ewb298+): 39762 rows, health_or 0x0, 0 lost frames, sense_delay 1600..1632, 0,0,0 amp fault status on all 6 amps; model max 103.9 / 103.8 / 103.9 / 103.8 C (woofers) and 58.0 / 58.1 C (tweeters); closed-loop fresh max 87.6 / 86.4 / 84.1 / 85.9 C (woofers) and 45.8 / 47.9 C (tweeters) with aligned coil resistance across all 6 channels before (3.895 / 3.884 / 3.917 / 3.928 / 3.421 / 3.428 ohm) and after kill -9 (4.008 / 3.996 / 4.015 / 4.040 / 3.426 / 3.452 ohm); mic capture [-39.2, -35.9, -36.5] dBFS; lease re-granted 1.254 s after kill -9"
+      }
+    ],
     "AID44": [
       {
         "date": "2026-11-07",
