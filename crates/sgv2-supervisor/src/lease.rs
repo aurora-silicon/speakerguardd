@@ -168,6 +168,103 @@ impl Regrant {
     }
 }
 
+/// A lapse whose last renewal is at least this old counts as a sleep even
+/// when no sleep was seen: a gap this long is not a late tick, and the wait
+/// for the engine's first beat after a thaw is the safe reading of it. The
+/// late ticks seen so far renewed 38-39 ms after the last renewal (J713,
+/// 11-28, three stream ends); 100 ms is over twice the worst of them and
+/// keeps the window in which a short sleep could pass for a stall small.
+pub const LAPSE_STALL_MAX_NS: u64 = 100_000_000;
+
+/// Why a lease lapsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LapseCause {
+    /// A system sleep, or a lapse that cannot be told from one: the kernel
+    /// has no sleep count or it moved, the suspend clock or counters moved
+    /// since the last renewal, the lapse came on a grant rather than a
+    /// renewal (the first write after a resume, or after the kernel refused
+    /// writes for a sleep), or the last renewal is too old to tell
+    /// ([`LAPSE_STALL_MAX_NS`]). The next grant waits for the engine's first
+    /// beat after the thaw.
+    Sleep,
+    /// The supervisor renewed late, `since_renew_ns` after its last
+    /// renewal, and the kernel's sleep count
+    /// ([`crate::kernel::SLEEPS_CONTROL`]) read before that renewal and at
+    /// the lapse is unchanged: no sleep began. Its clocks and the engine's
+    /// are honest, so the lease's own rule (two clean ticks) re-grants.
+    Stall { since_renew_ns: u64 },
+}
+
+/// Tells a late renewal from a sleep when the kernel reports a lapse
+/// (`ETIMEDOUT`, which it returns for both).
+///
+/// The kernel ends a lease 30 ms after the last renewal; the supervisor
+/// renews every 10 ms. A tick that runs 20 ms late with no sleep anywhere
+/// lapses the lease too (J713, 11-28: twice in 11 stream ends, each time
+/// while the session helper closed the amps' and the sense PCMs under the
+/// grant at the stream's end). Taking every lapse for a sleep held the
+/// next stream's grant for the post-sleep settle, past the plugin's 500 ms
+/// wake capacity, and its first frames were lost.
+#[derive(Debug, Default)]
+pub struct LapseWitness {
+    renewed_at: Option<u64>,
+    slept: bool,
+    /// The kernel's sleep count read before the last renewal.
+    sleeps_at_renewal: Option<u32>,
+}
+
+impl LapseWitness {
+    /// The tick granted or renewed at `now_ns`; `sleeps`: the kernel's
+    /// sleep count read before the write (a sleep that begins after the
+    /// read either refuses the write or moves the count before any lapse).
+    pub fn renewed(&mut self, now_ns: u64, sleeps: Option<u32>) {
+        self.renewed_at = Some(now_ns);
+        self.slept = false;
+        self.sleeps_at_renewal = sleeps;
+    }
+
+    /// The tick ended with nothing granted, other than by a lapse.
+    pub fn released(&mut self) {
+        self.renewed_at = None;
+        self.slept = false;
+        self.sleeps_at_renewal = None;
+    }
+
+    /// The suspend clock or counters moved.
+    pub fn sleep(&mut self) {
+        self.slept = true;
+    }
+
+    /// The supervisor's answer to a lapse at `now_ns`: after a sleep the
+    /// observer holds the heartbeat stale until the engine beats steadily
+    /// after the thaw; after a late tick nothing more than the lease's two
+    /// clean ticks is asked.
+    pub fn answer(&mut self, now_ns: u64, sleeps: Option<u32>, observer: &mut crate::observe::Observer) -> LapseCause {
+        let cause = self.lapsed(now_ns, sleeps);
+        if cause == LapseCause::Sleep {
+            observer.note_sleep();
+        }
+        cause
+    }
+
+    /// The kernel reported a lapse at `now_ns`; `sleeps`: its sleep count
+    /// read now. A stall only on positive evidence: the count was read
+    /// before the last renewal and is unchanged (a sleep moves it before
+    /// the freezer, so before this tick could run).
+    pub fn lapsed(&mut self, now_ns: u64, sleeps: Option<u32>) -> LapseCause {
+        let since = self.renewed_at.take().map(|t| now_ns.saturating_sub(t));
+        let slept = core::mem::take(&mut self.slept);
+        let before = self.sleeps_at_renewal.take();
+        let no_sleep_began = before.is_some() && before == sleeps;
+        match since {
+            Some(since_renew_ns) if no_sleep_began && !slept && since_renew_ns < LAPSE_STALL_MAX_NS => {
+                LapseCause::Stall { since_renew_ns }
+            }
+            _ => LapseCause::Sleep,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +407,60 @@ mod tests {
         r.idle();
         assert!(!r.holding(3 * MS));
         assert_eq!(r.released(10 * MS, true), None);
+    }
+
+    #[test]
+    fn a_stall_needs_the_kernel_sleep_count_unchanged() {
+        // a kernel without the count: every lapse is a sleep (main's rule)
+        let mut w = LapseWitness::default();
+        w.renewed(100 * MS, None);
+        assert_eq!(w.lapsed(139 * MS, None), LapseCause::Sleep);
+        // the count moved between the renewal and the lapse: a sleep began,
+        // whatever the suspend counters show and however short the gap
+        w.renewed(100 * MS, Some(7));
+        assert_eq!(w.lapsed(139 * MS, Some(8)), LapseCause::Sleep);
+        // unreadable at the lapse
+        w.renewed(100 * MS, Some(7));
+        assert_eq!(w.lapsed(139 * MS, None), LapseCause::Sleep);
+        // the count appeared only at the lapse (not read before the renewal)
+        w.renewed(100 * MS, None);
+        assert_eq!(w.lapsed(139 * MS, Some(7)), LapseCause::Sleep);
+        // unchanged: a stall
+        w.renewed(100 * MS, Some(7));
+        assert_eq!(w.lapsed(139 * MS, Some(7)), LapseCause::Stall { since_renew_ns: 39 * MS });
+        // a release forgets the reading
+        w.renewed(100 * MS, Some(7));
+        w.released();
+        assert_eq!(w.lapsed(139 * MS, Some(7)), LapseCause::Sleep);
+    }
+
+    #[test]
+    fn a_late_renewal_with_no_sleep_is_a_stall_and_anything_else_a_sleep() {
+        // J713 K060: renewed, then the next renewal 38.8 ms later lapsed
+        let mut w = LapseWitness::default();
+        w.renewed(2_424_190 * MS, Some(0));
+        assert_eq!(w.lapsed(2_424_228 * MS + 800_000, Some(0)), LapseCause::Stall { since_renew_ns: 38_800_000 });
+        // a sleep seen since the last renewal
+        w.renewed(0, Some(0));
+        w.sleep();
+        assert_eq!(w.lapsed(40 * MS, Some(0)), LapseCause::Sleep);
+        // a renewal clears a sleep seen before it
+        w.sleep();
+        w.renewed(100 * MS, Some(0));
+        assert_eq!(w.lapsed(140 * MS, Some(0)), LapseCause::Stall { since_renew_ns: 40 * MS });
+        // a lapse on a grant (nothing held: the first write after a resume,
+        // or after the kernel refused writes during one)
+        assert_eq!(w.lapsed(150 * MS, Some(0)), LapseCause::Sleep);
+        w.renewed(200 * MS, Some(0));
+        w.released();
+        assert_eq!(w.lapsed(210 * MS, Some(0)), LapseCause::Sleep);
+        // too long since the renewal to tell
+        w.renewed(300 * MS, Some(0));
+        assert_eq!(w.lapsed(300 * MS + LAPSE_STALL_MAX_NS, Some(0)), LapseCause::Sleep);
+        w.renewed(300 * MS, Some(0));
+        assert_eq!(
+            w.lapsed(300 * MS + LAPSE_STALL_MAX_NS - 1, Some(0)),
+            LapseCause::Stall { since_renew_ns: LAPSE_STALL_MAX_NS - 1 }
+        );
     }
 }

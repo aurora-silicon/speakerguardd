@@ -67,7 +67,7 @@ mod linux {
 
     use sgv2_lv2::page::{EnginePage, LAYOUT, MAGIC, PAGE_BYTES};
     use sgv2_supervisor::kernel::{Kernel, KernelError, Macaudio};
-    use sgv2_supervisor::lease::{Observation, Regrant};
+    use sgv2_supervisor::lease::{LapseCause, LapseWitness, Observation, Regrant};
     use sgv2_supervisor::machine::{blob_full_scales, board_from_compatible, Machine};
     use sgv2_supervisor::observe::{
         combine, helper_is, owner_to_tgid, parse_pcm_info, parse_pcm_status, parse_session, parse_tgid,
@@ -1427,6 +1427,8 @@ mod linux {
         // grants that keep ending in a fault at once are spaced out
         let mut regrant = Regrant::default();
         let mut held_off = false;
+        // a lapse after a late tick is not a sleep (see `lease::LapseWitness`)
+        let mut lapse = LapseWitness::default();
         // nothing plays: slow pollers and loop (see `pace`)
         let mut pace = Pace::default();
         let mut idle_ready_said = false;
@@ -1434,8 +1436,13 @@ mod linux {
             let (s, n) = (suspended_ns(), sleeps());
             if s > suspended.saturating_add(1_000_000) || n != slept {
                 observer.note_sleep();
+                lapse.sleep();
             }
             (suspended, slept) = (s, n);
+            // the kernel's sleep count before this tick's renewal: a lapse
+            // is a stall only if it has not moved since (see
+            // `lease::LapseWitness`); unreadable counts as unknown
+            let kernel_sleeps = kernel.sleeps().unwrap_or(None);
             let obs = observer.observe(&mut now_ns, &mut engine, &mut pcm_view, &mut session);
             // a held-off re-grant: this tick counts as one without demand
             // (every check still runs, so the grant comes on the first tick
@@ -1486,6 +1493,13 @@ mod linux {
             if ready_note.tick(ready, spell) {
                 eprintln!("protection ready: every check holds, granted while a stream plays");
             }
+            // what a lapse is measured from (the lapse itself is answered below)
+            match &event {
+                Ok(Event::Granted | Event::Renewed) => lapse.renewed(now_ns(), kernel_sleeps),
+                Ok(Event::Lapsed) => {}
+                _ if !sup.granted() => lapse.released(),
+                _ => {}
+            }
             match event {
                 Ok(Event::Idle) => {
                     regrant.released(now_ns(), false);
@@ -1518,10 +1532,27 @@ mod linux {
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
                 Ok(Event::Lapsed) => {
                     regrant.released(now_ns(), false);
-                    // the kernel withdraws a lease at a system sleep: the next
-                    // grant waits for the engine to beat steadily after the thaw
-                    observer.note_sleep();
-                    eprintln!("lease lapsed; re-qualifying");
+                    // the counters again, as late as possible: a sleep that
+                    // shows now is answered as one
+                    let (s, n) = (suspended_ns(), sleeps());
+                    if s > suspended.saturating_add(1_000_000) || n != slept {
+                        observer.note_sleep();
+                        lapse.sleep();
+                    }
+                    (suspended, slept) = (s, n);
+                    match lapse.answer(now_ns(), kernel.sleeps().unwrap_or(None), &mut observer) {
+                        // after a sleep the next grant waits for the engine
+                        // to beat steadily after the thaw
+                        LapseCause::Sleep => eprintln!("lease lapsed; re-qualifying"),
+                        // a late tick, proven by the kernel's sleep count:
+                        // the engine's beats and this tick's checks are
+                        // honest, and the lease's own rule (two clean
+                        // ticks) re-grants
+                        LapseCause::Stall { since_renew_ns } => eprintln!(
+                            "lease lapsed: renewed {} ms after the last renewal, and the kernel counted no system sleep; re-qualifying",
+                            since_renew_ns / 1_000_000
+                        ),
+                    }
                 }
                 Ok(_) => {}
                 Err(Fatal::Kernel(e)) => {
