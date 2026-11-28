@@ -334,6 +334,38 @@ fn partial() -> mic::Options {
     mic::Options { allow_partial: true, ..Default::default() }
 }
 
+/// `beam_state(true)` without the controls in `drop`.
+fn beam_state_without(drop: &[u32]) -> ParamState {
+    let mut st = beam_state(true);
+    st.sections[0].params.retain(|(id, _)| !drop.contains(id));
+    st
+}
+
+#[test]
+fn an_older_beam_preset_without_the_later_controls_is_the_fixed_beam() {
+    let base =
+        mic::compile(&Fixture::new().tree("mic-beam-later"), &mic::Options::default(), &mut Diagnostics::default())
+            .unwrap();
+    assert!(!base.refused(), "{:?}", base.report.refusals);
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &beam_state_without(&[42, 43]), false, None);
+    let c = mic::compile(&f.tree("mic-beam-older"), &mic::Options::default(), &mut Diagnostics::default()).unwrap();
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    assert_eq!(c.params.unwrap(), base.params.unwrap());
+}
+
+#[test]
+fn a_beam_preset_missing_another_control_refuses() {
+    let mut f = Fixture::new();
+    f.effects[3] = unit_effect("Beam", "bmfd", &beam_state_without(&[21]), false, None);
+    let c = mic::compile(&f.tree("mic-beam-missing"), &partial(), &mut Diagnostics::default()).unwrap();
+    assert!(
+        c.refused() && c.report.refusals.iter().any(|r| r.contains("control 21 missing")),
+        "{:?}",
+        c.report.refusals
+    );
+}
+
 /// [`beam_file`] at `bins` bins (the trackpad block needs block 480).
 fn beam_file_n(mics: usize, w: &[f32], bins: usize) -> Vec<u8> {
     let mut re = Vec::new();
