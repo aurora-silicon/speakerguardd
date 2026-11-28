@@ -220,6 +220,10 @@ fn six_lane_tuning(
         for bank in 1..3 {
             values.insert(lsm2::ids::PILOT[bank] + lsm2::ids::P_AMPLITUDE_DB, -40.0);
         }
+        // one speaker per thermal type
+        for ty in 0..3 {
+            values.insert(lsm2::ids::thermal(ty, lsm2::companion::extension::T_NUM_PARALLEL_SPEAKERS), 1.0);
+        }
     }
     values.insert(lsm2::ids::controller(9), 2.0);
     values.insert(lsm2::ids::controller(lsm2::ids::C_LINK_SLOW), 1.0);
@@ -389,8 +393,8 @@ fn six_lane_companion_with_inert_appended_fields_plays_on_its_static_model() {
     // which is off: they change nothing, whichever axes are controlled. The
     // temperature response-rate factor is run by the temperature candidate.
     let (tuning, _) = six_lane_tuning("six-lsid-static-release-times", true, |v| {
-        v.insert(lsm2::ids::controller(x::CONTROLLER_DISPLACEMENT_RELEASE), 50.0);
-        v.insert(lsm2::ids::controller(x::CONTROLLER_VELOCITY_RELEASE), 500.0);
+        v.insert(lsm2::ids::controller(x::CONTROLLER_DISPLACEMENT_RELEASE), 37.0);
+        v.insert(lsm2::ids::controller(x::CONTROLLER_VELOCITY_RELEASE), 412.0);
         v.insert(lsm2::ids::controller(x::CONTROLLER_TEMPERATURE_RATE_FACTOR), 0.125);
     });
     let (unit, _) = compile_six(&tuning);
@@ -400,18 +404,51 @@ fn six_lane_companion_with_inert_appended_fields_plays_on_its_static_model() {
     // carried, not interpreted.
     let (tuning, _) = six_lane_tuning("six-lsid-static-inert", true, |v| {
         for ty in 0..3 {
-            v.insert(lsm2::ids::model(1, ty, x::M_SENSITIVITY_MAX_GAIN_DB), 3.0);
-            v.insert(lsm2::ids::model(1, ty, x::M_MIMO_TARGET_Q), 0.7);
+            v.insert(lsm2::ids::model(1, ty, x::M_SENSITIVITY_MAX_GAIN_DB), 2.25);
+            v.insert(lsm2::ids::model(1, ty, x::M_MIMO_TARGET_Q), 0.37);
             v.insert(lsm2::ids::thermal(ty, x::T_NUM_PARALLEL_SPEAKERS), 1.0);
-            v.insert(lsm2::ids::thermal(ty, x::T_RDC_TOLERANCE_PERCENT), 10.0);
         }
-        v.insert(x::GENERAL_SYS_ID_FFT_SIZE, 2048.0);
+        v.insert(x::GENERAL_SYS_ID_FFT_SIZE, 1536.0);
         for c in 0..8 {
-            v.insert(24576 + c, -1.0);
+            v.insert(24576 + c, 4.0);
         }
-        v.insert(25601, -100.0);
+        v.insert(25601, -73.0);
     });
     assert_eq!(compile_six(&tuning).0.companion().unwrap().gates, 0);
+}
+
+#[test]
+fn a_released_six_lane_unit_does_not_read_its_flow_dictionary() {
+    // Property 6632 is carried opaque: a released unit's output is the same,
+    // bit for bit, whatever the dictionary holds (six lanes build no masker).
+    use aurora_speaker_tuning::plist::Value;
+    use common::{dict, i};
+    use sgv2_core::{Io, ProtectionUnit};
+    let (tuning, _) = six_lane_tuning("six-lsid-static-flow", true, |_| {});
+    let mut other = tuning.clone();
+    let f = other.protection.property_files.iter_mut().find(|f| f.number == 6632).unwrap();
+    f.value = dict(vec![(
+        "ChannelData",
+        Value::Array(vec![
+            dict(vec![("SyntheticSideMarker", i(-5)), ("Gain", i(9))]),
+            dict(vec![("SyntheticSideMarker", i(77)), ("Response", Value::Array(vec![i(1), i(2), i(3)]))]),
+        ]),
+    )]);
+    let render = |t: &aurora_speaker_tuning::tuning::Tuning| {
+        let (mut unit, _) = compile_six(t);
+        assert_eq!(unit.companion().unwrap().gates, 0);
+        let frames = unit.params().latency_frames() + 8192;
+        let input: Vec<f32> =
+            (0..frames).map(|n| 0.4 * (n as f32 * 0.031).sin() + 0.2 * (n as f32 * 0.0007).sin()).collect();
+        let mut storage = vec![vec![0.0f32; frames]; 6];
+        let mut output: Vec<_> = storage.iter_mut().map(|s| s.as_mut_slice()).collect();
+        assert!(!unit.process(Io { input: &[&input[..]; 6], output: &mut output, sense: &[], frames }).is_failsafe());
+        (storage, unit.companion().unwrap().flow.clone())
+    };
+    let (a, flow_a) = render(&tuning);
+    let (b, flow_b) = render(&other);
+    assert_ne!(flow_a, flow_b, "the two units carry different dictionaries");
+    assert!(a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| x.to_bits() == y.to_bits()));
 }
 
 #[test]
@@ -426,6 +463,8 @@ fn six_lane_appended_mechanisms_without_a_law_keep_the_companion_muted() {
         ("power groups", vec![(ids::channel(5, x::CHANNEL_POWER_GROUP_NUMBER), 1.0)]),
         ("reserved pilot-tone channel selector", vec![(x::PILOT_TUNING_RESERVED, 1.0)]),
         ("parallel speakers per thermal type", vec![(ids::thermal(1, x::T_NUM_PARALLEL_SPEAKERS), 2.0)]),
+        ("parallel speakers per thermal type", vec![(ids::thermal(2, x::T_NUM_PARALLEL_SPEAKERS), 0.0)]),
+        ("Rdc tolerance", vec![(ids::thermal(0, x::T_RDC_TOLERANCE_PERCENT), 7.5)]),
         ("per-system power limits", vec![(1068032 + 4, 10.0)]),
     ];
     for (i, (why, records)) in cases.into_iter().enumerate() {

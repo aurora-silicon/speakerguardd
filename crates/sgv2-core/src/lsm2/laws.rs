@@ -920,7 +920,7 @@ mod tests {
         // TemperatureResponseRateFactor: the weight is q^2 + factor, clamped
         // to [0, 1]; a factor that saturates it takes the resistance split
         // alone, so the result no longer depends on the output body rise.
-        let rated = temperature_candidate(130.0, 70.0, 30.0, 20.0, 40.0, 110.0, 125.0, 30.0, 20.0, 0.25);
+        let rated = temperature_candidate(130.0, 70.0, 30.0, 20.0, 40.0, 110.0, 125.0, 30.0, 20.0, 0.3125);
         assert_ne!(rated, g);
         let full = |om: f32| temperature_candidate(130.0, 70.0, 30.0, om, 40.0, 110.0, 125.0, 30.0, 20.0, 1.0);
         assert_eq!(full(0.0), full(20.0));
@@ -938,7 +938,7 @@ mod tests {
             let g = [(af, vc), (as_, mg)].iter().fold(1.0f64, |g, &(a, t)| if a < t { g.min(a / t) } else { g });
             libm::sqrt(g.max(0.0))
         };
-        for (om, factor) in [(20.0f32, 0.0f32), (20.0, 0.25), (5.0, 0.085), (60.0, 0.2), (0.0, 1.0)] {
+        for (om, factor) in [(20.0f32, 0.0f32), (20.0, 0.3125), (5.0, 0.0625), (60.0, 0.4375), (0.0, 1.0)] {
             let got = temperature_candidate(130.0, 70.0, 30.0, om, 40.0, 110.0, 125.0, 30.0, 20.0, factor) as f64;
             let want = law(om as f64, factor as f64);
             assert!((got - want).abs() < 1e-5, "om {om} factor {factor}: {got} vs {want}");

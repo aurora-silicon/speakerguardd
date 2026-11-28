@@ -241,6 +241,10 @@ pub fn effective_filterbank_latency_ms(latency_ms: f32, lookahead_ms: f32, rate:
 pub const BANDS: usize = 5;
 /// Taps of the property-6632 pressure response.
 pub const PRESSURE_TAPS: usize = 1024;
+
+/// The highest stream rate the unit runs at: the 176.4/192 kHz family, where
+/// the native controller caps ([`controller_frames`]).
+pub const MAX_STREAM_RATE: u32 = 192_000;
 const EPS: f64 = f32::MIN_POSITIVE as f64;
 /// The 0.99 downward target of every gain law (rig laws 5, 8; spec 15.4).
 const CUT: f32 = 0.99;
@@ -1996,6 +2000,15 @@ impl Unit {
         let (mut params, companion) = companion::decode_blob(bytes)?;
         if rate != 0 {
             params.sample_rate = rate;
+        }
+        if let Some(c) = &companion {
+            // The run factor must be the companion's own saved record (0
+            // where the schema has none), bit for bit.
+            let id = ids::controller(companion::extension::CONTROLLER_TEMPERATURE_RATE_FACTOR);
+            let saved = c.lsm2_records.iter().find(|r| r.0 == id).map_or(0.0, |r| r.1);
+            if params.temperature_rate_factor.to_bits() != saved.to_bits() {
+                return Err(InitError::Invalid("temperature rate factor"));
+            }
         }
         let mut unit = Self::new(params);
         if let Some(c) = &companion {

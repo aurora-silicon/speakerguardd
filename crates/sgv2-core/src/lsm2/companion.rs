@@ -109,15 +109,16 @@ pub fn extension_ids() -> Vec<u32> {
 }
 /// The appended six-lane fields that ask for a mechanism the static model
 /// would leave out, by name; empty when every one is inert. Fields that
-/// belong to the unrun estimator (the system-ID FFT size, the Rdc tolerance,
-/// sensitivity pairing), and parameters of a disabled mechanism, are
+/// belong to the unrun estimator (the system-ID FFT size, sensitivity
+/// pairing), and parameters of a disabled mechanism, are
 /// carried and not interpreted. Anything else enabled is refused rather
 /// than dropped:
 /// - sensitivity control, MIMO compensation, the high-impedance watermark,
 ///   adaptive release and power groups (laws not implemented);
 /// - a nonzero reserved pilot-tone channel selector (the pilot reserve
 ///   would select an unknown block);
-/// - a thermal type with other than one speaker per channel;
+/// - a thermal type with other than exactly one speaker per channel;
+/// - a nonzero Rdc tolerance (not shown to leave the static limits alone);
 /// - the per-system power limits while the power axis is controlled (with
 ///   it off and no power groups they change no gain).
 ///
@@ -163,8 +164,11 @@ pub fn six_lane_static_refusals(records: &[(u32, f32)]) -> Vec<&'static str> {
     if set(x::PILOT_TUNING_RESERVED) {
         push("reserved pilot-tone channel selector");
     }
-    if (0..3).any(|ty| get(ids::thermal(ty, x::T_NUM_PARALLEL_SPEAKERS)).is_some_and(|v| v != 0.0 && v != 1.0)) {
+    if (0..3).any(|ty| get(ids::thermal(ty, x::T_NUM_PARALLEL_SPEAKERS)) != Some(1.0)) {
         push("parallel speakers per thermal type");
+    }
+    if (0..3).any(|ty| set(ids::thermal(ty, x::T_RDC_TOLERANCE_PERCENT))) {
+        push("Rdc tolerance");
     }
     if set(ids::controller(ids::C_CONTROL_POWER)) && SYSTEM_BLOCKS.iter().any(|&b| (b..b + 12).any(&set)) {
         push("per-system power limits");

@@ -1014,26 +1014,30 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
         x.pilot_reserve = libm_pow10(f64::from(pilot_db) / 20.0) as f32;
         x.resolve_models();
         if static_release && get(id::model(id::MANAGER_ADMITTANCE, ty, id::M_ENABLE_LR2))? != 0.0 {
-            // The current model has no inductive branch. Leaving it out is
-            // allowed only where it cannot lower the modeled power (see
-            // lr2_omission_is_conservative). A generic flag takes the branch
-            // from the type's impedance block, as for the other model parts.
-            let src = if get(id::model(id::MANAGER_ADMITTANCE, ty, id::M_USE_GENERIC_LR2))? != 0.0 {
-                id::MANAGER_IMPEDANCE
-            } else {
-                id::MANAGER_ADMITTANCE
-            };
-            let branch = [
-                get(id::model(src, ty, id::M_LR2_R2))?,
-                get(id::model(src, ty, id::M_LR2_LE))?,
-                get(id::model(src, ty, id::M_LR2_L2))?,
-            ];
-            let Some(bound) = lr2_admittance_bound(&x, branch, rate) else {
-                return Err(bad(format!(
-                    "channel {c}'s admittance inductance is not a passive resistive-inductive branch, \
-                     which the current model cannot bound"
-                )));
-            };
+            // The current model has no inductive branch: it is scaled so
+            // that leaving the branch out cannot lower the modeled power
+            // (lr2_admittance_bound). A generic flag selects the type's
+            // impedance block's branch, as for the other model parts; the
+            // bound then covers both blocks' branches, so it holds whichever
+            // the native unit reads.
+            let generic = get(id::model(id::MANAGER_ADMITTANCE, ty, id::M_USE_GENERIC_LR2))? != 0.0;
+            let blocks: &[u32] =
+                if generic { &[id::MANAGER_ADMITTANCE, id::MANAGER_IMPEDANCE] } else { &[id::MANAGER_ADMITTANCE] };
+            let mut bound = 1.0f32;
+            for &src in blocks {
+                let branch = [
+                    get(id::model(src, ty, id::M_LR2_R2))?,
+                    get(id::model(src, ty, id::M_LR2_LE))?,
+                    get(id::model(src, ty, id::M_LR2_L2))?,
+                ];
+                let Some(k) = lr2_admittance_bound(&x, branch) else {
+                    return Err(bad(format!(
+                        "channel {c}'s admittance inductance is not a passive resistive-inductive branch, \
+                         which the current model cannot bound"
+                    )));
+                };
+                bound = bound.max(k);
+            }
             x.admittance_bound = bound;
             if bound == 1.0 {
                 diags.info(
@@ -1083,7 +1087,9 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
 /// The admittance bound for a current model that leaves out its inductive
 /// branch: the smallest binary32 factor `k >= 1` with `k Re Y` of the model
 /// without the branch at or above `Re Y` with it at every frequency up to
-/// Nyquist; `None` for a branch that is not passive (a negative or
+/// Nyquist at the highest stream rate the unit runs at
+/// ([`lsm2::MAX_STREAM_RATE`], whatever the tuning's own rate); `None` for a
+/// branch that is not passive (a negative or
 /// non-finite field). The power path integrates `u * i` with `i` from the
 /// admittance model, so for any signal scaling the current model by `k`
 /// keeps the modeled electrical power at or above the full model's. `k` is
@@ -1091,7 +1097,7 @@ fn compile_lsm2(t: &Tuning, b: &Bound, diags: &mut Diagnostics) -> Result<Compil
 /// branch is `Z = j w Le + (R2 * j w L2) / (R2 + j w L2)` in series with
 /// `Rdc` and the first resonator's motional impedance
 /// `Bl^2 / (Rms + j w Mms + Kms / (j w))`.
-fn lr2_admittance_bound(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3], rate: u32) -> Option<f32> {
+fn lr2_admittance_bound(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3]) -> Option<f32> {
     let (r2, le, l2) = (f64::from(r2), f64::from(le), f64::from(l2));
     if ![r2, le, l2].iter().all(|v| v.is_finite() && *v >= 0.0) {
         return None;
@@ -1112,7 +1118,7 @@ fn lr2_admittance_bound(c: &lsm2::ChannelParams, [r2, le, l2]: [f32; 3], rate: u
         div((1.0, 0.0), full).0 / div((1.0, 0.0), base).0
     };
     const POINTS: usize = 4096;
-    let (lo, hi) = (0.0f64, (f64::from(rate) / 2.0).log10());
+    let (lo, hi) = (0.0f64, (f64::from(lsm2::MAX_STREAM_RATE) / 2.0).log10());
     let x = |j: usize| lo + (hi - lo) * j as f64 / (POINTS - 1) as f64;
     let (mut best, mut at) = (f64::NEG_INFINITY, 0);
     for j in 0..POINTS {
