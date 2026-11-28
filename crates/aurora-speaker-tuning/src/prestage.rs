@@ -207,7 +207,8 @@ struct SlotPart {
     fixed: [f64; 3],
     /// The box's highest Butterworth shelf order, as the shelf uses it.
     max_order: u32,
-    /// The slot's first section in [`Part::sections`] (unused for a gain).
+    /// The slot's first section in [`Part::sections`] (a gain slot's own
+    /// gain section).
     section: usize,
 }
 
@@ -240,29 +241,11 @@ fn butterworth(high: bool, order: u32, f0: f64, fs: f64) -> Vec<Section> {
     made.sections[..made.count].to_vec()
 }
 
-/// A static phase-matched low-pass: two identical half-order Butterworth
-/// cascades on filtered channels, their all-pass denominator companions on
-/// the phase channels. An odd half-order delays both paths by one frame.
+/// A static phase-matched low-pass ([`tone_filter::phase_matched_low_pass`]):
+/// the filtered channels' sections and the phase channels' allpass sections.
 fn phase_compensated_low_pass(order: u32, f0: f64, fs: f64) -> (Vec<Section>, Vec<Section>) {
-    let half = butterworth(false, order / 2, f0, fs);
-    let mut filtered = half.clone();
-    filtered.extend_from_slice(&half);
-    let mut companion: Vec<Section> = half
-        .iter()
-        .map(|s| {
-            if s.a2 == 0.0 {
-                Section { b0: s.a1, b1: 1.0, b2: 0.0, a1: s.a1, a2: 0.0 }
-            } else {
-                Section { b0: s.a2, b1: s.a1, b2: 1.0, a1: s.a1, a2: s.a2 }
-            }
-        })
-        .collect();
-    if (order / 2) % 2 != 0 {
-        let delay = Section { b0: 0.0, b1: 1.0, b2: 0.0, a1: 0.0, a2: 0.0 };
-        filtered.push(delay);
-        companion.push(delay);
-    }
-    (filtered, companion)
+    let (filtered, phase) = tone_filter::phase_matched_low_pass(order, f0, fs);
+    (filtered.sections[..filtered.count].to_vec(), phase.sections[..phase.count].to_vec())
 }
 
 #[derive(Clone, Copy)]
@@ -347,7 +330,9 @@ pub fn voicing_tone(
         let mut ch = Channel::IDENTITY;
         ch.count = p.sections.len();
         ch.sections[..p.sections.len()].copy_from_slice(&p.sections);
-        ch.gain = if p.muted { 0.0 } else { 10f64.powf(p.gain_db / 20.0) };
+        // The box forms a dB gain in Float32: exp(dB * (ln 10 / 20)).
+        // the box's output gain, a Float32 dB exponential
+        ch.gain = if p.muted { 0.0 } else { f64::from(tone_filter::db_gain(p.gain_db as f32)) };
         if !ch.gain.is_finite() {
             return Err(bad(format!("{ctx} channel {c}: gain {} dB", p.gain_db)));
         }
@@ -751,7 +736,18 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
         Some(v) => return Err(bad(format!("{ctx}: highest filter order {v}"))),
         None => tone_filter::DEFAULT_SHELF_ORDER,
     };
-    p.gain_db = req(4)? + req(13)?;
+    // The voicing box runs its input gain as a Float32 gain object before
+    // its first slot, each gain slot at its own position, and its output gain
+    // after the last slot (the channel gain). The protection pre-stage folds
+    // them all into the channel gain.
+    if mode == Realise::Saved {
+        p.gain_db = req(13)?;
+        if req(4)? != 0.0 {
+            p.sections.push(tone_filter::gain_section(req(4)?));
+        }
+    } else {
+        p.gain_db = req(4)? + req(13)?;
+    }
     // Parameter 12 is the box's algorithm version: version 0 designs its
     // peaks on their poles (tone_filter::legacy_peak); later versions keep
     // the symmetric peak.
@@ -1031,7 +1027,11 @@ fn part_with(stage: &Stage, ch: u32, fs: f64, diags: &mut Diagnostics, mode: Rea
                 if in_bypassed_group {
                     g = g.min(0.0);
                 }
-                p.gain_db += g;
+                if mode == Realise::Saved {
+                    p.sections.push(tone_filter::gain_section(g));
+                } else {
+                    p.gain_db += g;
+                }
                 if automated {
                     diags.info(
                         "prestage-volume-automation",
@@ -2025,7 +2025,8 @@ mod tests {
                 assert!(lr * ar + li * ai >= -1e-12);
             }
             let (re, im) = response(&low, 1800.0);
-            assert!((re.hypot(im) - 0.5).abs() < 1e-9);
+            // -6 dB at the corner, to within the box's Float32 words
+            assert!((re.hypot(im) - 0.5).abs() < 1e-5, "order {order}: {}", re.hypot(im));
         }
     }
 
@@ -2392,7 +2393,8 @@ mod tests {
                 ch.sections[..s.len()].copy_from_slice(&s);
                 let at = |f: f64| 20.0 * ch.magnitude(f, fs).log10();
                 assert!((at(f0) + 3.0103).abs() < 1e-3, "order {order} f0 {f0}: {}", at(f0));
-                assert!(ch.peak(fs) <= 1.0 + 1e-8);
+                // Float32 words of a high order next to a low corner top unity by up to 0.01 dB
+                assert!(ch.peak(fs) <= 1.001_16, "order {order} f0 {f0}: {}", ch.peak(fs));
                 // an octave into the stop band: close to 6 dB per order
                 let stop = if high { at(f0 / 2.0) } else { at((2.0 * f0).min(23_000.0)) };
                 if !high && 2.0 * f0 >= 23_000.0 {

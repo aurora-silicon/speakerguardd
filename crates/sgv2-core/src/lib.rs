@@ -29,6 +29,7 @@ pub mod lsm2;
 pub mod machine;
 pub mod mic;
 pub mod placeholder;
+pub mod platform_math;
 pub mod prestage;
 pub mod resonator;
 pub mod ring;

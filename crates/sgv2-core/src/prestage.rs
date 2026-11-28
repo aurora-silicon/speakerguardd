@@ -69,6 +69,7 @@
 //! soft one at high level): it never reduces less at full scale.
 
 use crate::blob::{crc32, BlobError};
+use crate::vdsp;
 use crate::MAX_CHANNELS;
 
 pub const MAGIC: [u8; 8] = *b"SGV2PRE\0";
@@ -846,22 +847,43 @@ impl DynRun {
     }
 }
 
-/// Running state for one level-dependent ToneMeister slot. The shapes run
-/// `dry + (gain - 1) * carrier` (type 15: a fixed carrier, the detector's
-/// constant-peak band pass; type 17: a first-order low-pass at twice the
-/// corner divided by the current linear gain, so the shelf keeps its zero at
-/// twice the corner and moves its pole with the gain; type 18: a fixed
-/// first-order high-pass at half the corner). The control law:
+/// Running state for one level-dependent ToneMeister slot. Each slot runs
+/// on the signal in its place, in slices of at most [`DYNAMIC_SLICE`]
+/// frames of a render call (a longer call is cut into such slices from its
+/// start; every state carries across slices and calls). The shapes:
 ///
-/// - the side chain passes the detector (type 15: the band pass; type 17/18:
-///   a second-order Butterworth low/high-pass at the corner);
+/// - type 15: `dry + (gain - 1) * carrier`, the carrier a fixed copy of the
+///   detector's constant-peak band pass;
+/// - type 18: the same with a fixed first-order high-pass at half the
+///   corner;
+/// - type 17: `dry + carrier`, the carrier a first-order low-pass at twice
+///   the corner divided by a published gain `g` and scaled by `g - 1`, so
+///   the shelf keeps its zero at twice the corner and moves its pole with
+///   `g`. The slot keeps two such carriers. Each slice contributes the mean
+///   of its control signal; when no change is in progress the mean of the
+///   slice means gathered since the last change (this slice's included) is
+///   published: the idle carrier takes the running one's state and the new
+///   coefficients, and the output crossfades from the old carrier to the
+///   new over [`SHELF_FADE_S`] with weight `clamp(n / len, 0, 1)^2`. The
+///   next change waits for the first slice that starts after the fade.
+///
+/// The control law:
+///
+/// - the side chain (the mean of the selected channels) passes the detector
+///   (type 15: the band pass; type 17/18: a second-order Butterworth
+///   low/high-pass at the corner) on the platform's one-channel biquad;
 /// - two all-pass branches at half and twice the analysis centre form a
-///   quadrature pair; their magnitude is taken on the first frame of every
-///   16 (the phase carries across render calls) and mapped through the
-///   44-point response curve; the Float32 result is held for 16 frames;
-/// - the held gain passes a 20 Hz second-order low-pass whose Float32
-///   coefficients and histories follow the platform's single-precision
-///   multichannel biquad ([`ControlFilter`]), primed at unity.
+///   quadrature pair, one two-channel platform setup, so both branches step
+///   frame by frame in fused form whatever the box's width; their platform
+///   complex magnitude is taken on the first frame of every 16 (the phase
+///   carries across slices and render calls) and mapped through the 44-point
+///   response curve; the Float32 result is held for 16 frames;
+/// - the held gain passes a 20 Hz second-order low-pass on the platform's
+///   one-channel biquad ([`ControlFilter`]), primed at unity.
+///
+/// The carriers are a setup as wide as the box: a one-channel box runs them
+/// in the platform's blocked form over the slice, a wider box frame by
+/// frame in fused form.
 ///
 /// The low-pass's near-unity poles make its Float32 arithmetic part of the
 /// response: it settles the idle carrier slightly above unity and every
@@ -871,13 +893,30 @@ struct DynamicRun {
     fs: f64,
     detector: Section,
     component: Section,
-    /// Type 17: the shelf's zero (twice the corner), Hz; its carrier
-    /// follows the gain frame by frame.
+    /// Type 17: the shelf's zero (twice the corner), Hz.
     shelf_zero_hz: Option<f64>,
     detector_filter: ControlFilter,
-    component_state: [[f32; 2]; MAX_CHANNELS],
+    /// Types 15/18 retain the established scalar carrier and independent
+    /// one-channel analytic arithmetic. Only type 17 uses the corrected
+    /// multirate/banked path below.
+    legacy_component_state: [[f32; 2]; MAX_CHANNELS],
+    legacy_quadrature_filter: [ControlFilter; 2],
+    /// A stereo box that contains a moving type-17 shelf uses the shared
+    /// fused fixed-overlay path for its neighbouring type-15/18 slots.
+    corrected_fixed: bool,
+    /// Two carrier sets (one section per channel); `bank` runs, the other
+    /// is the one a type-17 change fades out of.
+    /// Boxed: a stage holds up to MAX_DYNAMIC_FILTERS slots.
+    carrier: alloc::boxed::Box<[[vdsp::Section; MAX_CHANNELS]; 2]>,
+    bank: usize,
+    /// Type 17: frames into the current fade (at most the fade's length),
+    /// whether a gain was ever published, and the slice means gathered.
+    fade: usize,
+    published: bool,
+    mean_sum: f32,
+    mean_count: f32,
     quadrature: [Section; 2],
-    quadrature_filter: [ControlFilter; 2],
+    quadrature_run: [vdsp::Section; 2],
     control_phase: usize,
     held: f32,
     control: ControlFilter,
@@ -887,11 +926,92 @@ struct DynamicRun {
 
 const DYNAMIC_CURVE_POINTS: usize = 44;
 
+/// Most frames a level-dependent slot processes at once.
+const DYNAMIC_SLICE: usize = 512;
+
+/// Type 17's carrier crossfade, s.
+const SHELF_FADE_S: f64 = 0.020;
+
 /// Frames per control-filter call; a multiple of the filter's group.
 const CONTROL_CHUNK: usize = 64;
 
+#[inline]
+fn add4(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+}
+
+/// 25G83 arm64 `vDSP_sve(x, 1, ..., n)`: the long-vector path alternates
+/// two banks of four NEON accumulators, combines the banks, then consumes
+/// the remaining vectors and the 2/1-sample tail before pairwise folding.
+#[allow(clippy::needless_range_loop)] // lane-indexed like the reduction it transcribes
+fn platform_sve(x: &[f32]) -> f32 {
+    let chunks = x.len() / 4;
+    let tail = x.len() & 3;
+    let vector = |i: usize| [x[4 * i], x[4 * i + 1], x[4 * i + 2], x[4 * i + 3]];
+    let zero = [0.0f32; 4];
+    let (mut sum, done) = if chunks >= 24 {
+        let mut a = core::array::from_fn::<_, 4, _>(vector);
+        for i in 0..4 {
+            a[i] = add4(a[i], vector(4 + i));
+        }
+        let mut current = core::array::from_fn::<_, 4, _>(|i| vector(8 + i));
+        let mut b = [zero; 4];
+        let loops = (x.len() - 96) / 32 + 1;
+        for group in 0..loops {
+            for i in 0..4 {
+                b[i] = add4(b[i], vector(12 + 8 * group + i));
+                a[i] = add4(a[i], current[i]);
+            }
+            current = core::array::from_fn(|i| vector(16 + 8 * group + i));
+        }
+        for i in 0..4 {
+            a[i] = add4(a[i], b[i]);
+            a[i] = add4(a[i], current[i]);
+            a[i] = add4(a[i], vector(12 + 8 * loops + i));
+        }
+        (add4(add4(a[0], a[2]), add4(a[1], a[3])), 16 + 8 * loops)
+    } else if chunks >= 16 {
+        let mut a = core::array::from_fn::<_, 4, _>(vector);
+        for i in 0..4 {
+            a[i] = add4(a[i], vector(4 + i));
+            a[i] = add4(a[i], vector(8 + i));
+            a[i] = add4(a[i], vector(12 + i));
+        }
+        (add4(add4(a[0], a[2]), add4(a[1], a[3])), 16)
+    } else if chunks >= 8 {
+        let mut a = core::array::from_fn::<_, 4, _>(vector);
+        for i in 0..4 {
+            a[i] = add4(a[i], vector(4 + i));
+        }
+        (add4(add4(a[0], a[2]), add4(a[1], a[3])), 8)
+    } else if chunks >= 4 {
+        let a = core::array::from_fn::<_, 4, _>(vector);
+        (add4(add4(a[0], a[2]), add4(a[1], a[3])), 4)
+    } else if chunks != 0 {
+        (vector(0), 1)
+    } else {
+        (zero, 0)
+    };
+    for i in done..chunks {
+        sum = add4(sum, vector(i));
+    }
+    let mut at = 4 * chunks;
+    if tail >= 2 {
+        sum[0] += x[at];
+        sum[1] += x[at + 1];
+        at += 2;
+    }
+    if tail & 1 != 0 {
+        sum[0] += x[at];
+    }
+    (sum[0] + sum[1]) + (sum[2] + sum[3])
+}
+
 impl DynamicRun {
-    fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
+    /// The slot's detector, carrier, type-17 zero and the two quadrature
+    /// pairs (current and legacy) at `fs`; allocates nothing.
+    #[allow(clippy::type_complexity)]
+    fn design(params: &DynamicFilter, fs: f64) -> (Section, Section, Option<f64>, [Section; 2], [Section; 2]) {
         let detector = match params.kind {
             DynamicKind::Notch => {
                 // ToneMeister filter type 14: the prewarped bilinear
@@ -928,16 +1048,39 @@ impl DynamicRun {
             DynamicKind::LowShelf => libm::sqrt(params.frequency_hz * 20.0).clamp(40.0, 10_000.0),
             DynamicKind::HighShelf => libm::sqrt(params.frequency_hz * 20_000.0).clamp(40.0, 10_000.0),
         };
-        let quadrature = [Self::allpass(0.5 * analysis_hz, 0.37, fs), Self::allpass(2.0 * analysis_hz, 0.37, fs)];
+        let q = f64::from(QUADRATURE_Q);
+        let quadrature = [Self::allpass(0.5 * analysis_hz, q, fs), Self::allpass(2.0 * analysis_hz, q, fs)];
+        let legacy_quadrature =
+            [Self::allpass(0.5 * analysis_hz, 0.37, fs), Self::allpass(2.0 * analysis_hz, 0.37, fs)];
+        let shelf_zero_hz = matches!(params.kind, DynamicKind::LowShelf).then_some(2.0 * params.frequency_hz);
+        (detector, component, shelf_zero_hz, quadrature, legacy_quadrature)
+    }
+
+    fn new(params: &DynamicFilter, fs: f64) -> DynamicRun {
+        let (detector, component, shelf_zero_hz, quadrature, legacy_quadrature) = Self::design(params, fs);
+        // a type-17 slot starts with no shelf (unit gain) until its first
+        // slice publishes one
+        let carrier = vdsp::Section::new(if shelf_zero_hz.is_some() { [0.0; 5] } else { words(&component) });
         DynamicRun {
             fs,
             detector,
             component,
-            shelf_zero_hz: matches!(params.kind, DynamicKind::LowShelf).then_some(2.0 * params.frequency_hz),
+            shelf_zero_hz,
             detector_filter: ControlFilter::zeroed(&detector),
-            component_state: [[0.0; 2]; MAX_CHANNELS],
+            legacy_component_state: [[0.0; 2]; MAX_CHANNELS],
+            legacy_quadrature_filter: [
+                ControlFilter::zeroed(&legacy_quadrature[0]),
+                ControlFilter::zeroed(&legacy_quadrature[1]),
+            ],
+            corrected_fixed: false,
+            carrier: alloc::boxed::Box::new([[carrier; MAX_CHANNELS]; 2]),
+            bank: 0,
+            fade: 0,
+            published: false,
+            mean_sum: 0.0,
+            mean_count: 0.0,
             quadrature,
-            quadrature_filter: [ControlFilter::zeroed(&quadrature[0]), ControlFilter::zeroed(&quadrature[1])],
+            quadrature_run: [vdsp::Section::new(words(&quadrature[0])), vdsp::Section::new(words(&quadrature[1]))],
             control_phase: 0,
             held: 1.0,
             control: ControlFilter::new(&Self::lowpass(20.0, f64::from(0.707f32), fs)),
@@ -950,24 +1093,41 @@ impl DynamicRun {
     /// any detector, controller or carrier history. These ToneMeister shapes
     /// update one fixed parallel carrier in place.
     fn reconfigure(&mut self, params: &DynamicFilter, fs: f64) {
-        let fresh = Self::new(params, fs);
+        let (detector, component, shelf_zero_hz, quadrature, legacy_quadrature) = Self::design(params, fs);
         self.fs = fs;
-        self.detector = fresh.detector;
-        self.detector_filter.set(&fresh.detector);
-        self.component = fresh.component;
-        self.shelf_zero_hz = fresh.shelf_zero_hz;
-        self.curve_samples = fresh.curve_samples;
-        self.quadrature = fresh.quadrature;
-        self.quadrature_filter[0].set(&fresh.quadrature[0]);
-        self.quadrature_filter[1].set(&fresh.quadrature[1]);
+        self.detector = detector;
+        self.detector_filter.set(&detector);
+        self.component = component;
+        self.shelf_zero_hz = shelf_zero_hz;
+        if self.shelf_zero_hz.is_none() {
+            // a fixed carrier: both sets take the new words in place
+            self.carrier.iter_mut().flatten().for_each(|s| s.set(words(&component)));
+        }
+        // (type 17: the new zero reaches the carrier with its next change)
+        self.curve_samples = Self::curve_samples(params);
+        self.quadrature = quadrature;
+        self.quadrature_run[0].set(words(&quadrature[0]));
+        self.quadrature_run[1].set(words(&quadrature[1]));
+        self.legacy_quadrature_filter =
+            [ControlFilter::zeroed(&legacy_quadrature[0]), ControlFilter::zeroed(&legacy_quadrature[1])];
         self.control.set(&Self::lowpass(20.0, f64::from(0.707f32), fs));
     }
 
     fn reset(&mut self) {
         self.detector_filter.reset_zero();
-        self.component_state = [[0.0; 2]; MAX_CHANNELS];
-        self.quadrature_filter[0].reset_zero();
-        self.quadrature_filter[1].reset_zero();
+        self.legacy_component_state = [[0.0; 2]; MAX_CHANNELS];
+        self.legacy_quadrature_filter[0].reset_zero();
+        self.legacy_quadrature_filter[1].reset_zero();
+        if self.shelf_zero_hz.is_some() {
+            self.carrier.iter_mut().flatten().for_each(|s| s.set([0.0; 5]));
+        }
+        self.carrier.iter_mut().flatten().for_each(vdsp::Section::reset);
+        self.bank = 0;
+        self.fade = 0;
+        self.published = false;
+        self.mean_sum = 0.0;
+        self.mean_count = 0.0;
+        self.quadrature_run.iter_mut().for_each(vdsp::Section::reset);
         self.control_phase = 0;
         self.held = 1.0;
         self.control.prime(&Self::lowpass(20.0, f64::from(0.707f32), self.fs), 1.0);
@@ -1004,7 +1164,17 @@ impl DynamicRun {
         Some(Section { b0: k * n, b1: k * n, b2: 0.0, a1: (k - 1.0) * n, a2: 0.0 })
     }
 
-    fn step_f32(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
+    /// Type 17's unscaled low-pass carrier words at published gain `g`.
+    /// The live per-frame control supplies the `(gain - 1)` amplitude after
+    /// the old/new carrier outputs have been blended.
+    fn shelf_words(zero_hz: f64, g: f64, fs: f64) -> [f64; 5] {
+        match Self::moving_shelf_carrier(zero_hz, g, fs) {
+            Some(s) => words(&s),
+            None => [0.0; 5],
+        }
+    }
+
+    fn step_legacy(section: &Section, state: &mut [f32; 2], input: f32) -> f32 {
         let (b0, b1, b2, a1, a2) =
             (section.b0 as f32, section.b1 as f32, section.b2 as f32, section.a1 as f32, section.a2 as f32);
         let output = b0 * input + state[0];
@@ -1038,6 +1208,22 @@ impl DynamicRun {
     }
 
     fn curve(&self, level: f64) -> f32 {
+        let samples = &self.curve_samples;
+        let db = 20.0 * crate::platform_math::log10f((level as f32).clamp(1e-5, 1.0));
+        let x = ((db + 100.0) * 0.43).max(0.0);
+        let raw_index = x as usize;
+        let i = raw_index.min(43);
+        let t = x - raw_index as f32;
+        let (previous, current, next, next2) =
+            (samples[i.saturating_sub(1)], samples[i], samples[(i + 1).min(43)], samples[(i + 2).min(43)]);
+        let a = libm::fmaf(1.0 / 6.0, next2, libm::fmaf(-0.5, next, libm::fmaf(-1.0 / 6.0, previous, 0.5 * current)));
+        let b = libm::fmaf(0.5, next, libm::fmaf(0.5, previous, -current));
+        let c = libm::fmaf(0.5, next, libm::fmaf(-0.5, previous, 0.0));
+        let d = libm::fmaf(1.0 / 6.0, next, libm::fmaf(1.0 / 6.0, previous, (2.0 / 3.0) * current));
+        libm::fmaf(t, libm::fmaf(t, libm::fmaf(t, a, b), c), d)
+    }
+
+    fn curve_legacy(&self, level: f64) -> f32 {
         let samples = &self.curve_samples;
         let db = 20.0 * libm::log10f((level as f32).clamp(1e-5, 1.0));
         let x = ((db + 100.0) * 0.43).max(0.0);
@@ -1076,8 +1262,20 @@ impl DynamicRun {
         if sidechains == 0 {
             return;
         }
+        if self.shelf_zero_hz.is_none() && !self.corrected_fixed {
+            self.process_legacy(at, bufs, n, sidechains, frames);
+            return;
+        }
+        let mut from = 0;
+        while from < frames {
+            let len = (frames - from).min(DYNAMIC_SLICE);
+            self.process_slice(at, bufs, n, sidechains, from, len);
+            from += len;
+        }
+    }
+
+    fn process_legacy(&mut self, at: &DynamicAt, bufs: &mut [&mut [f32]], n: usize, sidechains: usize, frames: usize) {
         if at.params.smooth {
-            // Explicit attack/release: a block envelope on the detector.
             let mut sum_sq = 0.0;
             let mut from = 0;
             while from < frames {
@@ -1097,7 +1295,7 @@ impl DynamicRun {
             let coefficient =
                 if time_ms <= 0.0 { 0.0 } else { libm::exp(-(frames as f64) / (time_ms * self.fs / 1_000.0)) };
             self.envelope += (1.0 - coefficient) * (measured - self.envelope);
-            self.held = self.curve(self.envelope);
+            self.held = self.curve_legacy(self.envelope);
         }
         let mut gain = [0.0f32; CONTROL_CHUNK];
         let mut from = 0;
@@ -1110,12 +1308,12 @@ impl DynamicRun {
                 self.detector_filter.run(&mut gain[..len]);
                 let mut a = gain;
                 let mut b = gain;
-                self.quadrature_filter[0].run(&mut a[..len]);
-                self.quadrature_filter[1].run(&mut b[..len]);
+                self.legacy_quadrature_filter[0].run(&mut a[..len]);
+                self.legacy_quadrature_filter[1].run(&mut b[..len]);
                 for k in 0..len {
                     if self.control_phase == 0 {
                         self.envelope = f64::from(libm::sqrtf(a[k] * a[k] + b[k] * b[k]));
-                        self.held = self.curve(self.envelope);
+                        self.held = self.curve_legacy(self.envelope);
                     }
                     self.control_phase = (self.control_phase + 1) & 15;
                     gain[k] = self.held;
@@ -1124,19 +1322,13 @@ impl DynamicRun {
                 gain[..len].fill(self.held);
             }
             self.control.run(&mut gain[..len]);
-            let mut carriers = [self.component; CONTROL_CHUNK];
-            if let Some(zero_hz) = self.shelf_zero_hz {
-                for (carrier, g) in carriers.iter_mut().zip(gain.iter()).take(len) {
-                    *carrier = Self::moving_shelf_carrier(zero_hz, f64::from(*g), self.fs).unwrap_or(self.component);
-                }
-            }
             for (c, buf) in bufs.iter_mut().enumerate().take(n) {
                 if at.active_mask >> c & 1 == 0 {
                     continue;
                 }
-                for ((sample, g), carrier) in buf[from..from + len].iter_mut().zip(gain.iter()).zip(carriers.iter()) {
+                for (sample, g) in buf[from..from + len].iter_mut().zip(gain.iter()) {
                     let input = if sample.is_finite() { sample.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
-                    let component = Self::step_f32(carrier, &mut self.component_state[c], input);
+                    let component = Self::step_legacy(&self.component, &mut self.legacy_component_state[c], input);
                     let output = input + (g - 1.0) * component;
                     *sample = if output.is_finite() { output } else { 0.0 };
                 }
@@ -1144,7 +1336,136 @@ impl DynamicRun {
             from += len;
         }
     }
+
+    /// One slice: the control signal over the slice, then the carriers.
+    fn process_slice(
+        &mut self,
+        at: &DynamicAt,
+        bufs: &mut [&mut [f32]],
+        n: usize,
+        sidechains: usize,
+        from: usize,
+        len: usize,
+    ) {
+        let mut gain = [0.0f32; DYNAMIC_SLICE];
+        let gain = &mut gain[..len];
+        if at.params.smooth {
+            // Explicit attack/release: a block envelope on the detector.
+            let mut sum_sq = 0.0;
+            let mut detected = [0.0f32; DYNAMIC_SLICE];
+            let detected = &mut detected[..len];
+            for (k, sample) in detected.iter_mut().enumerate() {
+                *sample = Self::sidechain(at, bufs, n, sidechains, from + k) as f32;
+            }
+            self.detector_filter.run(detected);
+            for &sample in detected.iter() {
+                sum_sq += f64::from(sample) * f64::from(sample);
+            }
+            let measured = core::f64::consts::SQRT_2 * libm::sqrt(sum_sq / len as f64);
+            let time_ms = if measured > self.envelope { at.params.attack_ms } else { at.params.release_ms };
+            let coefficient =
+                if time_ms <= 0.0 { 0.0 } else { libm::exp(-(len as f64) / (time_ms * self.fs / 1_000.0)) };
+            self.envelope += (1.0 - coefficient) * (measured - self.envelope);
+            self.held = self.curve(self.envelope);
+            gain.fill(self.held);
+        } else {
+            for (k, sample) in gain.iter_mut().enumerate() {
+                *sample = Self::sidechain(at, bufs, n, sidechains, from + k) as f32;
+            }
+            self.detector_filter.run(gain);
+            let mut a = [0.0f32; DYNAMIC_SLICE];
+            let mut b = [0.0f32; DYNAMIC_SLICE];
+            let (a, b) = (&mut a[..len], &mut b[..len]);
+            a.copy_from_slice(gain);
+            b.copy_from_slice(gain);
+            self.quadrature_run[0].run_frames(a);
+            self.quadrature_run[1].run_frames(b);
+            for k in 0..len {
+                if self.control_phase == 0 {
+                    self.envelope = f64::from(crate::voicing::tone::platform_magnitude(a[k], b[k]));
+                    self.held = self.curve(self.envelope);
+                }
+                self.control_phase = (self.control_phase + 1) & 15;
+                gain[k] = self.held;
+            }
+        }
+        self.control.run(gain);
+        let fade_len = libm::round(SHELF_FADE_S * self.fs).max(1.0) as usize;
+        let fading = if let Some(zero_hz) = self.shelf_zero_hz {
+            let mean = platform_sve(gain) / len as f32;
+            let changing = self.published && self.fade < fade_len;
+            self.mean_count += 1.0;
+            self.mean_sum += mean;
+            if !changing {
+                let g = self.mean_sum / self.mean_count;
+                self.mean_sum = 0.0;
+                self.mean_count = 0.0;
+                self.published = true;
+                self.fade = 0;
+                let next = 1 - self.bank;
+                let c = Self::shelf_words(zero_hz, f64::from(g), self.fs);
+                for ch in 0..n {
+                    let mut s = self.carrier[self.bank][ch];
+                    s.set(c);
+                    self.carrier[next][ch] = s;
+                }
+                self.bank = next;
+            }
+            self.fade < fade_len
+        } else {
+            false
+        };
+        let wide = n >= 2;
+        for (c, buf) in bufs.iter_mut().enumerate().take(n) {
+            if at.active_mask >> c & 1 == 0 {
+                continue;
+            }
+            let dry = &mut buf[from..from + len];
+            for v in dry.iter_mut() {
+                *v = if v.is_finite() { v.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+            }
+            let mut new = [0.0f32; DYNAMIC_SLICE];
+            let new = &mut new[..len];
+            new.copy_from_slice(dry);
+            let run = |s: &mut vdsp::Section, x: &mut [f32]| if wide { s.run_frames(x) } else { s.run(x) };
+            run(&mut self.carrier[self.bank][c], new);
+            if self.shelf_zero_hz.is_some() {
+                let mut old = [0.0f32; DYNAMIC_SLICE];
+                let old = &mut old[..len];
+                if fading {
+                    old.copy_from_slice(dry);
+                    run(&mut self.carrier[1 - self.bank][c], old);
+                }
+                for (k, (sample, carrier)) in dry.iter_mut().zip(new.iter()).enumerate() {
+                    let component = if fading && self.fade + k < fade_len {
+                        let p = (self.fade + k) as f32 / fade_len as f32;
+                        old[k] + p * p * (carrier - old[k])
+                    } else {
+                        *carrier
+                    };
+                    let output = *sample + (gain[k] - 1.0) * component;
+                    *sample = if output.is_finite() { output } else { 0.0 };
+                }
+            } else {
+                for ((sample, g), component) in dry.iter_mut().zip(gain.iter()).zip(new.iter()) {
+                    let output = *sample + (g - 1.0) * component;
+                    *sample = if output.is_finite() { output } else { 0.0 };
+                }
+            }
+        }
+        if self.shelf_zero_hz.is_some() {
+            self.fade = (self.fade + len).min(fade_len);
+        }
+    }
 }
+
+/// A section's five coefficients for the platform filter.
+fn words(s: &Section) -> [f64; 5] {
+    [s.b0, s.b1, s.b2, s.a1, s.a2]
+}
+
+/// The quality of ToneMeister's analytic all-pass pair (a Float32 value).
+const QUADRATURE_Q: f32 = 0.37;
 
 /// The ToneMeister control low-pass, computed the way the platform's
 /// single-precision multichannel biquad computes one section on one channel.
@@ -1408,6 +1729,9 @@ pub struct PreStage {
     /// allocated once here, never in the real-time path.
     boxes: [Option<alloc::boxed::Box<mstk::Run>>; MAX_BOXES],
     dynamic: [Option<DynamicRun>; MAX_DYNAMIC_FILTERS],
+    /// A one-channel ToneMeister box's static sections as the platform's
+    /// one-channel biquad runs them (allocated once, for one channel only).
+    mono: Option<alloc::boxed::Box<[crate::vdsp::Section; MAX_SECTIONS]>>,
 }
 
 impl PreStage {
@@ -1424,10 +1748,18 @@ impl PreStage {
             (k < params.box_count.min(MAX_BOXES))
                 .then(|| alloc::boxed::Box::new(mstk::Run::new(&params.boxes[k].params, fs, params.channels)))
         });
-        let dynamic = core::array::from_fn(|k| {
+        let mut dynamic = core::array::from_fn(|k| {
             (k < params.dynamic_count.min(MAX_DYNAMIC_FILTERS)).then(|| DynamicRun::new(&params.dynamic[k].params, fs))
         });
-        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic }
+        let corrected_fixed =
+            params.channels >= 2 && params.dynamic_filters().iter().any(|d| d.params.kind == DynamicKind::LowShelf);
+        for run in dynamic.iter_mut().flatten() {
+            run.corrected_fixed = corrected_fixed;
+        }
+        let mono = (params.channels == 1).then(|| {
+            alloc::boxed::Box::new(core::array::from_fn(|_| crate::vdsp::Section::new([1.0, 0.0, 0.0, 0.0, 0.0])))
+        });
+        PreStage { params, state: [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS], dynamics, boxes, dynamic, mono }
     }
 
     pub fn params(&self) -> &Params {
@@ -1461,6 +1793,9 @@ impl PreStage {
     /// Clears every filter's history and the dynamics' detectors (stream start).
     pub fn reset(&mut self) {
         self.state = [[[0.0; 2]; MAX_SECTIONS]; MAX_CHANNELS];
+        for s in self.mono.iter_mut().flat_map(|m| m.iter_mut()) {
+            s.reset();
+        }
         if let Some(d) = &mut self.dynamics {
             d.reset();
         }
@@ -1509,6 +1844,10 @@ impl PreStage {
     /// form leaves a rounding floor up to 8 dB louder, e.g. under a 16 kHz
     /// tone through 80-100 Hz sections).
     fn run_sections_float(&mut self, c: usize, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
+        if c == 0 && self.mono.is_some() {
+            self.run_mono(from, to, gain, buf);
+            return;
+        }
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             buf.fill(0.0);
             return;
@@ -1533,6 +1872,41 @@ impl PreStage {
                     *st = [0.0; 2];
                 }
                 *y = 0.0;
+            }
+        }
+    }
+
+    /// [`Self::run_sections_float`] for a one-channel box: the platform runs
+    /// a one-channel setup's sections one after another over the whole call
+    /// in its blocked form ([`crate::vdsp::Section::run`]), not frame by
+    /// frame (black-box: one-channel boxes of the installed unit match this
+    /// bit for bit and miss the fused frame step from the second sample).
+    fn run_mono(&mut self, from: usize, to: usize, gain: f64, buf: &mut [f32]) {
+        let (Some(mono), Some(ch)) = (self.mono.as_mut(), self.params.channel.first()) else {
+            buf.fill(0.0);
+            return;
+        };
+        let to = to.min(ch.count).min(MAX_SECTIONS);
+        let from = from.min(to);
+        for v in buf.iter_mut() {
+            *v = if v.is_finite() { v.clamp(-INPUT_BOUND, INPUT_BOUND) } else { 0.0 };
+        }
+        for (run, s) in mono[from..to].iter_mut().zip(&ch.sections[from..to]) {
+            run.set([s.b0, s.b1, s.b2, s.a1, s.a2]);
+            run.run(buf);
+        }
+        let g = gain as f32;
+        let mut poisoned = false;
+        for v in buf.iter_mut() {
+            *v *= g;
+            if !v.is_finite() {
+                poisoned = true;
+                *v = 0.0;
+            }
+        }
+        if poisoned {
+            for s in mono[from..to].iter_mut() {
+                s.reset();
             }
         }
     }
@@ -1600,6 +1974,30 @@ impl PreStage {
         }
         let n = n.min(self.params.channels);
         let count = self.params.box_count.min(MAX_BOXES);
+        // The installed ToneMeister builds one static multichannel bank from
+        // all ordinary slots and runs that bank before any level-dependent
+        // overlay. Dynamic slots then run in saved order, each observing the
+        // output of the preceding overlay. `split`/`before_box` describe the
+        // saved slot positions but are not runtime taps for a Tone box.
+        if self.params.dynamic_count != 0 {
+            for (c, buf) in bufs.iter_mut().enumerate().take(n) {
+                let len = frames.min(buf.len());
+                self.run_sections_float(
+                    c,
+                    0,
+                    self.params.channel[c].count,
+                    self.params.channel[c].gain,
+                    &mut buf[..len],
+                );
+            }
+            for k in 0..self.params.dynamic_count.min(MAX_DYNAMIC_FILTERS) {
+                let at = self.params.dynamic[k];
+                if let Some(run) = &mut self.dynamic[k] {
+                    run.process(&at, &mut bufs[..n], frames);
+                }
+            }
+            return;
+        }
         let mut from = [0usize; MAX_CHANNELS];
         let mut dynamic_index = 0usize;
         for k in 0..=count {
@@ -1686,6 +2084,13 @@ impl PreStage {
     /// in [`Self::run_sections_float`]. The protection pre-stage
     /// deliberately keeps the f64 path above.
     pub(crate) fn process_float(&mut self, c: usize, input: &[f32], output: &mut [f32]) {
+        if c == 0 && self.mono.is_some() {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            let (count, gain) = (self.params.channel[0].count, self.params.channel[0].gain);
+            self.run_mono(0, count, gain, &mut output[..n]);
+            return;
+        }
         let (Some(ch), Some(z)) = (self.params.channel.get(c), self.state.get_mut(c)) else {
             output.fill(0.0);
             return;
@@ -1986,8 +2391,9 @@ mod tests {
     fn type18_bounds_the_quadrature_analysis_center() {
         let p = dynamic_filter_params(DynamicKind::HighShelf);
         let run = DynamicRun::new(&p.dynamic[0].params, 48_000.0);
-        assert_eq!(run.quadrature[0], DynamicRun::allpass(5_000.0, 0.37, 48_000.0));
-        assert_eq!(run.quadrature[1], DynamicRun::allpass(20_000.0, 0.37, 48_000.0));
+        let q = f64::from(QUADRATURE_Q);
+        assert_eq!(run.quadrature[0], DynamicRun::allpass(5_000.0, q, 48_000.0));
+        assert_eq!(run.quadrature[1], DynamicRun::allpass(20_000.0, q, 48_000.0));
     }
 
     #[test]
@@ -2028,8 +2434,8 @@ mod tests {
         run.process(&at, &mut [&mut signal], 512);
 
         let detector_history = run.detector_filter.history;
-        let component_state = run.component_state;
-        let quadrature_history = [run.quadrature_filter[0].history, run.quadrature_filter[1].history];
+        let carrier = run.carrier.clone();
+        let quadrature = run.quadrature_run;
         let control = run.control.history;
         let phase = run.control_phase;
         let held = run.held;
@@ -2043,8 +2449,16 @@ mod tests {
         assert_ne!(run.curve_samples, original_curve);
         assert_eq!(run.curve_samples, DynamicRun::new(&moved, 48_000.0).curve_samples);
         assert_eq!(run.detector_filter.history, detector_history);
-        assert_eq!(run.component_state, component_state);
-        assert_eq!([run.quadrature_filter[0].history, run.quadrature_filter[1].history], quadrature_history);
+        // the carrier keeps its state (a fixed carrier takes the new words)
+        let mut kept = carrier;
+        kept.iter_mut().flatten().for_each(|s| s.set(words(&DynamicRun::new(&moved, 48_000.0).component)));
+        assert_eq!(run.carrier, kept);
+        // the analytic pair keeps its state under the new words
+        let mut pair = quadrature;
+        let fresh = DynamicRun::new(&moved, 48_000.0).quadrature;
+        pair[0].set(words(&fresh[0]));
+        pair[1].set(words(&fresh[1]));
+        assert_eq!(run.quadrature_run, pair);
         assert_eq!(run.control.history, control);
         assert_eq!(run.control_phase, phase);
         assert_eq!(run.held, held);
