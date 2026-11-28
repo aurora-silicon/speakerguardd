@@ -38,6 +38,8 @@
 //! | `aufx/lwbo` | the low-frequency blend (`sgv2_core::mic::blend`) against the reference beams; law from the summary, measured against black-box whole-graph renders of the unit (broadband, wind-like, steered, onset: 43-60 dB; low-level and tone-in-noise residuals), TODO(SPEC) | approximate |
 //! | `aufx/ocns` | identity, partial blobs only (documented transparent or attenuating) | uncharacterised |
 //! | bypassed in the strip | nothing | bypassed |
+//! | `aufx/sens` after the analysis (frequency domain, before the beam) | the same suppressor carried before the transform: black-box equal there, one block later than the unit, so only together with the trackpad block | approximate |
+//! | trackpad block (`aufx/nnet` bypassed, `delay` set from its latency, `adif`, `dbgn`, `asum`) | one block of delay (black-box exact), which the frequency-placed suppressor's block carries; the unit not bypassed, or the block alone, refuses | exact |
 //! | anything else | refused, partial or not | refused |
 //!
 //! **Refusal.** The default compile refuses, and writes no blob, when any
@@ -418,6 +420,120 @@ fn is_dead(g: &Graph, node: &str) -> bool {
 
 fn parameter_box(bx: &GraphBox) -> bool {
     matches!(&bx.kind, BoxKind::Builtin(w) if w.starts_with("parameter_"))
+}
+
+fn builtin_is(g: &Graph, node: &str, word: &str) -> bool {
+    g.find_box(node).is_some_and(|b| matches!(&b.kind, BoxKind::Builtin(w) if w == word))
+}
+
+/// The link that sets a trackpad block's delay from its neural unit's
+/// latency; [`trackpad_block`] checks it, the parameter logic skips it.
+fn trackpad_latency_link(g: &Graph, l: &dspg::BoxLink) -> bool {
+    let at = |t: &dspg::Target, id: f64| Num::value(&t.id) == Some(id) && t.rest == ["0", "0"];
+    g.find_box(&l.from.node).is_some_and(|b| subtype(b) == "nnet")
+        && builtin_is(g, &l.to.node, "delay")
+        && at(&l.from, 14.0)
+        && at(&l.to, 0.0)
+}
+
+/// The trackpad mitigation block after the synthesis: `src` feeds a neural
+/// unit N and a delay D (set from N's latency); `adif` A = D - N, a dB gain
+/// G on A, `asum` M = N + G. With N bypassed in the strip, black-box renders
+/// of the whole block are one block of delay (exact at 48 kHz, block 480).
+/// Returns M and the block's boxes; anything else is an error.
+fn trackpad_block(g: &Graph, strip: &AuStrip, src: &str, fs: u32) -> Result<(String, Vec<String>)> {
+    let no = |why: &str| bad(format!("{src} feeds two boxes that are not the characterised trackpad block: {why}"));
+    let outs = |n: &str| g.wires.iter().filter(|w| w.src.node == n).collect::<Vec<_>>();
+    let from =
+        |n: &str, port: u32| g.wires.iter().find(|w| w.dst.node == n && w.dst.port == port).map(|w| w.src.node.clone());
+    let single = |n: &str| {
+        let v: Vec<String> = outs(n).iter().map(|w| w.dst.node.clone()).collect();
+        if v.len() == 1 {
+            v.into_iter().next()
+        } else {
+            None
+        }
+    };
+    let s = outs(src);
+    let nn = s
+        .iter()
+        .map(|w| w.dst.node.clone())
+        .find(|n| g.find_box(n).is_some_and(|b| subtype(b) == "nnet"))
+        .ok_or_else(|| no("no neural unit"))?;
+    let dl = s.iter().map(|w| w.dst.node.clone()).find(|n| builtin_is(g, n, "delay")).ok_or_else(|| no("no delay"))?;
+    if s.len() != 2 {
+        return Err(no("not exactly two consumers"));
+    }
+    if !strip.effect(&nn).is_some_and(|e| e.bypass) {
+        return Err(bad(format!("{nn} (aufx/nnet): only a bypassed neural unit is characterised")));
+    }
+    let a = single(&dl).ok_or_else(|| no("the delay feeds more than one box"))?;
+    if !builtin_is(g, &a, "adif")
+        || from(&a, 0).as_deref() != Some(dl.as_str())
+        || from(&a, 1).as_deref() != Some(nn.as_str())
+    {
+        return Err(no("the difference is not delay minus unit"));
+    }
+    let gn = single(&a).ok_or_else(|| no("the difference feeds more than one box"))?;
+    if !builtin_is(g, &gn, "dbgn") {
+        return Err(no("the difference does not feed a dB gain"));
+    }
+    let m = single(&gn).ok_or_else(|| no("the gain feeds more than one box"))?;
+    if !builtin_is(g, &m, "asum")
+        || from(&m, 0).as_deref() != Some(nn.as_str())
+        || from(&m, 1).as_deref() != Some(gn.as_str())
+    {
+        return Err(no("the mix is not unit plus attenuated difference"));
+    }
+    let names = [nn.clone(), dl.clone(), a.clone(), gn.clone(), m.clone()];
+    // the complete characterised wiring, ports included: nothing else into or
+    // out of the block but the mix's one output
+    let shape = |w: &dspg::Wire| (w.src.node.clone(), w.src.port, w.dst.node.clone(), w.dst.port);
+    let mut got: Vec<_> = g.wires.iter().filter(|w| names.contains(&w.dst.node)).map(shape).collect();
+    got.sort();
+    let mut want = vec![
+        (src.to_string(), 0, nn.clone(), 0),
+        (src.to_string(), 0, dl.clone(), 0),
+        (dl.clone(), 0, a.clone(), 0),
+        (nn.clone(), 0, a.clone(), 1),
+        (a.clone(), 0, gn.clone(), 0),
+        (nn.clone(), 0, m.clone(), 0),
+        (gn.clone(), 0, m.clone(), 1),
+    ];
+    want.sort();
+    if got != want {
+        return Err(no("its wiring or ports differ from the characterised block"));
+    }
+    let leaving: Vec<_> =
+        g.wires.iter().filter(|w| names.contains(&w.src.node) && !names.contains(&w.dst.node)).map(shape).collect();
+    if leaving.len() != 1 || leaving[0].0 != m || leaving[0].1 != 0 {
+        return Err(no("something other than the mix's output 0 leaves the block"));
+    }
+    // exactly one parameter link touches the block: the unit's latency
+    // (parameter 14) into the delay's parameter 0
+    let touching: Vec<_> =
+        g.box_param_links.iter().filter(|l| names.contains(&l.from.node) || names.contains(&l.to.node)).collect();
+    if touching.len() != 1
+        || !trackpad_latency_link(g, touching[0])
+        || touching[0].from.node != nn
+        || touching[0].to.node != dl
+    {
+        return Err(no("its parameter links are not exactly the unit's latency into the delay"));
+    }
+    if g.param_links.iter().any(|l| names.contains(&l.target.node))
+        || g.box_property_links.iter().any(|l| names.contains(&l.from.node) || names.contains(&l.to.node))
+    {
+        return Err(no("another parameter or property writes into the block"));
+    }
+    for w in g.wires.iter().filter(|w| names.contains(&w.dst.node)) {
+        let block = g.wire_format(w).and_then(|f| f.block_size.as_ref()).and_then(Num::value);
+        if wire_ch(g, w)? != 1 || block != Some(480.0) || fs != 48_000 {
+            return Err(bad(format!(
+                "{nn}: the trackpad block is characterised at one channel, 48 kHz, block 480 only"
+            )));
+        }
+    }
+    Ok((m, names.to_vec()))
 }
 
 fn wire_ch(g: &Graph, w: &dspg::Wire) -> Result<usize> {
@@ -1018,6 +1134,9 @@ pub fn static_params(g: &Graph, params: &BTreeMap<String, f64>) -> Result<BTreeM
         return Err(bad(format!("parameter box {} never resolves (a cycle or a missing input)", bx.name)));
     }
     for l in &g.box_param_links {
+        if trackpad_latency_link(g, l) {
+            continue;
+        }
         let Some(bx) = g.find_box(&l.to.node) else { return Err(bad(format!("link to unknown box {}", l.to.node))) };
         if parameter_box(bx) {
             continue;
@@ -1433,6 +1552,9 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
     let mut refs: Vec<Beam> = Vec::new();
     let mut freq: Vec<mic::FreqStage> = Vec::new();
     let mut sens_hop: Option<usize> = None;
+    // a frequency-placed suppressor's extra block, until a trackpad block takes it
+    let mut freq_sens_block = false;
+    let mut freq_sens_count = 0usize;
     let mut domain = Domain::PreTime;
     let mut node = input.clone();
     let mut visited = vec![input.clone()];
@@ -1465,6 +1587,36 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                 }
             }
             continue;
+        }
+        if domain == Domain::PostTime && next.len() == 2 {
+            match trackpad_block(&g, &strip, &node, fs) {
+                Ok((mix, names)) if freq_sens_block => {
+                    freq_sens_block = false;
+                    for n in &names {
+                        let bx = g.find_box(n).unwrap();
+                        let detail = if subtype(bx) == "nnet" {
+                            "trackpad block, neural unit bypassed: one block of delay (black-box exact), carried by the \
+                             frequency-placed suppressor's block"
+                        } else {
+                            "part of the trackpad block"
+                        };
+                        r.stage(n, &kind_name(bx), "time", Status::Exact, detail);
+                    }
+                    visited.extend(names);
+                    node = mix;
+                    continue;
+                }
+                Ok(_) => {
+                    r.refusals.push(format!(
+                        "{node}: a trackpad block (one block of delay) without a frequency-placed suppressor to carry it"
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    r.refusals.push(err.to_string());
+                    break;
+                }
+            }
         }
         let [nx] = next.as_slice() else {
             r.refusals.push(format!("{node} feeds {next:?}: the chain is not a single path"));
@@ -1547,7 +1699,7 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                      decaying term with the high-pass poles); steady state exact",
                 );
             }
-            ("gain" | "dbgn", Domain::PreTime | Domain::PostTime) => match gain_db(&nx, &sub, e, &ov) {
+            ("gain" | "dbgn", d) if *d != Domain::Freq || beam_p.is_none() => match gain_db(&nx, &sub, e, &ov) {
                 Ok((db, false)) => {
                     stages.push(Stage::Gain { db });
                     r.stage(&nx, &kind, dom, Status::Exact, format!("{db:+.2} dB"));
@@ -1733,7 +1885,9 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                 node = nx;
                 continue;
             }
-            ("sens", Domain::PreTime) if in_w == out_w => {
+            ("sens", Domain::PreTime | Domain::Freq)
+                if in_w == out_w && (domain == Domain::PreTime || beam_p.is_none()) =>
+            {
                 let res = (|| -> Result<mic::sens::Sens> {
                     let e = e.ok_or_else(|| bad(format!("{nx}: no preset in the strip")))?;
                     let hop = g
@@ -1754,8 +1908,20 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
                             r.refusals.push(format!("{nx}: suppressors on different blocks"));
                         }
                         sens_hop = Some(sp.hop);
+                        let placed = if domain == Domain::Freq {
+                            freq_sens_count += 1;
+                            if freq_sens_count > 1 {
+                                r.refusals.push(format!(
+                                    "{nx}: a second frequency-placed suppressor (one trackpad block carries one block)"
+                                ));
+                            }
+                            freq_sens_block = true;
+                            "; after the analysis: carried before the transform (black-box equal, one block later)"
+                        } else {
+                            ""
+                        };
                         let detail = format!(
-                            "noise-floor suppressor, {} microphones, block {}, Burg order {}{}",
+                            "noise-floor suppressor, {} microphones, block {}, Burg order {}{}{placed}",
                             sp.mics,
                             sp.hop,
                             sp.order,
@@ -1799,6 +1965,12 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
             r.refusals.push(format!("{nx}: {in_w} channels in, {out_w} out"));
         }
         node = nx;
+    }
+    if freq_sens_block {
+        r.refusals.push(
+            "a frequency-placed suppressor runs one block later than the unit and no trackpad block carries that block"
+                .into(),
+        );
     }
     // every box off the path must be a dead end, parameter logic, or bypassed
     for bx in &g.boxes {
