@@ -497,14 +497,23 @@ fn a_trackpad_block_without_a_frequency_placed_suppressor_refuses() {
 }
 
 #[test]
-fn a_frequency_placed_suppressor_without_a_trackpad_block_refuses() {
+fn a_frequency_placed_suppressor_without_a_trackpad_block_is_one_block_later() {
+    let base = mic::compile(
+        &neo_fixture(false, false, true).tree("mic-neo-sens-alone-base"),
+        &mic::Options::default(),
+        &mut Diagnostics::default(),
+    )
+    .unwrap();
     let c = mic::compile(
         &neo_fixture(true, false, true).tree("mic-neo-sens-alone"),
         &mic::Options::default(),
         &mut Diagnostics::default(),
     )
     .unwrap();
-    assert!(c.refused() && c.report.refusals.iter().any(|r| r.contains("one block later")), "{:?}", c.report.refusals);
+    assert!(!c.refused(), "{:?}", c.report.refusals);
+    // the time-domain chain, and the report says it is one block later than the unit
+    assert!(c.report.notes.iter().any(|n| n.contains("one block later")), "{:?}", c.report.notes);
+    assert_eq!(c.params.unwrap(), base.params.unwrap());
 }
 
 /// Compile `f` with the graph text changed by `edit` and expect a refusal mentioning `why`.
