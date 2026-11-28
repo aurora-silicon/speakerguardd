@@ -514,6 +514,28 @@ fn a_frequency_placed_suppressor_without_a_trackpad_block_is_one_block_later() {
     // the time-domain chain, and the report says it is one block later than the unit
     assert!(c.report.notes.iter().any(|n| n.contains("one block later")), "{:?}", c.report.notes);
     assert_eq!(c.params.unwrap(), base.params.unwrap());
+    // the extra block is in the serialized latency: one block more than the
+    // same graph with the suppressor bypassed (the unit's timing)
+    let unit = common::test_unit();
+    let m = Machine::with_unit("j999", &unit).unwrap();
+    let latency = |f: &Fixture, name: &str| {
+        let (blob, report) = mic::compile_blob(
+            &f.installed(name, "j999", &unit),
+            &m,
+            &mic::Options::default(),
+            false,
+            &mut Diagnostics::default(),
+        )
+        .unwrap();
+        let (h, _) = artifact::decode(&blob.expect("a blob")).unwrap();
+        assert_eq!(h.latency as usize, report.latency_frames);
+        h.latency as usize
+    };
+    let live = latency(&neo_fixture(true, false, true), "mic-neo-sens-alone-blob");
+    let mut off = neo_fixture(true, false, true);
+    off.effects[1] = unit_effect("Sens", "sens", &sens_state(6.0), true, None);
+    let bypassed = latency(&off, "mic-neo-sens-off-blob");
+    assert_eq!(live, bypassed + 480);
 }
 
 /// Compile `f` with the graph text changed by `edit` and expect a refusal mentioning `why`.

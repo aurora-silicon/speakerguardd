@@ -2136,7 +2136,8 @@ pub fn compile(b: &Bundle, opts: &Options, diags: &mut Diagnostics) -> Result<Co
         // blob's latency says so, so a host aligns it
         r.notes.push(
             "the frequency-placed suppressor runs one block later than the unit (no trackpad block absorbs it): \
-             the same output, one block (10 ms at 48 kHz) more latency than macOS, reported in the blob's latency"
+             lag-aligned approximate parity with the unit, one block (10 ms at 48 kHz) more latency than macOS, \
+             carried in the blob's latency"
                 .into(),
         );
         r.todo("frequency-placed suppressor: one block more latency than the unit (a frequency-domain suppressor stage would remove it)");
