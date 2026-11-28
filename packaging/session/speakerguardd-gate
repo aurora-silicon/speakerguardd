@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -63,6 +64,7 @@ CONTROL = "Speaker Protection"
 # The dual kernel's selector (linux#1279) and the upgrade's persistent choice.
 INTERFACE_CONTROL = "Speaker Protection Interface"
 UPGRADE_SETTING = "/var/lib/aurora-speaker-upgrade/interface"
+SEAT_PENDING = "/run/aurora-speaker-upgrade/seat-pending"
 
 
 def log(*a):
@@ -197,6 +199,18 @@ def upgrade_setting(path=None):
     return v if v == "v2" else None
 
 
+def upgrade_seat_pending(path=None):
+    """True when aurora-speaker-upgrade deferred this boot's switch until the
+    first regular user logs in on seat0. Only a regular file owned by root (or
+    the current uid in tests) counts; symlinks are ignored."""
+    path = path or SEAT_PENDING
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid in (0, os.geteuid())
+
+
 # amixer's message when the card opened but has no such control
 # (snd_ctl_elem_info() failed); alsa-utils does not translate it.
 NO_SUCH_CONTROL = "Cannot find the given element"
@@ -323,10 +337,13 @@ def _decide(args):
                        f"could not be read within {args.wait:.0f} s: {FLOOR}")
     if iface is None:
         return False, (why_not or f"{board} is gated") + f"; no speaker card: {FLOOR}"
-    if why_not:
-        return False, f"{why_not}: {FLOOR} ({card})"
     if iface == "legacy":
         return False, f"{board} is gated for v2, but this kernel has no \"{CONTROL}\" control on {card}: {FLOOR}"
+    if getattr(args, "cmd", "v2") == "prepare" and upgrade_seat_pending(getattr(args, "seat_pending", None)):
+        return True, (f"{board}: aurora-speaker-upgrade waits for the first seat0 user on {card}: "
+                      "allowing seat follower to retry the switch")
+    if why_not:
+        return False, f"{why_not}: {FLOOR} ({card})"
     if iface == "dual" and upgrade_setting(getattr(args, "setting", None)) != "v2":
         return False, (f"{board} is gated for v2 and the kernel serves both interfaces on {card}, but the upgrade has not "
                        f"switched this Mac ({UPGRADE_SETTING} is not \"v2\"; aurora-speaker-upgrade run switches it): "
@@ -346,6 +363,8 @@ def main():
     ap.add_argument("--tuning-cli", default="aurora-speaker-tuning")
     ap.add_argument("--wait", type=float, default=15.0, help="seconds to wait for the speaker card")
     ap.add_argument("--setting", default=UPGRADE_SETTING, help="the upgrade's persistent interface choice")
+    ap.add_argument("--seat-pending", default=SEAT_PENDING,
+                    help="marker written by aurora-speaker-upgrade while waiting for the first seat0 user")
     args = ap.parse_args()
     if args.cmd == "interface":
         return interface(args)

@@ -103,6 +103,15 @@ again until the kernel, speakerguardd v2's provisioning or self-check, the
 parity attestation or this tool changes; the unit counts a refusal as an
 outcome, not a failure. `run` by hand always tries again.
 
+If provisioning cannot name a seat user yet at boot (for example on a fresh
+install before the first-run wizard creates the user, or on a multi-user Mac
+before the first login), the boot run leaves the speakers at the kernel's own
+limit, records no refusal, writes `/run/aurora-speaker-upgrade/seat-pending`,
+and exits 2 (not now). When the first regular user logs in on `seat0`,
+`speakerguardd-seat.path` triggers `speakerguardd-seat.service`, which retries
+`aurora-speaker-upgrade.service` for that user; a passing switch or a later
+refusal clears the marker.
+
 A boot run waits up to 120 s for the speaker card, because the card's
 driver can bind after `sound.target` (on a J413 the card registered a
 second after the run). It waits only while the live device tree describes

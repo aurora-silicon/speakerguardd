@@ -427,7 +427,8 @@ class BootRefusalRecord(unittest.TestCase):
         self.key = "k1"
         up.refusal_key = lambda identity: test.key
         up.Store.ensure = lambda self: os.makedirs(self.root, mode=0o700, exist_ok=True)
-        self.a = lambda boot: types.SimpleNamespace(store=self.dir, adt=None, at_boot=boot)
+        self.a = lambda boot: types.SimpleNamespace(
+            store=self.dir, adt=None, at_boot=boot, seat_pending=os.path.join(self.dir, "seat-pending"))
 
     def tearDown(self):
         import shutil
@@ -465,6 +466,139 @@ class BootRefusalRecord(unittest.TestCase):
         k = self.saved[2](types.SimpleNamespace(unit="u1"))
         self.assertRegex(k, r"^[0-9a-f]{64}$")
         self.assertNotEqual(k, self.saved[2](types.SimpleNamespace(unit="u2")))
+
+
+class FirstBootNoSeatRetry(unittest.TestCase):
+    """speakerguardd#274: first boot before a regular user exists (plasma-setup
+    / gnome-initial-setup, or a multi-user Mac before first login) leaves the
+    speakers at the floor, writes no refused.json, marks seat-pending for the
+    seat follower, and retries on the first login; a later refusal clears the
+    marker and keeps the floor."""
+
+    def run_upgrade(self, at_boot, prov_rc, prov_stderr="", selfcheck_err=None, existing_marker=False):
+        import contextlib
+        import stat
+        import subprocess
+        import tempfile
+        import types
+        from unittest import mock
+        from aurora_speaker_upgrade import collect, upgrade as up
+
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store")
+            pconf = os.path.join(d, "etc", "provision.conf")
+            marker = os.path.join(d, "run", "seat-pending")
+            if existing_marker:
+                up.mark_seat_pending(marker)
+            bundle = {"manifest.json": json.dumps({"unit_id": "u1", "aid": "AID34", "macos_build": "27.2"}).encode()}
+            ident = types.SimpleNamespace(unit="u1", acoustic=34, matches_dt=lambda: True)
+            a = types.SimpleNamespace(
+                store=store, adt=None, at_boot=at_boot, force=False, no_switch=False,
+                seat_pending=marker, scratch=os.path.join(d, "scratch"),
+                chosen=collect.CHOSEN_SPID, installer_dirs=[], ipsw=None,
+            )
+
+            def fake_run_v2(argv, **kw):
+                return subprocess.CompletedProcess(argv, prov_rc, "", prov_stderr)
+
+            def fake_selfcheck(_a, _mode=None):
+                if selfcheck_err is not None:
+                    raise selfcheck_err
+
+            back_calls = []
+            real_back = up.back_to_floor
+
+            def spy_back(*args, **kw):
+                back_calls.append(args)
+                return real_back(*args, **kw)
+
+            patches = [
+                (collect, "Identity", lambda adt=None: ident),
+                (up, "refusal_key", lambda _id: "k1"),
+                (up, "wait_interface_mode", lambda wait: ("dual", "0")),
+                (up, "playback_proof", lambda aid: [{"evidence": "x", "covers": ["a"]}]),
+                (up, "card_identity", lambda c: "AppleJ614"),
+                (up, "acquire_waiting", lambda i, a, w: (bundle, {"aid": "AID34", "macos_build": "27.2", "source": "ipsw"})),
+                (up, "same_speaker_card", lambda m, c, i: None),
+                (up, "PROVISION_CONF", pconf),
+                (up, "tool", lambda name: "/usr/libexec/speakerguardd/" + name),
+                (up, "older_stop", lambda: None),
+                (up, "session_stop", lambda: None),
+                (up, "session_start", lambda: None),
+                (up, "graph_deactivate", lambda: None),
+                (up, "interface_set", lambda c, v: None),
+                (up, "run_v2", fake_run_v2),
+                (up, "selfcheck", fake_selfcheck),
+                (up, "systemctl", lambda *args: subprocess.CompletedProcess(args, 0, "", "")),
+                (up, "wait_v2_granted", lambda since: True),
+                (up, "back_to_floor", spy_back),
+            ]
+            with contextlib.ExitStack() as stack:
+                for target, attr, val in patches:
+                    stack.enter_context(mock.patch.object(target, attr, val))
+                exc = None
+                rc = None
+                try:
+                    rc = up.cmd_run(a)
+                except Exception as e:
+                    exc = e
+                return {
+                    "rc": rc,
+                    "exc": exc,
+                    "back_calls": len(back_calls),
+                    "refused_exists": os.path.exists(os.path.join(store, "refused.json")),
+                    "interface_exists": os.path.exists(os.path.join(store, "interface")),
+                    "marker_exists": os.path.exists(marker),
+                    "marker_mode": stat.S_IMODE(os.stat(marker).st_mode) if os.path.exists(marker) else None,
+                    "marker_dir_mode": stat.S_IMODE(os.stat(os.path.dirname(marker)).st_mode) if os.path.exists(marker) else None,
+                    "switched": up.Store(store).state().get("switched"),
+                }
+
+    def test_no_seat_user_at_boot_leaves_floor_skips_refusal_and_marks_pending(self):
+        from aurora_speaker_upgrade import upgrade as up
+        for rc, err in ((up.EXIT_NO_SEAT, "no seat user: 0 regular users (none)"),
+                        (1, "speakerguardd-provision:   - no seat user: 0 regular users (none)")):
+            res = self.run_upgrade(at_boot=True, prov_rc=rc, prov_stderr=err)
+            self.assertIsInstance(res["exc"], up.NoSeatUser)
+            self.assertIsInstance(res["exc"], up.Retry)
+            self.assertEqual(res["back_calls"], 1)
+            self.assertFalse(res["refused_exists"])
+            self.assertFalse(res["interface_exists"])
+            self.assertFalse(res["switched"])
+            self.assertTrue(res["marker_exists"])
+            self.assertEqual(res["marker_mode"], 0o600)
+            self.assertEqual(res["marker_dir_mode"], 0o700)
+
+    def test_by_hand_no_seat_user_retries_without_marking_pending(self):
+        from aurora_speaker_upgrade import upgrade as up
+        res = self.run_upgrade(at_boot=False, prov_rc=up.EXIT_NO_SEAT, prov_stderr="no seat user: 0 regular users")
+        self.assertIsInstance(res["exc"], up.NoSeatUser)
+        self.assertFalse(res["refused_exists"])
+        self.assertFalse(res["marker_exists"])
+
+    def test_retry_after_login_switches_and_clears_marker(self):
+        from aurora_speaker_upgrade import upgrade as up
+        res = self.run_upgrade(at_boot=True, prov_rc=0, existing_marker=True)
+        self.assertIsNone(res["exc"])
+        self.assertEqual(res["rc"], up.EXIT_OK)
+        self.assertTrue(res["interface_exists"])
+        self.assertTrue(res["switched"])
+        self.assertFalse(res["marker_exists"])
+        self.assertFalse(res["refused_exists"])
+
+    def test_retry_refusal_keeps_floor_records_refused_and_clears_marker(self):
+        from aurora_speaker_upgrade import upgrade as up
+        res = self.run_upgrade(
+            at_boot=True, prov_rc=0,
+            selfcheck_err=up.Refused("self-check refused"),
+            existing_marker=True,
+        )
+        self.assertIsInstance(res["exc"], up.Refused)
+        self.assertEqual(res["back_calls"], 1)
+        self.assertFalse(res["interface_exists"])
+        self.assertFalse(res["switched"])
+        self.assertTrue(res["refused_exists"])
+        self.assertFalse(res["marker_exists"])
 
 
 class V2Umask(unittest.TestCase):

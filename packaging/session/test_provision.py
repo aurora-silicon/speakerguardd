@@ -378,9 +378,10 @@ class Provision(Base):
         self.assert_closed("no usable speaker tuning bundle")
 
     def test_fails_closed_without_a_seat_user(self):
-        self.patch(prov, "regular_users", lambda rng: ["alice", "bob"])
-        self.assertEqual(self.run_(), 1)
-        self.assert_closed("no seat user: 2 regular users (alice, bob)")
+        for users, desc in (([], "0 regular users (none)"), (["alice", "bob"], "2 regular users (alice, bob)")):
+            self.patch(prov, "regular_users", lambda rng, u=users: u)
+            self.assertEqual(self.run_(), prov.EXIT_NO_SEAT)
+            self.assert_closed(f"no seat user: {desc}")
 
     def test_fails_closed_without_a_card(self):
         def nocard(hw, want, wait, **kw):
@@ -461,7 +462,7 @@ class Seat(Base):
             f.write("[Autologin]\nSession=plasma\nUser=chloe\n")
         self.assertEqual(prov.autologin_user(etc), "chloe")
 
-    def seat_change(self, is_enabled, show):
+    def seat_change(self, is_enabled, show, seat_pending=False, symlink=False):
         """seat0 changes to a regular user nobody provisioned (the first
         login on a fresh install). `is_enabled` is `systemctl is-enabled`'s
         exit status, `show` the unit's `systemctl show` properties. The
@@ -479,11 +480,45 @@ class Seat(Base):
         self.patch(prov, "seat0_user", lambda rng: "alice")
         self.patch(prov.subprocess, "run", run)
         os.makedirs(self.p.state, exist_ok=True)
-        self.assertEqual(prov.cmd_seat(self.args("seat"), self.p), 0)
+        marker = os.path.join(self.t, "seat-pending")
+        if os.path.lexists(marker):
+            os.unlink(marker)
+        if symlink:
+            target = os.path.join(self.t, "seat-target")
+            with open(target, "w") as f:
+                f.write("pending\n")
+            os.symlink(target, marker)
+        elif seat_pending:
+            with open(marker, "w") as f:
+                f.write("pending\n")
+        a = self.args("seat")
+        a.seat_pending = marker
+        a.upgrade_unit = prov.UPGRADE_UNIT
+        self.assertEqual(prov.cmd_seat(a, self.p), 0)
         return calls
 
-    def restarted(self, calls):
-        return ["systemctl", "restart", "--no-block", "speakerguardd.service"] in calls
+    def restarted(self, calls, unit="speakerguardd.service"):
+        return ["systemctl", "restart", "--no-block", unit] in calls
+
+    def test_seat_retries_pending_upgrade_on_first_login(self):
+        # Enabled (Fedora preset) and WantedBy-only (Arch): retry the boot upgrade
+        # rather than restarting the supervisor directly.
+        calls = self.seat_change(0, {}, seat_pending=True)
+        self.assertTrue(self.restarted(calls, prov.UPGRADE_UNIT))
+        self.assertFalse(self.restarted(calls))
+        calls = self.seat_change(1, {"LoadState": "loaded", "UnitFileState": "disabled",
+                                     "WantedBy": "multi-user.target", "RequiredBy": ""}, seat_pending=True)
+        self.assertTrue(self.restarted(calls, prov.UPGRADE_UNIT))
+        self.assertFalse(self.restarted(calls))
+        # Disabled or masked upgrade unit: never started.
+        calls = self.seat_change(1, {"LoadState": "loaded", "UnitFileState": "disabled",
+                                     "WantedBy": "", "RequiredBy": ""}, seat_pending=True)
+        self.assertFalse(self.restarted(calls, prov.UPGRADE_UNIT))
+        self.assertFalse(self.restarted(calls))
+        # A symlink marker is ignored (falls back to normal supervisor restart).
+        calls = self.seat_change(0, {}, symlink=True)
+        self.assertFalse(self.restarted(calls, prov.UPGRADE_UNIT))
+        self.assertTrue(self.restarted(calls))
 
     def test_seat_restarts_a_unit_the_package_wants_without_enabling_it(self):
         # Arch (alarm-aurora): pacman applies no presets, so the package ships
@@ -1395,20 +1430,44 @@ class Deactivate(Base):
 
 
 class Gate(Base):
-    def decide(self, iface="v2", gate_data=None, cmd="v2", card=None):
+    def decide(self, iface="v2", gate_data=None, cmd="v2", card=None, seat_pending=None):
         g = os.path.join(self.t, "gate.json")
         with open(g, "w") as f:
             json.dump(GATE if gate_data is None else gate_data, f)
         self.patch(gate, "kernel_interface", lambda wait, **kw: (iface, "AppleX") if iface else (None, card))
         self.patch(gate, "PROVISION_CONF", os.path.join(self.t, "provision.conf"))
         a = types.SimpleNamespace(gate=g, dt=self.dt, tuning_cli=self.cli, wait=0, state=self.p.state, cmd=cmd,
-                                  setting=os.path.join(self.t, "upgrade-interface"))
+                                  setting=os.path.join(self.t, "upgrade-interface"),
+                                  seat_pending=seat_pending or os.path.join(self.t, "absent-seat-pending"))
         v2, why = gate.decide(a)
         self.why = why
         if not v2:
             # whenever v2 does not run, nothing runs: never an older daemon
             self.assertIn(gate.FLOOR, why)
         return v2
+
+    def test_prepare_admits_seat_pending_upgrade_while_v2_stays_closed(self):
+        self.board("j999")
+        # Simulate an unswitched dual-kernel Mac whose IPSW bundle is not yet
+        # wired into provision.conf (back_to_floor restored provision.conf).
+        self.ctl({"fail": "no usable speaker tuning bundle"})
+        marker = os.path.join(self.t, "seat-pending")
+        self.assertFalse(self.decide(iface="dual", cmd="prepare", seat_pending=marker))
+        self.assertFalse(self.decide(iface="dual", cmd="v2", seat_pending=marker))
+        with open(marker, "w") as f:
+            f.write("2026-11-28T00:00:00+0000\n")
+        # Seat follower (prepare) may run on dual or v2-only kernels; supervisor (v2) stays closed.
+        self.assertTrue(self.decide(iface="dual", cmd="prepare", seat_pending=marker))
+        self.assertTrue(self.decide(iface="v2", cmd="prepare", seat_pending=marker))
+        self.assertFalse(self.decide(iface="dual", cmd="v2", seat_pending=marker))
+        self.assertFalse(self.decide(iface="v2", cmd="v2", seat_pending=marker))
+        # Legacy kernel or missing speaker card stays closed even with the marker.
+        self.assertFalse(self.decide(iface="legacy", cmd="prepare", seat_pending=marker))
+        self.assertFalse(self.decide(iface=None, cmd="prepare", seat_pending=marker))
+        # Symlink marker is refused.
+        link = os.path.join(self.t, "seat-pending-link")
+        os.symlink(marker, link)
+        self.assertFalse(self.decide(iface="dual", cmd="prepare", seat_pending=link))
 
     def checked(self, result="pass", **kw):
         sc = load("sc", "speakerguardd-selfcheck")

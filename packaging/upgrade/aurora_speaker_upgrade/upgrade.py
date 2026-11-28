@@ -54,6 +54,8 @@ log = logging.getLogger("aurora-speaker-upgrade")
 
 STORE = "/var/lib/aurora-speaker-upgrade"
 LOCK = "/run/aurora-speaker-upgrade.lock"
+SEAT_PENDING = "/run/aurora-speaker-upgrade/seat-pending"
+EXIT_NO_SEAT = 2
 PROVISION_CONF = "/etc/speakerguardd/provision.conf"
 PARAMS = "/var/lib/speakerguardd/params.bin"
 V2_CONF = "/etc/speakerguardd/speakerguardd.conf"
@@ -104,6 +106,13 @@ class Retry(Exception):
 class Unreachable(Retry):
     """The pinned restore image could not be read now (no network yet, DNS,
     a timeout, a server error): a boot run waits a while for it."""
+
+
+class NoSeatUser(Retry):
+    """No regular user exists or has logged in on seat0 yet (first-run setup
+    wizard or a multi-user Mac before the first login). The boot unit leaves
+    the speakers at the floor without writing refused.json and retries on the
+    first seat0 login."""
 
 
 def say(msg):
@@ -393,12 +402,36 @@ def playback_proof(acoustic, paths=None):
     return []
 
 
+def mark_seat_pending(path=None):
+    """Record that this boot's upgrade deferred until the first seat0 login.
+    Lives in /run (root-only 0700/0600) so it clears automatically on reboot."""
+    path = path or SEAT_PENDING
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+    tmp = path + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+    os.rename(tmp, path)
+
+
+def clear_seat_pending(path=None):
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path or SEAT_PENDING)
+
+
 def provision(store, a):
     p = tool("speakerguardd-provision")
     if not p:
         raise Refused("speakerguardd v2 is not installed (no speakerguardd-provision)")
     r = run_v2([p, "run"] + (["--force"] if a.force else []))
     sys.stderr.write(r.stderr[-2000:])
+    if r.returncode == EXIT_NO_SEAT or (r.returncode != 0 and "no seat user:" in r.stderr):
+        raise NoSeatUser(
+            "no seat user yet (the first login on seat0 retries this switch): "
+            "the speakers stay at the kernel's floor until then")
     if r.returncode != 0:
         raise Refused(f"speakerguardd v2 could not compile this Mac's tuning (exit {r.returncode})")
 
@@ -904,8 +937,14 @@ def _cmd_run(a):
             # supervisor starts.
             interface_set(card, IF_V2)
         selfcheck(a, mode)
+    except NoSeatUser:
+        back_to_floor(store, state, mode, card)
+        if getattr(a, "at_boot", False):
+            mark_seat_pending(getattr(a, "seat_pending", None))
+        raise
     except (Refused, Retry):
         back_to_floor(store, state, mode, card)
+        clear_seat_pending(getattr(a, "seat_pending", None))
         raise
     write_file(store.interface, "v2\n", 0o600)
     state["switched"] = True
@@ -915,7 +954,9 @@ def _cmd_run(a):
     r = systemctl("restart", v2_unit())
     if r.returncode != 0 or not wait_v2_granted(since):
         back_to_floor(store, state, mode, card)
+        clear_seat_pending(getattr(a, "seat_pending", None))
         raise Refused(f"speakerguardd v2 did not take the speakers within {GRANT_WAIT_S} s: {NO_SWITCH}")
+    clear_seat_pending(getattr(a, "seat_pending", None))
     say(f"done: speakerguardd v2 owns the speakers ({prov.get('aid')}, macOS {prov.get('macos_build')}, "
         f"{prov.get('source')})")
     return EXIT_OK
@@ -963,6 +1004,7 @@ def cmd_run(a):
     try:
         code = _cmd_run(a)
     except (Refused, collect.CollectError) as e:
+        clear_seat_pending(getattr(a, "seat_pending", None))
         with contextlib.suppress(Exception):
             store.ensure()
             fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -972,6 +1014,7 @@ def cmd_run(a):
                 f.write("\n")
         raise
     if code == EXIT_OK:
+        clear_seat_pending(getattr(a, "seat_pending", None))
         with contextlib.suppress(FileNotFoundError):
             os.unlink(record)
     return code
@@ -1090,6 +1133,7 @@ def main(argv=None):
     ap.add_argument("--installer-dir", action="append", dest="installer_dirs")
     ap.add_argument("--chosen", default=collect.CHOSEN_SPID)
     ap.add_argument("--scratch", default=None)
+    ap.add_argument("--seat-pending", default=SEAT_PENDING, help=argparse.SUPPRESS)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument(ACK_FLAG, dest="i_understand_preview", action="store_true",
                     help=argparse.SUPPRESS)

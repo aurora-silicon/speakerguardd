@@ -109,6 +109,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -133,6 +134,18 @@ def log(*a):
 
 class Failed(Exception):
     pass
+
+
+class NoSeatUser(Failed):
+    """No regular user exists or has logged in on seat0 yet (first-run setup
+    or a multi-user Mac before the first login). Still fails closed; exit 2
+    tells aurora-speaker-upgrade to retry on the first seat0 login instead of
+    recording a permanent boot refusal."""
+
+
+EXIT_NO_SEAT = 2
+SEAT_PENDING = "/run/aurora-speaker-upgrade/seat-pending"
+UPGRADE_UNIT = "aurora-speaker-upgrade.service"
 
 
 class Paths:
@@ -440,7 +453,7 @@ def resolve_seat_user(p, override, rng=None, etc="/etc"):
     users = regular_users(rng)
     if len(users) == 1:
         return users[0], "only regular user"
-    raise Failed(
+    raise NoSeatUser(
         f"no seat user: {len(users)} regular users ({', '.join(users) or 'none'}) and nobody has logged in on seat0 "
         f"yet; the first login there provisions speakerguardd (or set SGV2_SEAT_USER=<name> in {p.override})"
     )
@@ -562,6 +575,7 @@ def run_speakers(args, p):
            "board": "-", "unit": unit_id(args.dt), "kernel": os.uname().release, "bundle_digest": "-", "macos_build": "-", "aid": "-",
            "speaker_id": speaker_id_raw(args.dt), "compiler": "-", "source": "-", "params_sha256": "-",
            "voicing_pre": "false", "protection_units": "-", "compile_refusals": -1, "provenance": "-", "compiled": False, "seat_user": "-", "seat_how": "-"}
+    no_seat = False
     try:
         ensure_dir(p.state, 0o755, live)
         ensure_dir(p.etc, 0o755, live)
@@ -613,6 +627,9 @@ def run_speakers(args, p):
         if how == "seat0":
             write_atomic(p.seat_last, user + "\n")
         rec["result"] = "pass"
+    except NoSeatUser as e:
+        no_seat = True
+        rec["reasons"].append(str(e))
     except (Failed, wiring.Refused) as e:
         rec["reasons"].append(str(e))
     except Exception as e:  # noqa: BLE001 - every failure is a failing record
@@ -634,7 +651,7 @@ def run_speakers(args, p):
         for r in rec["reasons"]:
             for i, line in enumerate(r.splitlines()):
                 log(("  - " if i == 0 else "    ") + line)
-        return 1
+        return EXIT_NO_SEAT if no_seat else 1
     log(f"provisioned {rec['board']}: blob {rec['params_sha256'][:12]} ({'compiled' if rec['compiled'] else 'bound'}), "
         f"seat user {rec['seat_user']} ({rec['seat_how']}), {p.conf}")
     return 0
@@ -1460,9 +1477,22 @@ def starts_at_boot(unit):
     return bool(props.get("WantedBy", "").split() or props.get("RequiredBy", "").split())
 
 
+def upgrade_seat_pending(path=None):
+    """True when aurora-speaker-upgrade deferred this boot's switch until the
+    first regular user logs in on seat0. Only a regular file owned by root (or
+    the current uid in tests) counts; symlinks are ignored."""
+    path = path or SEAT_PENDING
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_uid in (0, os.geteuid())
+
+
 def cmd_seat(args, p):
     """seat0 changed. A regular user other than the provisioned one is
-    active there: restart the supervisor, which provisions for them."""
+    active there: retry a boot upgrade waiting for its first seat user, or
+    restart the supervisor, which provisions for them."""
     override = read_kv(p.override)
     if override.get("SGV2_SEAT_USER"):
         return 0
@@ -1470,6 +1500,14 @@ def cmd_seat(args, p):
     if not user:
         return 0
     write_atomic(p.seat_last, user + "\n")
+    if upgrade_seat_pending(getattr(args, "seat_pending", None)):
+        unit = getattr(args, "upgrade_unit", UPGRADE_UNIT)
+        if not starts_at_boot(unit):
+            log(f"{user} is on seat0; nothing starts {unit} (not enabled, not wanted, or masked), so not retrying it")
+            return 0
+        log(f"{user} is on seat0 now and {unit} waited for a seat user: restarting {unit}")
+        subprocess.run(["systemctl", "restart", "--no-block", unit])
+        return 0
     provisioned = read_kv(p.conf).get("SGV2_USER")
     if provisioned == user:
         return 0
@@ -1645,6 +1683,8 @@ def main():
     ap.add_argument("--bundle", help="the tuning source (default: the installer's bundle)")
     ap.add_argument("--force", action="store_true", help="compile even if the blob is bound")
     ap.add_argument("--unit", default="speakerguardd.service", help="the supervisor's unit (seat, sleep, wake)")
+    ap.add_argument("--upgrade-unit", default=UPGRADE_UNIT, help="seat: the boot upgrade unit to retry when waiting for a seat user")
+    ap.add_argument("--seat-pending", default=SEAT_PENDING, help="seat: marker written by aurora-speaker-upgrade while waiting for seat0")
     ap.add_argument("--sleep-wait", type=float, default=2.0, help="how long sleep waits for the amps to unlink, and then for the PCMs to close")
     ap.add_argument("--graph-unit", default="speakerguardd-graph.service", help="the user's graph unit (activate)")
     ap.add_argument("--switch-test-wait", type=float, default=150.0,
