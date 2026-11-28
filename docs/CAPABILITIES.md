@@ -167,7 +167,7 @@ refusing when the copy disagrees, is an open item.
 
 | Change | Its machine-specific part | Maps onto |
 |---|---|---|
-| T8152 transport without sense, playback ceiling and high-pass (J873g) | `apple,t8152-aop-audio` entry and back-end DMA names; playback ceiling from the ALSA control range and TLV | Transport discovery and the live ceiling check are on main. A tuning-backed high-pass and proof that it runs ahead of protection remain open. |
+| T8152 transport without sense, playback ceiling and pre-protection voicing (J873g) | `apple,t8152-aop-audio` entry and back-end DMA names; playback ceiling from the ALSA control range and TLV; compiled `AID48` `Atsp` + `--voicing-pre` chain | On main: transport discovery (`#272`), live ceiling check (`#222`), J873g fixture and 420 s `AID48` playback ladder (`#285`), and macOS `26B123`/`26B131` voicing parity attestation (`#286`, `compiler-gaps: none`, `sgv2#voicing-1ch` ahead of `sgv2#1ch`). A standalone tuning-backed high-pass and session-graph proof remain open only for a future speaker without a compiled model/voicing chain. |
 | T8142/T6050 transport without a sense channel | `speaker_dma`/`sense_dma` on the driver entry | as is: per block, `sense_path` |
 | K114c sense on the v2 path | applied sense geometry | as is: `alsa:` applied hw params |
 | Fail closed on an unproven method; units without sense by name | method dispatch, `NO_SENSE_UNITS` | as is: `tuning:` unit kind |
