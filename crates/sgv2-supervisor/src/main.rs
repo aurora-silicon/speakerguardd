@@ -1165,7 +1165,9 @@ mod linux {
             // (every check still runs, so the grant comes on the first tick
             // after the hold)
             let demand_seen = obs.demand;
-            let holding = regrant.holding(now_ns());
+            // a lapse taken for a late tick holds the re-grant until the
+            // suspend counters confirm it (`lease::LAPSE_CONFIRM_NS`)
+            let holding = regrant.holding(now_ns()) | lapse.confirming(now_ns());
             if holding != held_off {
                 held_off = holding;
                 if !holding {
@@ -1249,16 +1251,26 @@ mod linux {
                 Ok(Event::HardFault(f)) => eprintln!("amp fault, protection withdrawn until restart: {f}"),
                 Ok(Event::Lapsed) => {
                     regrant.released(now_ns(), false);
+                    // the counters again, as late as possible: a sleep that
+                    // shows now is answered as one
+                    let (s, n) = (suspended_ns(), sleeps());
+                    if s > suspended.saturating_add(1_000_000) || n != slept {
+                        observer.note_sleep();
+                        lapse.sleep();
+                    }
+                    (suspended, slept) = (s, n);
                     match lapse.answer(now_ns(), &mut observer) {
                         // after a sleep the next grant waits for the engine
                         // to beat steadily after the thaw
                         LapseCause::Sleep => eprintln!("lease lapsed; re-qualifying"),
-                        // a late tick: the engine's beats and this tick's
-                        // checks are honest, and the lease's own rule (this
-                        // clean tick and the next) re-grants
+                        // a late tick, provisionally: once the suspend
+                        // counters have read unchanged for the confirm
+                        // window, the lease's own rule (two clean ticks)
+                        // re-grants
                         LapseCause::Stall { since_renew_ns } => eprintln!(
-                            "lease lapsed: renewed {} ms after the last renewal, with no system sleep; re-qualifying",
-                            since_renew_ns / 1_000_000
+                            "lease lapsed: renewed {} ms after the last renewal, with no system sleep; re-granting after a {} ms check of the suspend counters",
+                            since_renew_ns / 1_000_000,
+                            sgv2_supervisor::lease::LAPSE_CONFIRM_NS / 1_000_000
                         ),
                     }
                 }

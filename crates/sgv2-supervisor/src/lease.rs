@@ -170,8 +170,20 @@ impl Regrant {
 
 /// A lapse whose last renewal is at least this old counts as a sleep even
 /// when no sleep was seen: a gap this long is not a late tick, and the wait
-/// for the engine's first beat after a thaw is the safe reading of it.
-pub const LAPSE_STALL_MAX_NS: u64 = 250_000_000;
+/// for the engine's first beat after a thaw is the safe reading of it. The
+/// late ticks seen so far renewed 38-39 ms after the last renewal (J713,
+/// 11-28, three stream ends); 100 ms is over twice the worst of them and
+/// keeps the window in which a short sleep could pass for a stall small.
+pub const LAPSE_STALL_MAX_NS: u64 = 100_000_000;
+
+/// A lapse taken for a late tick is provisional this long: no re-grant until
+/// a tick this far after the lapse has read the suspend clock and counters
+/// unchanged. The kernel bumps `suspend_stats` only after the thaw and the
+/// `PM_POST_SUSPEND` notifiers, so an aborted or sub-millisecond suspend can
+/// show there a tick or more after the lapse it caused; five ticks of
+/// tolerance, and the re-grant still lands far inside the plugin's 500 ms
+/// wake.
+pub const LAPSE_CONFIRM_NS: u64 = 50_000_000;
 
 /// Why a lease lapsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,8 +196,11 @@ pub enum LapseCause {
     /// beat after the thaw.
     Sleep,
     /// The supervisor renewed late with no sleep since its last renewal,
-    /// `since_renew_ns` before: its clocks and the engine's are honest, so
-    /// the lease's own rule (this clean tick and the next) re-grants.
+    /// `since_renew_ns` before. Provisional: the re-grant waits until the
+    /// suspend counters have read unchanged [`LAPSE_CONFIRM_NS`] after the
+    /// lapse ([`LapseWitness::confirming`]); a sleep seen meanwhile makes it
+    /// a sleep after all (the observer's post-sleep settle). Then the
+    /// lease's own rule (two clean ticks) re-grants.
     Stall { since_renew_ns: u64 },
 }
 
@@ -203,6 +218,8 @@ pub enum LapseCause {
 pub struct LapseWitness {
     renewed_at: Option<u64>,
     slept: bool,
+    /// When a lapse was taken for a late tick, until it is confirmed.
+    stall_at: Option<u64>,
 }
 
 impl LapseWitness {
@@ -218,9 +235,27 @@ impl LapseWitness {
         self.slept = false;
     }
 
-    /// The suspend clock or counters moved.
+    /// The suspend clock or counters moved. A lapse still being confirmed
+    /// as a late tick was a sleep after all: the caller has noted the sleep
+    /// with the observer, whose settle now holds the grant.
     pub fn sleep(&mut self) {
         self.slept = true;
+        self.stall_at = None;
+    }
+
+    /// A lapse taken for a late tick is still being confirmed at `now_ns`
+    /// (called after this tick's suspend check): hold the re-grant. A tick
+    /// [`LAPSE_CONFIRM_NS`] or more after the lapse that has seen no sleep
+    /// confirms it.
+    pub fn confirming(&mut self, now_ns: u64) -> bool {
+        match self.stall_at {
+            Some(t) if now_ns < t.saturating_add(LAPSE_CONFIRM_NS) => true,
+            Some(_) => {
+                self.stall_at = None;
+                false
+            }
+            None => false,
+        }
     }
 
     /// The supervisor's answer to a lapse at `now_ns`: after a sleep the
@@ -241,9 +276,13 @@ impl LapseWitness {
         let slept = core::mem::take(&mut self.slept);
         match since {
             Some(since_renew_ns) if !slept && since_renew_ns < LAPSE_STALL_MAX_NS => {
+                self.stall_at = Some(now_ns);
                 LapseCause::Stall { since_renew_ns }
             }
-            _ => LapseCause::Sleep,
+            _ => {
+                self.stall_at = None;
+                LapseCause::Sleep
+            }
         }
     }
 }
