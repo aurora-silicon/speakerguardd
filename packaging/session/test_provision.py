@@ -1642,6 +1642,7 @@ class Gate(Base):
                 mock.patch.object(sc, "lv2_shadows", return_value=[]), \
                 mock.patch.object(sc, "blob_rate", return_value=w["rate"]), \
                 mock.patch.object(sc, "find_card", return_value=(0, desc["card"])), \
+                mock.patch.object(sc.wiring, "live_card", return_value=None), \
                 mock.patch.object(sc, "pcm_ids", return_value={("Secondary", "p"): 1}) as pcm:
             self.assertEqual(sc.cmd_run(args), 0)
             self.assertEqual(pcm.call_count, 1)
