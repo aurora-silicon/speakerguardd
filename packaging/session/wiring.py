@@ -994,8 +994,8 @@ def read_binding(path):
 
 # A dual kernel (linux integration/aurora 98cb6a86 and later) serves both
 # speaker protection interfaces on one card. "Speaker Volume Unlock" (the
-# older daemons: speakersafetyd, speakerguardd 0.1) is in charge at every
-# card bind. A root write of "Speaker Protection Interface" = "Speaker
+# volume lock, at the kernel's own limit; no daemon of ours ever uses it) is
+# in charge at every card bind. A root write of "Speaker Protection Interface" = "Speaker
 # Protection" hands the speakers to the v2 lease, through the floor; the
 # kernel hands them back to the volume lock (at its floor) after 30 s with
 # no owner of "Speaker Protection". The switch is state for the boot, never

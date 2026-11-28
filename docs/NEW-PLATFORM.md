@@ -155,9 +155,10 @@ test root, and `--bundle` names another tuning source.
 
 ## 5. The fleet gate (`speakerguardd-gate`)
 
-Distributions install v2 on every Mac beside the older daemons
-(speakerguardd 0.1 and speakersafetyd). The gate is the `ExecCondition=` of
-both, so exactly one stack runs on a board:
+speakerguardd v2 is the only speaker protection. The gate is the
+`ExecCondition=` of its units; there is no fallback to an older daemon
+(speakerguardd 0.1, speakersafetyd), and no unit of this tree starts,
+enables or hands the speakers to one:
 
 - v2 runs when every protection type in the Mac's own tuning graph compiles
   without refusals and appears in this build's `units_at_parity`, the silent
@@ -165,8 +166,14 @@ both, so exactly one stack runs on a board:
   verified installer extraction names this board and this individual Mac's
   unit ID from its own macOS. A new blob or kernel requires a fresh check.
   The kernel must expose the v2 interface ("Speaker Protection").
-- the older daemons run only on kernels without that interface. On a v2
-  kernel, an unqualified board stays muted at the kernel's floor.
+- anywhere else no speaker daemon runs: an unqualified board, or a kernel
+  without the v2 interface, stays at the kernel's own limit. On a dual
+  kernel ("Speaker Protection Interface") v2 also needs the upgrade's
+  setting (aurora-speaker-upgrade); without it nothing runs and the
+  kernel's volume lock holds the speakers.
+- `speakerguardd-gate legacy` is still accepted and always answers no, so
+  a leftover `legacy-gate.conf` drop-in from an older package skips the
+  older daemon instead of starting it.
 
 The primary unit and any LSID companion are checked separately: `lsid` is
 not at parity, so K114/K116 (AID49/50) remain muted. Parity is a property of

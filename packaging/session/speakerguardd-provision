@@ -4,7 +4,7 @@ manual step, before the self-check and the supervisor start.
 
     speakerguardd-provision run      [--bundle SRC] [--force]   (root, speakerguardd-provision.service)
     speakerguardd-provision activate [--graph-unit UNIT]        (root, after the self-check passed)
-    speakerguardd-provision deactivate [--graph-unit UNIT]      (root, the older daemons take the speakers back)
+    speakerguardd-provision deactivate [--graph-unit UNIT]      (root, v2 lets the speakers go in this boot)
     speakerguardd-provision seat     --unit UNIT                (root, when seat0 changes hands)
     speakerguardd-provision graph-user                          (the user's speakerguardd-graph.service)
                                                                 (waits while the switch test is pending)
@@ -1249,14 +1249,15 @@ def cmd_activate(args, p):
 
 
 def cmd_deactivate(args, p):
-    """The older daemons take the speakers back in this boot (aurora-speaker-
-    upgrade --revert on a dual kernel): remove v2's graph and bring the seat
-    user's running session back onto the distribution's own speaker graph
-    now, instead of at the next boot."""
+    """v2 lets the speakers go in this boot (aurora-speaker-upgrade, when a
+    switch on a dual kernel did not go through): remove v2's graph and bring
+    the seat user's running session back onto the distribution's own speaker
+    graph now, instead of at the next boot. No speaker daemon takes over:
+    the kernel's own limit holds the speakers."""
     import gen
 
     conf = read_kv(p.conf)
-    clear_graph(p, result="legacy")
+    clear_graph(p, result="off")
     # The raw-PCM rules and the UCM marker hide the distribution's own
     # speaker device; they go too (provisioning writes them again).
     for f in glob.glob(os.path.join(p.raw, "*.conf")) + [os.path.join(p.graph, gen.UCM_MARKER)]:
