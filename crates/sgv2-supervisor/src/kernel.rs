@@ -28,7 +28,14 @@
 //!   a dB TLV: the supervisor reads the operating point back (KERNEL.md 2.3).
 //! - "Speaker Playback Mux" names the front-end ("Primary" or "Secondary")
 //!   that drives the speakers: the supervisor watches that PCM only, so it
-//!   checks the mux every tick.
+//!   checks the mux every tick. Under a grant the kernel refuses every write
+//!   of it (`EBUSY`); before one, any file may write it. So a first grant
+//!   holds the mux's `SNDRV_CTL_IOCTL_ELEM_LOCK` on the owning file from its
+//!   last read of the route to the grant: no other file can re-route in
+//!   between, and the route granted is the route read. A kernel that saw
+//!   another file write the mux since its last grant decision refuses the
+//!   next grant with `EBUSY` too, as during a sleep: nothing is granted, and
+//!   the route is read again on the clean ticks before the next grant.
 //! - "Speaker Protection Crossover" (boolean): the owner declares, before a
 //!   grant, that the engine runs the Mac's own crossover and high-pass ahead
 //!   of the amps (the plugin's pre-stage, compiled from the tuning). The
@@ -74,7 +81,9 @@ pub enum KernelError {
     NotOwner,
     /// The lease ran out before this renewal, which granted nothing.
     Lapsed,
-    /// A system sleep is in progress (`EBUSY` on the write).
+    /// `EBUSY` on the write: a system sleep is in progress, or the kernel
+    /// saw another file write the speaker mux since its last grant decision.
+    /// Either way nothing was granted, and the checks run again.
     Sleeping,
     /// `EIO` on a grant or release: an amp write failed (the operating gain
     /// on a grant, the floor on a release; an I2C error either way). Fatal.
@@ -155,6 +164,12 @@ pub trait Kernel {
     /// The front-end "Speaker Playback Mux" selects ("Primary", "Secondary"),
     /// or `None` if the card has no such mux.
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError>;
+    /// Lock "Speaker Playback Mux" on this file, so that no other file can
+    /// write it until [`Kernel::free_route`]. `Ok(false)` if another file
+    /// holds its lock. A card without the mux has nothing to hold.
+    fn hold_route(&mut self) -> Result<bool, KernelError>;
+    /// Unlock the mux [`Kernel::hold_route`] locked.
+    fn free_route(&mut self) -> Result<(), KernelError>;
 }
 
 /// A level's raw value and centi-dB, for the double.
@@ -182,6 +197,20 @@ pub struct Recorder {
     /// maximum is the released level, the kernel's floor.
     pub ceiling: Option<Option<i32>>,
     pub route: Option<String>,
+    /// The route at each renewal, in order.
+    pub renewed_routes: Vec<Option<String>>,
+    /// The mux is locked on this file.
+    pub route_held: bool,
+    pub route_holds: u32,
+    /// Another file holds the mux's lock.
+    pub route_locked_elsewhere: bool,
+    /// Another file writes this route right after the n-th route read from
+    /// now (1: the next one), unless the mux is held on this file then.
+    pub reroute: Option<(u32, String)>,
+    /// Re-routes refused because the mux was held.
+    pub reroutes_refused: u32,
+    /// The error the next renewal fails with.
+    pub refuse_next: Option<KernelError>,
 }
 
 impl Recorder {
@@ -207,8 +236,12 @@ impl Recorder {
 
 impl Kernel for Recorder {
     fn renew(&mut self) -> Result<(), KernelError> {
+        if let Some(e) = self.refuse_next.take() {
+            return Err(e);
+        }
         self.held = true;
         self.renewals += 1;
+        self.renewed_routes.push(self.route.clone());
         Ok(())
     }
     fn release(&mut self) -> Result<(), KernelError> {
@@ -248,7 +281,31 @@ impl Kernel for Recorder {
             .unwrap_or_default())
     }
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
-        Ok(self.route.clone())
+        let route = self.route.clone();
+        if let Some((n, to)) = self.reroute.take() {
+            if n > 1 {
+                self.reroute = Some((n - 1, to));
+            } else if self.route_held {
+                self.reroutes_refused += 1;
+            } else {
+                self.route = Some(to);
+            }
+        }
+        Ok(route)
+    }
+    fn hold_route(&mut self) -> Result<bool, KernelError> {
+        assert!(!self.route_held, "the mux is locked twice");
+        if self.route_locked_elsewhere {
+            return Ok(false);
+        }
+        self.route_held = true;
+        self.route_holds += 1;
+        Ok(true)
+    }
+    fn free_route(&mut self) -> Result<(), KernelError> {
+        assert!(self.route_held, "the mux is unlocked without its lock");
+        self.route_held = false;
+        Ok(())
     }
 }
 
@@ -406,6 +463,7 @@ mod alsa {
     pub(super) const ELEM_READ: u64 = ioc(RW, 0x12, core::mem::size_of::<ElemValue>());
     pub(super) const ELEM_WRITE: u64 = ioc(RW, 0x13, core::mem::size_of::<ElemValue>());
     pub(super) const ELEM_LOCK: u64 = ioc(W, 0x14, core::mem::size_of::<ElemId>());
+    pub(super) const ELEM_UNLOCK: u64 = ioc(W, 0x15, core::mem::size_of::<ElemId>());
     #[cfg(test)]
     pub(super) const SUBSCRIBE_EVENTS: u64 = ioc(RW, 0x16, core::mem::size_of::<i32>());
 
@@ -688,6 +746,35 @@ mod alsa {
             Ok(out)
         }
         fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
+            let Some((id, names)) = self.mux()? else { return Ok(None) };
+            // enumerated.item[0]: the low word of the first value
+            let item = self.read(id)?.value[0] as u32;
+            Ok(names.get(item as usize).cloned())
+        }
+        fn hold_route(&mut self) -> Result<bool, KernelError> {
+            let Some((id, _)) = self.mux()? else { return Ok(true) };
+            // SAFETY: the owning fd and a pointer to a live, correctly sized ElemId.
+            if unsafe { ioctl(self.fd(), ELEM_LOCK, &id as *const ElemId) } < 0 {
+                return match errno() {
+                    EBUSY => Ok(false),
+                    e => Err(KernelError::Control(format!("lock {SPEAKER_MUX}: errno {e}"))),
+                };
+            }
+            Ok(true)
+        }
+        fn free_route(&mut self) -> Result<(), KernelError> {
+            let Some((id, _)) = self.mux()? else { return Ok(()) };
+            // SAFETY: the owning fd and a pointer to a live, correctly sized ElemId.
+            if unsafe { ioctl(self.fd(), ELEM_UNLOCK, &id as *const ElemId) } < 0 {
+                return Err(KernelError::Control(format!("unlock {SPEAKER_MUX}: errno {}", errno())));
+            }
+            Ok(())
+        }
+    }
+
+    impl Macaudio {
+        /// The mux's id and item names, looked up once.
+        fn mux(&mut self) -> Result<Option<(ElemId, Vec<String>)>, KernelError> {
             if self.mux.is_none() {
                 let mut found = None;
                 for id in self.ids()? {
@@ -712,10 +799,7 @@ mod alsa {
                 }
                 self.mux = Some(found);
             }
-            let Some(Some((id, names))) = self.mux.clone() else { return Ok(None) };
-            // enumerated.item[0]: the low word of the first value
-            let item = self.read(id)?.value[0] as u32;
-            Ok(names.get(item as usize).cloned())
+            Ok(self.mux.clone().flatten())
         }
     }
 }
@@ -774,6 +858,7 @@ mod tests {
         assert_eq!(ELEM_READ, 0xc4c8_5512);
         assert_eq!(ELEM_WRITE, 0xc4c8_5513);
         assert_eq!(ELEM_LOCK, 0x4040_5514);
+        assert_eq!(ELEM_UNLOCK, 0x4040_5515);
         assert_eq!(SUBSCRIBE_EVENTS, 0xc004_5516);
     }
 

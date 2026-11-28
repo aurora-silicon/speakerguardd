@@ -130,6 +130,12 @@ impl Kernel for StepPerAmp {
     fn speaker_route(&mut self) -> Result<Option<String>, KernelError> {
         self.0.speaker_route()
     }
+    fn hold_route(&mut self) -> Result<bool, KernelError> {
+        self.0.hold_route()
+    }
+    fn free_route(&mut self) -> Result<(), KernelError> {
+        self.0.free_route()
+    }
 }
 
 #[test]
