@@ -1,6 +1,6 @@
 {
  "format": 2,
- "law": "004574671c0d3503cce1b92343d16e3cdb22bbe89bed6f7850582f916b5111ad",
+ "law": "33e776f46ea31f8f244ce5392b5c449c872cce164611313ca460fcd9a91d796f",
  "tolerance": {
   "louder_db": 0.25,
   "quieter_db": 1.0,
@@ -10,7 +10,7 @@
   {
    "build": "25C56",
    "reference": "macOS 26.2 25C56 Audio Units (its AudioDSP.component, read from the 25C56 restore image, rendered on a 25G83 host)",
-   "rev": "842bb71f8b1a67a82dcf666456460d0b1a2625d7",
+   "rev": "7d7b5d0ed4f0f763b5b2a662af55a61df03fa58d",
    "spread": {
     "sha256": "d3a03e7913ea3ebee9dc0ba386586e6ecbc995d43d5710ac269166dcc0d76e80",
     "chaotic_max_dbfs": -60.0,
@@ -1998,7 +1998,7 @@
   {
    "build": "25G72",
    "reference": "macOS 25G72 Audio Units (its AudioDSP.component, read from the 25G72 restore image, rendered on a 25G83 host)",
-   "rev": "842bb71f8b1a67a82dcf666456460d0b1a2625d7",
+   "rev": "7d7b5d0ed4f0f763b5b2a662af55a61df03fa58d",
    "spread": null,
    "sliders": [
     0.7,
@@ -4308,7 +4308,7 @@
   {
    "build": "25G83",
    "reference": "macOS 26.6.2 25G83 Audio Units",
-   "rev": "842bb71f8b1a67a82dcf666456460d0b1a2625d7",
+   "rev": "7d7b5d0ed4f0f763b5b2a662af55a61df03fa58d",
    "spread": {
     "sha256": "2706dbe150842b24d175e20acbac8cd837bc698d02a49537ba05b61d0bcb6db6",
     "chaotic_max_dbfs": -60.0,
@@ -6920,7 +6920,7 @@
   {
    "build": "26A428",
    "reference": "macOS 27.0 26A428 Audio Units",
-   "rev": "842bb71f8b1a67a82dcf666456460d0b1a2625d7",
+   "rev": "7d7b5d0ed4f0f763b5b2a662af55a61df03fa58d",
    "spread": null,
    "sliders": [],
    "slider_spread": {},
@@ -7613,7 +7613,7 @@
   {
    "build": "26B8125",
    "reference": "macOS 27.2 26B8125 Audio Units (its AudioDSP.component, read from the 26B8125 restore image; byte-identical to the 26B8132 host's own, rendered on a 26B8132 host)",
-   "rev": "842bb71f8b1a67a82dcf666456460d0b1a2625d7",
+   "rev": "7d7b5d0ed4f0f763b5b2a662af55a61df03fa58d",
    "spread": null,
    "sliders": [
     0.7,
@@ -10092,19 +10092,19 @@
      ],
      "verdict": "refused",
      "measured": 168,
-     "worst_louder_db": 2.348,
-     "worst_quieter_db": -0.389,
-     "reason": "24 cell(s) louder than macOS by more than 0.25 dB, worst +2.35 dB (lane 1, tone_4000_0); 10 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -2.87 dB (lane 0, tone_4000_-12): reported, not refused",
+     "worst_louder_db": 2.349,
+     "worst_quieter_db": -0.247,
+     "reason": "8 cell(s) louder than macOS by more than 0.25 dB, worst +2.35 dB (lane 1, tone_4000_0); 10 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -2.88 dB (lane 0, tone_4000_-12): reported, not refused",
      "floor_residue_cells": 10,
-     "worst_floor_residue_db": -2.867,
+     "worst_floor_residue_db": -2.878,
      "sliders": [
       {
        "slider": 0.7,
        "verdict": "pass",
        "mvol_db": -10.3721,
        "measured": 130,
-       "worst_louder_db": 0.172,
-       "worst_quieter_db": -0.042,
+       "worst_louder_db": 0.013,
+       "worst_quieter_db": -0.043,
        "reason": "within +0.25/-1.0 dB of macOS on 130 cells"
       },
       {
@@ -10112,7 +10112,7 @@
        "verdict": "pass",
        "mvol_db": -20.4322,
        "measured": 126,
-       "worst_louder_db": 0.049,
+       "worst_louder_db": 0.006,
        "worst_quieter_db": -0.011,
        "reason": "within +0.25/-1.0 dB of macOS on 126 cells"
       },
@@ -10138,11 +10138,11 @@
      ],
      "verdict": "refused",
      "measured": 162,
-     "worst_louder_db": 1.273,
-     "worst_quieter_db": -0.19,
-     "reason": "10 cell(s) louder than macOS by more than 0.25 dB, worst +1.27 dB (lane 1, tone_4000_0); 4 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -2.09 dB (lane 1, tone_16000_0): reported, not refused",
+     "worst_louder_db": 1.265,
+     "worst_quieter_db": -0.082,
+     "reason": "2 cell(s) louder than macOS by more than 0.25 dB, worst +1.26 dB (lane 1, tone_4000_0); 4 floor-residue cell(s) quieter than macOS by more than 1.0 dB more than 55 dB under their lane's peak, worst -2.09 dB (lane 1, tone_16000_0): reported, not refused",
      "floor_residue_cells": 4,
-     "worst_floor_residue_db": -2.095,
+     "worst_floor_residue_db": -2.091,
      "sliders": [
       {
        "slider": 0.7,
@@ -10150,7 +10150,7 @@
        "mvol_db": -10.3721,
        "measured": 128,
        "worst_louder_db": 0.077,
-       "worst_quieter_db": -0.011,
+       "worst_quieter_db": -0.036,
        "reason": "within +0.25/-1.0 dB of macOS on 128 cells"
       },
       {
