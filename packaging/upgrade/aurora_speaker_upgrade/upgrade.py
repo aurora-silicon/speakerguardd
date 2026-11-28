@@ -223,8 +223,10 @@ def with_fill(identity, b, component, dirs):
 
 
 def acquire_waiting(identity, a, wait, sleep=time.sleep, clock=time.monotonic):
-    """acquire(), trying again every 5 s for up to `wait` seconds while the
-    pinned restore image cannot be reached. Anything else (a refusal, a
+    """acquire(), starting a new attempt every 5 s while the pinned restore
+    image cannot be reached, as long as the attempt starts within `wait`
+    seconds (the last attempt itself is bounded by the reader's HTTP
+    timeouts, not by `wait`). Anything else (a refusal, a
     retry for another reason) is passed on at once."""
     deadline = clock() + wait
     while True:
@@ -457,11 +459,36 @@ def interface_mode():
 # card registered 1 s after the run on a fresh boot), and a run that finds no
 # card waits for the next boot.
 CARD_WAIT_S = 120
-# How long a boot run keeps trying to reach the pinned restore image. On a
-# fresh J413 boot network-online.target was reached before DNS answered, and
-# the run gave up until the next boot.
+# How long a boot run keeps starting new attempts at the pinned restore
+# image (a retry-start budget: an attempt started inside it runs to the end
+# under the reader's own HTTP timeouts). On a fresh J413 boot
+# network-online.target was reached before DNS answered, and the run gave up
+# until the next boot.
 NET_WAIT_S = 180
 
+
+
+def card_identity(card):
+    """The card's ALSA id (/proc/asound/cardN/id, e.g. AppleJ413), or None
+    when card N is gone. With the number it tells a reprobed or renumbered
+    card from the one a run started on."""
+    try:
+        with open(f"/proc/asound/card{card}/id") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def same_speaker_card(mode, card, ident):
+    """Retry unless the kernel still serves `mode` on the same card number
+    with the same ALSA id. Called after the restore image fetch, which can
+    take minutes at boot, before anything changes provisioning or the
+    protection switch."""
+    now_mode, now_card = interface_mode()
+    if (now_mode, now_card) != (mode, card) or card_identity(card) != ident:
+        raise Retry(f"the speaker card changed during the fetch (was {mode} on card {card} {ident}, now "
+                    f"{now_mode} on card {now_card} {card_identity(now_card) if now_card else None}): "
+                    "nothing changed, try again")
 
 
 def wait_interface_mode(wait, dt=None, sleep=time.sleep, clock=time.monotonic):
@@ -869,7 +896,9 @@ def _cmd_run(a):
             "for this speaker yet, so the boot unit leaves the speakers as they are "
             "('aurora-speaker-upgrade run' switches by hand)")
         return EXIT_OK
+    ident = card_identity(card)
     b, prov = acquire_waiting(identity, a, NET_WAIT_S if getattr(a, "at_boot", False) else 0)
+    same_speaker_card(mode, card, ident)
     store.ensure()
     if not have or digest(have) != digest(b):
         store.put_bundle(b)

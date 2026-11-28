@@ -175,3 +175,63 @@ class AcquireWaiting(unittest.TestCase):
 
     def test_unreachable_is_a_retry(self):
         self.assertTrue(issubclass(up.Unreachable, up.Retry))
+
+
+class SameSpeakerCard(unittest.TestCase):
+    """After the (boot-time, possibly minutes-long) fetch the run checks it still talks to the same speaker card
+    before it touches provisioning or the protection switch (review of #299)."""
+
+    def check(self, now, ids, want_retry):
+        with mock.patch.object(up, "interface_mode", return_value=now), \
+                mock.patch.object(up, "card_identity", side_effect=lambda c: ids.get(c)):
+            if want_retry:
+                with self.assertRaises(up.Retry) as cm:
+                    up.same_speaker_card("dual", "1", "AppleJ413")
+                self.assertIn("changed during the fetch", str(cm.exception))
+            else:
+                up.same_speaker_card("dual", "1", "AppleJ413")
+
+    def test_unchanged(self):
+        self.check(("dual", "1"), {"1": "AppleJ413"}, False)
+
+    def test_card_disappeared(self):
+        self.check(("none", None), {}, True)
+
+    def test_card_renumbered(self):
+        self.check(("dual", "2"), {"2": "AppleJ413"}, True)
+
+    def test_number_reused_by_another_card(self):
+        self.check(("dual", "1"), {"1": "HDMI"}, True)
+
+    def test_mode_changed(self):
+        self.check(("v2-only", "1"), {"1": "AppleJ413"}, True)
+
+    def test_card_identity_reads_proc(self):
+        self.assertIsNone(up.card_identity("99999"))
+
+
+class RunRevalidatesBeforeStoring(unittest.TestCase):
+    def test_changed_card_stops_before_store(self):
+        stored = []
+
+        class Ident:
+            unit, board, acoustic = "u" * 64, "j413", 13
+
+            def __init__(self, adt):
+                pass
+
+            def matches_dt(self):
+                return True
+        modes = iter([("dual", "1"), ("none", None)])
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(up.collect, "Identity", Ident), \
+                mock.patch.object(up, "interface_mode", side_effect=lambda: next(modes)), \
+                mock.patch.object(up, "card_identity", return_value="AppleJ413"), \
+                mock.patch.object(up, "playback_proof", return_value=True), \
+                mock.patch.object(up, "acquire", return_value=({}, {"source": "x"})), \
+                mock.patch.object(up.Store, "put_bundle", lambda self, b: stored.append(b)), \
+                mock.patch.object(up, "say"):
+            a = mock.Mock(store=d, adt=None, at_boot=False)
+            with self.assertRaises(up.Retry):
+                up._cmd_run(a)
+        self.assertEqual(stored, [])
