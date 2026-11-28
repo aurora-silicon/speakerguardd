@@ -20,7 +20,8 @@ does not load: those builds need a host on that macOS.
 import argparse, hashlib, json, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "packaging", "upgrade"))
+UPGRADE = os.path.join(HERE, "..", "..", "..", "packaging", "upgrade")
+sys.path.insert(0, UPGRADE)
 from aurora_speaker_upgrade import ipsw  # noqa: E402
 from aurora_speaker_upgrade.asahi_firmware import apfs_ro  # noqa: E402
 
@@ -32,7 +33,9 @@ def main():
     ap.add_argument("build"); ap.add_argument("board"); ap.add_argument("out")
     ap.add_argument("--ipsw"); ap.add_argument("--no-tunings", action="store_true")
     a = ap.parse_args()
-    vol, _, got, _ = ipsw.open_system(a.board, url=a.ipsw, preferred_build=a.build)
+    # This tree's pin, not an installed copy (the fetcher's may be an older format)
+    pin = ipsw._pin_entries([os.path.join(UPGRADE, "share", "restore-images.json")])
+    vol, _, got, _ = ipsw.open_system(a.board, images=pin, url=a.ipsw, preferred_build=a.build)
     os.makedirs(a.out, mode=0o700, exist_ok=True)
     ino, _ = vol.resolve(UNIT)
     b = vol.read_file(ino)
