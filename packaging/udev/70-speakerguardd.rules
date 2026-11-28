@@ -1,0 +1,18 @@
+# speakerguardd v2: start the supervisor when a speaker card registers, not
+# only once at boot. Its unit requires provisioning, the silent self-check
+# and the switch test, so this one start runs the whole chain, as at boot.
+#
+# At boot the units run after systemd-udev-settle.service, and the gate waits
+# up to 15 s for the speaker card. A card can register later than that. The
+# M4 Mac mini's (J773g) sits on its AOP coprocessor, so it registers only
+# once the AOP's firmware runs. A module loaded after boot registers its card
+# whenever it loads. Without this rule the gate's "no speaker card" holds
+# for the rest of the boot, and the kernel keeps the speakers at its floor.
+#
+# ALSA registers a card's controlC<N> last, after its PCMs, so the speaker
+# PCM exists when this matches; systemd's own sound.target rule keys on the
+# same device. Starting a supervisor that already runs is a no-op. On a Mac
+# the gate leaves to the older daemons, every unit skips as it does at boot
+# (ExecCondition). Only "add": the upgrade's revert re-triggers "change" on
+# every sound device and must not start v2 again.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", DRIVERS=="snd-soc-macaudio", TAG+="systemd", ENV{SYSTEMD_WANTS}+="speakerguardd.service"
