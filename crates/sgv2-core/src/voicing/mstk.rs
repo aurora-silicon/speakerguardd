@@ -144,9 +144,11 @@ pub struct Params {
     pub render_quality: u32,
     pub overshoot_compensation: bool,
     pub algorithm: u32,
-    /// Whether automated algorithm-3 band zero uses the 25G83 selected-rate
-    /// detector producer. macOS 27 uses the host-rate producer instead.
-    /// Unknown source builds deliberately retain the established 25G83 law.
+    /// Whether the automated (eight-frame pick) detector follows the 25G83
+    /// law: band zero's selected-rate producer and one shared 2 ms window.
+    /// macOS 27 uses the host-rate producer and the per-band 10/8/2/1 ms
+    /// windows instead. Unknown source builds deliberately retain the
+    /// established 25G83 law.
     pub selected_rate_band_zero: bool,
     pub automation_input: f64,
     pub automation_min: f64,
@@ -1178,13 +1180,20 @@ impl Run {
         // Mode 4 shares one two-millisecond odd trailing maximum across all
         // four arms. At the fixed eight-frame cadence this is 11/13/25
         // updates at 44.1/48/96 kHz before any outer band-rate reduction.
-        // The eight-frame automation pick shares that window too. Black-box
-        // (installed unit, a box with threshold automation): with the
-        // per-band 10/8/2/1 ms windows, low tones at full scale compressed
-        // up to 0.33 dB too far and steps down released up to 1 dB late.
+        // On 25G83 the eight-frame automation pick shares that window too.
+        // Black-box (installed 25G83 unit, a box with threshold automation):
+        // with the per-band 10/8/2/1 ms windows, low tones at full scale
+        // compressed up to 0.33 dB too far and steps down released up to
+        // 1 dB late. macOS 27's units (26B8125, a box with threshold
+        // automation, release 5/20/80 ms) hold each band for the per-band
+        // windows instead: with the shared 2 ms window the gain recovered
+        // up to 5.8 dB early after a burst, with 10/8/2/1 ms it follows
+        // within 0.1 dB RMS at every release time.
         let window_ms = match cadence(q) {
-            Cadence::AnalyticPick | Cadence::PickEight => [2.0; BANDS],
-            Cadence::Pick => [10.0, 8.0, 2.0, 1.0],
+            Cadence::AnalyticPick => [2.0; BANDS],
+            // Measured on macOS 27 for algorithm 3 only; others keep 2 ms.
+            Cadence::PickEight if q.selected_rate_band_zero || q.algorithm < 3 => [2.0; BANDS],
+            Cadence::PickEight | Cadence::Pick => [10.0, 8.0, 2.0, 1.0],
         };
         let mut detector_window = core::array::from_fn(|b| {
             ((libm::round(window_ms[b] * fs / (1000.0 * detector_factor[b] as f64)) as usize) | 1)
@@ -1943,6 +1952,18 @@ mod tests {
         // updates.
         assert_eq!(window, [1, 13, 13, 13]);
         assert!(!analytic_pick);
+        // macOS 27, algorithm 3: the automated pick holds each band for the
+        // per-band 10/8/2/1 ms windows, band zero at the host rate.
+        let mut automated27 = automated;
+        automated27.algorithm = 3;
+        automated27.render_quality = 1;
+        automated27.selected_rate_band_zero = false;
+        let (factor, window, _, band_zero_factor, _) = cadence(&automated27, 48_000.0);
+        assert_eq!((factor, band_zero_factor), ([8; BANDS], 1));
+        assert_eq!(window, [61, 49, 13, 7]);
+        // The 25G83 law keeps the shared two-millisecond window.
+        automated27.selected_rate_band_zero = true;
+        assert_eq!(cadence(&automated27, 48_000.0).1[1..], [13, 13, 13]);
         assert!(alloc::boxed::Box::new(Run::new(&automated, 48_000.0, 1)).band_zero_pick_lag);
         assert!(!alloc::boxed::Box::new(Run::new(&p, 48_000.0, 1)).band_zero_pick_lag);
 
