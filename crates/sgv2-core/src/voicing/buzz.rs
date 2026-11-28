@@ -997,8 +997,8 @@ mod tests {
         // At 2000 Hz (12 kHz analysis rate, w = pi/3), exact arcsin recovers 2000 Hz
         // without the small-angle bias of q^2 / sqrt(2*(1 - cos(q))).
         let mut r = Run::new(&Params::default(), 48_000.0, 1);
-        for n in 0..FFT {
-            r.history[n] = libm::sin(2.0 * core::f64::consts::PI * 2000.0 * n as f64 / ANALYSIS_RATE) as f32;
+        for (n, slot) in r.history.iter_mut().enumerate().take(FFT) {
+            *slot = libm::sin(2.0 * core::f64::consts::PI * 2000.0 * n as f64 / ANALYSIS_RATE) as f32;
         }
         r.history_len = FFT;
         let bin = libm::round(2000.0 * FFT as f64 / ANALYSIS_RATE) as usize;
@@ -1009,9 +1009,9 @@ mod tests {
     #[test]
     fn packed_fft_spectra_matches_direct_dft() {
         let mut r = Run::new(&Params::default(), 48_000.0, 1);
-        for n in 0..FFT {
+        for (n, slot) in r.history.iter_mut().enumerate().take(FFT) {
             let t = n as f64 / ANALYSIS_RATE;
-            r.history[n] = (0.6 * libm::sin(2.0 * core::f64::consts::PI * 333.0 * t)
+            *slot = (0.6 * libm::sin(2.0 * core::f64::consts::PI * 333.0 * t)
                 + 0.35 * libm::cos(2.0 * core::f64::consts::PI * 1777.0 * t + 0.4)
                 + 0.15 * libm::sin(2.0 * core::f64::consts::PI * 4123.0 * t)) as f32;
         }
