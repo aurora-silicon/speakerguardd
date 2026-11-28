@@ -275,7 +275,11 @@ class Pilot(unittest.TestCase):
         self.conf = os.path.join(self.tmp.name, "c.conf")
         with open(self.conf, "w") as f:
             f.write(f"SGV2_MACHINE=j414\nSGV2_UID={os.getuid()}\n")
-        self.args = mock.Mock(graph_dir=self.tmp.name, conf=None)
+        self.params = os.path.join(self.tmp.name, "params.bin")
+        self.rate = 44100
+        with open(self.params, "wb") as f:
+            f.write(b"SGV2PRM\0" + bytes(16) + self.rate.to_bytes(4, "little"))
+        self.args = mock.Mock(graph_dir=self.tmp.name, conf=None, params=self.params)
         self.refused = 0
         self.grants = 0
 
@@ -290,7 +294,7 @@ class Pilot(unittest.TestCase):
             if "pw-top" in cmd:
                 return subprocess.CompletedProcess(cmd, 0, next(seq), "")
             if "pw-cat" in cmd:
-                pilots.append(k.get("input"))
+                pilots.append((cmd, k["input"]))
                 return subprocess.CompletedProcess(cmd, 0, b"", b"")
             raise AssertionError(cmd)
 
@@ -310,7 +314,19 @@ class Pilot(unittest.TestCase):
         # one pilot wakes the path, then the counted ones
         self.assertEqual(len(pilots), sgsc.PILOT_STARTS + 1)
         # silent: every pilot sample is zero
-        self.assertTrue(all(p and not any(p) for p in pilots))
+        for cmd, payload in pilots:
+            self.assertEqual(cmd[cmd.index("--rate") + 1], str(self.rate))
+            self.assertEqual(len(payload), int(self.rate * sgsc.PILOT_S) * 2 * 4)
+            self.assertFalse(any(payload))
+
+    def test_zero_parameter_rate_is_refused_before_any_pilot(self):
+        with open(self.params, "r+b") as f:
+            f.seek(24)
+            f.write(bytes(4))
+        result, pilots = self.live([self.top(0, 0)])
+        self.assertIsInstance(result, sgsc.wiring.Refused)
+        self.assertIn("parameter rate 0 Hz", str(result))
+        self.assertEqual(pilots, [])
 
     def test_missing_filter_stage_is_refused_before_any_pilot(self):
         # ALSA nodes can load even when a missing LV2 plugin prevents the
